@@ -12,7 +12,7 @@
 //      Note: real Linux path runs through a msg_ctl abstraction
 //      (smu_msg_v1_send_msg / smu_msg_v1_wait_response) so different
 //      SMU generations can share code. We collapse to direct register
-//      pokes here because we only target SMU v14_0_3.
+//      pokes here with an explicit family/version protocol descriptor.
 //
 //  mac-amdgpu is MIT-licensed (Copyright (c) lemonade-sdk contributors);
 //  see NOTICE at the root of this kext. Register semantics cross-checked
@@ -157,6 +157,26 @@ static const char *smu_resp_name(uint32_t resp)
     }
 }
 
+// Resolve in 64 bits before narrowing: a malformed discovery base must never
+// wrap into an unrelated low MMIO address.
+static bool smu_mailbox_registers(const DeviceContext &dev, const cobalt::SmuProtocol &protocol,
+                                  uint32_t *message, uint32_t *argument, uint32_t *response)
+{
+    if (!dev.rmmio || !dev.ip.isResolved(IPBlock::MP1, protocol.mailboxSegment)) return false;
+    const uint64_t base = dev.ip.getBase(IPBlock::MP1, protocol.mailboxSegment);
+    const uint64_t offsets[] = {protocol.messageOffset, protocol.argumentOffset, protocol.responseOffset};
+    uint32_t registers[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        const uint64_t dword = base + offsets[i];
+        if (dword > 0xFFFFFFFFull || dword * 4ull + 4ull > dev.rmmioSize) return false;
+        registers[i] = static_cast<uint32_t>(dword);
+    }
+    if (message) *message = registers[0];
+    if (argument) *argument = registers[1];
+    if (response) *response = registers[2];
+    return true;
+}
+
 //
 // smu_wait_for_response — port of smu_cmn_wait_for_response.
 // Polls C2PMSG_90 until non-zero or timeout. Returns the latched
@@ -165,12 +185,17 @@ static const char *smu_resp_name(uint32_t resp)
 static bool
 smu_wait_for_response(const DeviceContext &dev, uint32_t *outResp)
 {
-    if (!dev.ip.isResolved(IPBlock::MP1, /*baseIdx=*/1)) {
+    const cobalt::SmuProtocol *protocol = smu_protocol_for_device(dev);
+    if (protocol == nullptr) { if (outResp) *outResp = 0; return false; }
+    if (!dev.ip.isResolved(IPBlock::MP1, /*baseIdx=*/protocol->mailboxSegment)) {
         if (outResp) *outResp = 0;
         return false;
     }
-    const uint32_t reg = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
-                                               MP1Regs::C2PMSG_90);
+    uint32_t reg = 0;
+    if (!smu_mailbox_registers(dev, *protocol, nullptr, nullptr, &reg)) {
+        if (outResp) *outResp = 0;
+        return false;
+    }
     // Upstream uses `adev->usec_timeout * 20 = 100 ms * 20 = 2 s` here.
     const uint64_t kBudgetUs = 2 * 1000000;
     uint32_t v = 0;
@@ -198,41 +223,29 @@ smu_wait_for_response(const DeviceContext &dev, uint32_t *outResp)
     return false;
 }
 
-// The PPSMC message body: the pre-0.0.604 smu_send_msg_with_param text, unchanged (tests/native_s2_dal_test.cpp pins the wrapper/body split in the
-// source; there is no automated disassembly test - the 0.0.604 builder compared the object code by hand against a pristine build of the base and found
-// it identical apart from alignment padding and its jump table); the public entry below only adds the shared lock around it.
+// Keep the noinline transport body and shared-lock wrapper separate. Protocol
+// selection now supplies the mailbox coordinates; the write/poll order is retained.
 static __attribute__((noinline)) kern_return_t
 smu_send_msg_with_param_body(const DeviceContext &dev,
                              uint32_t msgId, uint32_t param,
                              uint32_t *outReturn)
 {
+    const cobalt::SmuProtocol *protocol = smu_protocol_for_device(dev);
+    if (protocol == nullptr) return kIOReturnUnsupported;
     // SMU mailbox registers `regMP1_SMN_C2PMSG_*` declare BASE_IDX 1 in
     // upstream mp_14_0_2_offset.h — NOT BASE_IDX 0. Using base[0] (the
     // historical default) routes the writes to a completely different
     // physical register and SMU never responds. Confirmed against
     // upstream `smu_v14_0_send_msg_with_param`.
-    if (!dev.ip.isResolved(IPBlock::MP1, /*baseIdx=*/1)) {
+    if (!dev.ip.isResolved(IPBlock::MP1, /*baseIdx=*/protocol->mailboxSegment)) {
         SMU_LOG("MP1 BASE_IDX 1 not resolved — SMU mailbox unreachable");
         return kIOReturnNotReady;
     }
 
-    const uint32_t regMsg   = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
-                                                    MP1Regs::C2PMSG_66);
-    const uint32_t regParam = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
-                                                    MP1Regs::C2PMSG_82);
-    const uint32_t regResp  = SOC15_REG_OFFSET_BIDX(dev, IPBlock::MP1, 1,
-                                                    MP1Regs::C2PMSG_90);
-
-    // [DEVIATION 4] Our RREG32 answers 0xFFFFFFFF for a dword outside
-    // the BAR5 mapping and WREG32 silently drops the write — the wait
-    // loop below would then read a non-zero "response" that the SMU
-    // never wrote. Refuse up front instead.
-    uint32_t highDword = regMsg;
-    if (regParam > highDword) highDword = regParam;
-    if (regResp  > highDword) highDword = regResp;
-    if (!dev.rmmio || ((size_t)highDword * 4 + 4) > dev.rmmioSize) {
-        SMU_LOG("mailbox dwords out of BAR5 range (msg 0x%x param 0x%x resp 0x%x, rmmio %llu bytes)",
-                regMsg, regParam, regResp, (unsigned long long)dev.rmmioSize);
+    uint32_t regMsg = 0, regParam = 0, regResp = 0;
+    if (!smu_mailbox_registers(dev, *protocol, &regMsg, &regParam, &regResp)) {
+        SMU_LOG("mailbox coordinates are unrepresentable or outside BAR5 (%llu bytes)",
+                (unsigned long long)dev.rmmioSize);
         return kIOReturnNoDevice;
     }
 
@@ -286,6 +299,12 @@ smu_send_msg_with_param(const DeviceContext &dev,
                         uint32_t msgId, uint32_t param,
                         uint32_t *outReturn)
 {
+    if (outReturn) *outReturn = 0;
+    const cobalt::SmuProtocol *protocol = smu_protocol_for_device(dev);
+    if (protocol == nullptr || !cobalt::smu_message_allowed(*protocol, msgId))
+        return kIOReturnUnsupported;
+    if ((msgId == PPSMC::GetSmuVersion || msgId == PPSMC::GetDriverIfVersion) && param != 0u)
+        return kIOReturnBadArgument;
     SmuSeq seq;   // the shared mailbox lock (held = false only when IOLockAlloc failed: then the message goes out unlocked, as before 0.0.604)
     return smu_send_msg_with_param_body(dev, msgId, param, outReturn);
 }
@@ -323,6 +342,7 @@ smu_test_message(const DeviceContext &dev, uint32_t *outEcho)
 kern_return_t
 smu_set_driver_dram_addr(const DeviceContext &dev, uint64_t bus_addr)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     kern_return_t r = smu_send_msg_with_param(
         dev, PPSMCTable::SetDriverDramAddrHigh,
         static_cast<uint32_t>(bus_addr >> 32), nullptr);
@@ -335,6 +355,7 @@ smu_set_driver_dram_addr(const DeviceContext &dev, uint64_t bus_addr)
 kern_return_t
 smu_set_tools_dram_addr(const DeviceContext &dev, uint64_t bus_addr)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     kern_return_t r = smu_send_msg_with_param(
         dev, PPSMCTable::SetToolsDramAddrHigh,
         static_cast<uint32_t>(bus_addr >> 32), nullptr);
@@ -347,6 +368,7 @@ smu_set_tools_dram_addr(const DeviceContext &dev, uint64_t bus_addr)
 kern_return_t
 smu_transfer_table_dram_to_smu(const DeviceContext &dev, uint32_t table_id)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     return smu_send_msg_with_param(dev,
                                    PPSMCTable::TransferTableDram2Smu,
                                    table_id, nullptr);
@@ -355,6 +377,7 @@ smu_transfer_table_dram_to_smu(const DeviceContext &dev, uint32_t table_id)
 kern_return_t
 smu_transfer_table_smu_to_dram(const DeviceContext &dev, uint32_t table_id)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     return smu_send_msg_with_param(dev,
                                    PPSMCTable::TransferTableSmu2Dram,
                                    table_id, nullptr);
@@ -401,6 +424,7 @@ smu_get_driver_if_version(const DeviceContext &dev, uint32_t *outVer)
 uint64_t
 smu_driver_table_mc(const DeviceContext &dev)
 {
+    if (!smu_legacy_policies_allowed(dev)) return 0;
     // Refuse rather than guess when the context has no VRAM geometry —
     // a caller in that position must pass its own MC address.
     if (dev.vramMcBase == 0 || dev.vramLimit == 0) return 0;
@@ -437,6 +461,7 @@ smu_driver_table_mc(const DeviceContext &dev)
 kern_return_t
 smu_smc_hw_setup(DeviceContext &dev, uint64_t driver_table_mc)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     constexpr uint64_t kDriverTableSize  = kSMUDriverTableSize;  // 64 KB
     constexpr uint64_t kFwBufAlign       = 0x1000;               // PAGE_SIZE
 
@@ -541,12 +566,12 @@ smu_smc_hw_setup(DeviceContext &dev, uint64_t driver_table_mc)
     //     smu_smc_hw_setup calls smu_notify_display_change /
     //     smu_set_power_source after RunDcBtc with the current power
     //     source. The reference is an external GPU so it assumes AC
-    //     (param=1); this card is a desktop PCIe board, which is AC
-    //     too. Some PMFW builds don't expose this message — same
+    //     (AC=0); this card is a desktop PCIe board, which is AC
+    //     too. The firmware enum encodes AC as 0. Some PMFW builds don't expose this message — same
     //     non-fatal pattern as SetAllowedFeaturesMask{Low,High} below.
     {
         kern_return_t r = smu_send_msg_with_param(
-            dev, PPSMC::NotifyPowerSource, /*AC*/ 1, nullptr);
+            dev, PPSMC::NotifyPowerSource, smu_protocol_for_device(dev)->acPowerSource, nullptr);
         if (r != kIOReturnSuccess) {
             SMU_LOG("smc_hw_setup: NotifyPowerSource(AC) non-fatal kr=0x%x", (unsigned)r);
         } else {
@@ -649,12 +674,14 @@ smu_smc_hw_setup(DeviceContext &dev, uint64_t driver_table_mc)
 kern_return_t
 smu_hw_init(DeviceContext &dev, bool runSmcHwSetup)
 {
+    if (smu_protocol_for_device(dev) == nullptr ||
+        (runSmcHwSetup && !smu_legacy_policies_allowed(dev))) return kIOReturnUnsupported;
     // 1. Existing alive-check: TestMessage round-trip.
     uint32_t echo = 0;
     kern_return_t r = smu_test_message(dev, &echo);
     if (r != kIOReturnSuccess) {
         SMU_LOG("hw_init: TestMessage failed kr=0x%x — PMFW not answering "
-                "(is smu_14_0_3.bin loaded through the PSP yet?)", (unsigned)r);
+                "(is the selected PMFW loaded through the PSP yet?)", (unsigned)r);
         return r;
     }
 
@@ -702,6 +729,7 @@ smu_hw_init(DeviceContext &dev, bool runSmcHwSetup)
 kern_return_t
 smu_disable_all_features(const DeviceContext &dev)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     // v0.1.24 — turn DPM off via PMFW. Without a chip-specific
     // fan curve (smu_set_default_dpm_table), PMFW defaults fan to
     // MAX when DPM is enabled. Sending DisableAllSmuFeatures parks
@@ -717,6 +745,10 @@ kern_return_t
 smu_set_soft_freq_range(const DeviceContext &dev, uint32_t clk_id,
                         uint32_t min_mhz, uint32_t max_mhz)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
+    const cobalt::SmuProtocol *protocol = smu_protocol_for_device(dev);
+    if ((clk_id != protocol->gfxClock && clk_id != protocol->socClock) ||
+        min_mhz > 0xFFFFu || max_mhz > 0xFFFFu) return kIOReturnBadArgument;
     // Encoding per upstream smu_v14_0_set_soft_freq_limited_range
     // (smu_v14_0.c:1099): param = (clk_id << 16) | freq_mhz.
     if (!dev.smuOnline) return kIOReturnNotReady;
@@ -748,6 +780,7 @@ smu_set_soft_freq_range(const DeviceContext &dev, uint32_t clk_id,
 kern_return_t
 smu_set_power_state(const DeviceContext &dev, uint32_t state)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     // v0.1.29 — per-state GFXCLK soft-clamp via PMFW.
     //
     // Maps a coarse "power state" (auto / low / nominal / high / peak)
@@ -792,7 +825,7 @@ smu_set_power_state(const DeviceContext &dev, uint32_t state)
               (state == SMUPowerState::Auto) ||
               (state == SMUPowerState::Nominal);
 
-    const uint32_t clk_id = PPCLK::GFXCLK;  // 0
+    const uint32_t clk_id = smu_protocol_for_device(dev)->gfxClock;
     kern_return_t firstErr = kIOReturnSuccess;
 
     if (max_mhz != 0) {
@@ -824,6 +857,7 @@ smu_set_power_state(const DeviceContext &dev, uint32_t state)
 kern_return_t
 smu_read_metrics(const DeviceContext &dev, SmuMetricsResult *out)
 {
+    if (!smu_legacy_policies_allowed(dev)) return kIOReturnUnsupported;
     if (out == nullptr) return kIOReturnBadArgument;
     *out = SmuMetricsResult{};
 
@@ -832,7 +866,7 @@ smu_read_metrics(const DeviceContext &dev, SmuMetricsResult *out)
         SMU_LOG("read_metrics: GetDriverIfVersion failed %#x", r);
         return r;
     }
-    out->layout_verified = (out->if_version == kSMUDriverIfVersion_14_0_2);
+    out->layout_verified = (out->if_version == smu_protocol_for_device(dev)->expectedDriverIfVersion);
 
     const uint64_t table_mc = smu_driver_table_mc(dev);
     if (table_mc == 0) {

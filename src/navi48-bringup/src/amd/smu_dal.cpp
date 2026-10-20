@@ -79,6 +79,10 @@ kern_return_t smu_dal_send(const DeviceContext &dev, uint32_t msg, uint32_t para
     DalMsg local;
     DalMsg *o = m != nullptr ? m : &local;
     memset(o, 0, sizeof(*o));
+    if (!smu_legacy_policies_allowed(dev)) {
+        o->refuse = kRefLevel; o->rc = (uint32_t)kIOReturnUnsupported;
+        return (kern_return_t)o->rc;
+    }
     // 1. The allowlist, before anything else. Level 0 (no boot-arg, or not a native boot with S1b POSITIVE PASS) refuses everything.
     const uint32_t why = allow_check(dal_gated_level(), msg, param, gDal.max[0], gDal.max[1]);
     if (why != kAllow) {
@@ -395,6 +399,11 @@ IOReturn dal_run_step(DeviceContext &dev, uint32_t step, n48n_dal_result *out) {
     out->step = step;
     out->underflow = N48N_DAL_UNDERFLOW_NA;
     out->flags = N48N_DAL_F_UNDERFLOW_UNREAD | N48N_DAL_F_VUPDATE_UNCOUNTED;
+    if (!smu_legacy_policies_allowed(dev)) {
+        out->verdict = kDenied; out->deny = kDenyGate;
+        out->rc = (uint32_t)kIOReturnUnsupported;
+        return kIOReturnSuccess;
+    }
     out->level = boot_arg_level();
     // 0.0.605: the DAL step and the mode trial refuse each other. Each sets its own flag FIRST (sequentially consistent) and then reads the other's, so at least one of the two sees the other.
     const bool gotBusy = owner_cas(kOwnerIdle, kOwnerDal);   // (owner 2 = a clock hold is up: the step is DENIED busy)
@@ -484,6 +493,11 @@ uint32_t dal_hold_state() { return hold_state_now(gHold); }
 uint32_t dal_hold_raise(DeviceContext &dev, uint32_t needDispKhz, uint32_t needDppKhz, HoldRep *rep, Decoded *after) {
     HoldRep local;
     HoldRep *r = rep != nullptr ? rep : &local;
+    if (!smu_legacy_policies_allowed(dev)) {
+        memset(r, 0, sizeof(*r)); r->state = hold_state_now(gHold); r->rc = kHrPre;
+        if (after != nullptr) *after = Decoded{};
+        return kHrPre;
+    }
     gHoldDev = &dev;
     const HoldIo io = hold_io();
     return hold_raise(io, gHold, *r, dal_gated_level(), gDal.e1bOk, gDal.latch.stopped, needDispKhz, needDppKhz, after);
@@ -491,6 +505,10 @@ uint32_t dal_hold_raise(DeviceContext &dev, uint32_t needDispKhz, uint32_t needD
 uint32_t dal_hold_release(DeviceContext &dev, bool restoreBad, HoldRep *rep) {
     HoldRep local;
     HoldRep *r = rep != nullptr ? rep : &local;
+    if (!smu_legacy_policies_allowed(dev)) {
+        memset(r, 0, sizeof(*r)); r->state = hold_state_now(gHold); r->relRc = kRlNotHeld;
+        return kRlNotHeld;
+    }
     gHoldDev = &dev;
     const HoldIo io = hold_io();
     return hold_release(io, gHold, *r, restoreBad);

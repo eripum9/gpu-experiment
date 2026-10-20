@@ -20,6 +20,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "../smu_protocol.hpp"
 
 namespace amdgpu {
 
@@ -344,35 +345,35 @@ constexpr uint32_t kAMDGPUGPUPageShift = 12;
 // so PMFW transitions out of bootup-idle and unblocks the IMU autoload
 // state machine (BOOTLOAD_STATUS poll in gfx_v12_0_hw_init).
 namespace PPSMC {
-    constexpr uint32_t TestMessage                = 0x01;
-    constexpr uint32_t GetSmuVersion              = 0x02;
-    constexpr uint32_t GetDriverIfVersion         = 0x03;
-    constexpr uint32_t SetAllowedFeaturesMaskLow  = 0x04;
-    constexpr uint32_t SetAllowedFeaturesMaskHigh = 0x05;
-    constexpr uint32_t EnableAllSmuFeatures       = 0x06;
-    constexpr uint32_t DisableAllSmuFeatures      = 0x07;
-    constexpr uint32_t GetRunningSmuFeaturesLow   = 0x0C;
-    constexpr uint32_t GetRunningSmuFeaturesHigh  = 0x0D;
-    constexpr uint32_t SetDriverDramAddrHigh      = 0x0E;
-    constexpr uint32_t SetDriverDramAddrLow       = 0x0F;
-    constexpr uint32_t SetToolsDramAddrHigh       = 0x10;
-    constexpr uint32_t SetToolsDramAddrLow        = 0x11;
-    constexpr uint32_t TransferTableSmu2Dram      = 0x12;
-    constexpr uint32_t TransferTableDram2Smu      = 0x13;
+    constexpr uint32_t TestMessage                = static_cast<uint32_t>(cobalt::SmuMessage::TestMessage);
+    constexpr uint32_t GetSmuVersion              = static_cast<uint32_t>(cobalt::SmuMessage::GetSmuVersion);
+    constexpr uint32_t GetDriverIfVersion         = static_cast<uint32_t>(cobalt::SmuMessage::GetDriverIfVersion);
+    constexpr uint32_t SetAllowedFeaturesMaskLow  = static_cast<uint32_t>(cobalt::SmuMessage::SetAllowedFeaturesMaskLow);
+    constexpr uint32_t SetAllowedFeaturesMaskHigh = static_cast<uint32_t>(cobalt::SmuMessage::SetAllowedFeaturesMaskHigh);
+    constexpr uint32_t EnableAllSmuFeatures       = static_cast<uint32_t>(cobalt::SmuMessage::EnableAllSmuFeatures);
+    constexpr uint32_t DisableAllSmuFeatures      = static_cast<uint32_t>(cobalt::SmuMessage::DisableAllSmuFeatures);
+    constexpr uint32_t GetRunningSmuFeaturesLow   = static_cast<uint32_t>(cobalt::SmuMessage::GetRunningSmuFeaturesLow);
+    constexpr uint32_t GetRunningSmuFeaturesHigh  = static_cast<uint32_t>(cobalt::SmuMessage::GetRunningSmuFeaturesHigh);
+    constexpr uint32_t SetDriverDramAddrHigh      = static_cast<uint32_t>(cobalt::SmuMessage::SetDriverDramAddrHigh);
+    constexpr uint32_t SetDriverDramAddrLow       = static_cast<uint32_t>(cobalt::SmuMessage::SetDriverDramAddrLow);
+    constexpr uint32_t SetToolsDramAddrHigh       = static_cast<uint32_t>(cobalt::SmuMessage::SetToolsDramAddrHigh);
+    constexpr uint32_t SetToolsDramAddrLow        = static_cast<uint32_t>(cobalt::SmuMessage::SetToolsDramAddrLow);
+    constexpr uint32_t TransferTableSmu2Dram      = static_cast<uint32_t>(cobalt::SmuMessage::TransferTableSmu2Dram);
+    constexpr uint32_t TransferTableDram2Smu      = static_cast<uint32_t>(cobalt::SmuMessage::TransferTableDram2Smu);
     // v0.1.29 — pptable defaulting. PMFW falls back to the IFWI-baked
     // default powerplay table on this message; gives us a real fan
     // curve + populates the chip-specific allowed-feature mask.
-    constexpr uint32_t UseDefaultPPTable          = 0x14;
+    constexpr uint32_t UseDefaultPPTable          = static_cast<uint32_t>(cobalt::SmuMessage::UseDefaultPPTable);
     // v0.1.29 — per-state GFXCLK soft-clamp messages. Encoding is
     // (clk_id << 16) | freq_mhz; clk_id=0 == PPCLK_GFXCLK on v14.
     // See smu_v14_0_set_soft_freq_limited_range (smu_v14_0.c:1099).
-    constexpr uint32_t SetSoftMinByFreq           = 0x19;
-    constexpr uint32_t SetSoftMaxByFreq           = 0x1A;
+    constexpr uint32_t SetSoftMinByFreq           = static_cast<uint32_t>(cobalt::SmuMessage::SetSoftMinByFreq);
+    constexpr uint32_t SetSoftMaxByFreq           = static_cast<uint32_t>(cobalt::SmuMessage::SetSoftMaxByFreq);
     // v0.1.29 — AC/DC source notify. Upstream smu_smc_hw_setup sends
-    // this after RunDcBtc. Param: 0=DC, 1=AC. Opcode per upstream
+    // this after RunDcBtc. Param: AC=0, DC=1. Opcode per upstream
     // smu_v14_0_2_ppsmc.h (#define PPSMC_MSG_NotifyPowerSource 0x35).
-    constexpr uint32_t NotifyPowerSource          = 0x35;
-    constexpr uint32_t RunDcBtc                   = 0x36;
+    constexpr uint32_t NotifyPowerSource          = static_cast<uint32_t>(cobalt::SmuMessage::NotifyPowerSource);
+    constexpr uint32_t RunDcBtc                   = static_cast<uint32_t>(cobalt::SmuMessage::RunDcBtc);
 }
 
 // PPCLK enum (subset) — drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/

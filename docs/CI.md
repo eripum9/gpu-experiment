@@ -40,11 +40,17 @@ graphics acceleration or compatibility with the RX 9060 XT.
 
 ## Artifacts
 
-The job uploads the five macOS x86_64 host executables and a tar archive
+The job uploads the seven macOS x86_64 host executables and a tar archive
 containing the compiled, ad-hoc-signed kext, build provenance, the project
 license/notices, and the AMD firmware license. The archive is for inspection
 and download only. Do not treat it as a tested driver or install it on a
 machine: it has not been loaded, and the RX 9060 XT remains unsupported.
+
+The POSIX host checks also compile the actual SMU and DAL implementations
+against the existing simulated PMFW/kernel shims, with AddressSanitizer and
+UndefinedBehaviorSanitizer enabled. They exercise message ordering, family
+refusals and the mailbox lock without accessing a real GPU. Windows runs the
+freestanding protocol tests; the fork-based transport simulation runs in CI.
 
 GitHub-hosted macOS x86_64 capacity is time-limited by GitHub's runner support
 policy. The workflow uses `macos-15-intel`, the Intel macOS 15 label documented

@@ -33,6 +33,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 
 #include <kern/thread.h>       // the shims of tests/dalshim (the kernel headers are not on the include path of a host build)
 #include <libkern/OSAtomic.h>
@@ -70,6 +71,7 @@ struct World {
     std::vector<Rule> rules;
     std::map<uint32_t, uint32_t> seenCount;
     std::vector<std::pair<uint32_t, uint32_t>> seen;   // every message the PMFW received
+    std::vector<std::pair<uint32_t, uint32_t>> ppsmcParams;
     std::vector<uint32_t> ppsmcSeen;
     uint32_t hardmin[2];
     std::vector<uint32_t> dpm[2];
@@ -176,6 +178,7 @@ static void service() {
     // PPSMC mailbox: TestMessage echoes param + 1; every other message answers OK with 0
     if (W.reg[0x16282] != 0u) {
         W.ppsmcSeen.push_back(W.reg[0x16282]);
+        W.ppsmcParams.push_back({W.reg[0x16282], W.reg[0x16292]});
         W.reg[0x16292] = W.reg[0x16292] + 1u; W.reg[0x1629A] = 1u; W.reg[0x16282] = 0u;
     }
     if (!W.pending && W.reg[kRegMsg] != 0u) { W.pending = true; W.pmsg = W.reg[kRegMsg]; W.parg = W.reg[kRegArg]; W.due = gNowNs + (uint64_t)W.latencyMs * 1000000ull; }
@@ -231,7 +234,10 @@ static void world_reset(uint32_t level, bool bootArg = true) {
     W.fps = 60.0; W.fpsAfter = 60.0; W.fpsAfterDelayNs = 3000000000ull;
     W.lit = true; W.lastFrameNs = gNowNs; W.frameAcc = 1000.0;
     sync_regs(); W.dentistFrozen = W.reg[kRegDentist];
+    gDev = amdgpu::DeviceContext{};
     gDev.rmmio = W.reg; gDev.rmmioSize = sizeof(W.reg);
+    gDev.firmwareFamily = cobalt::Family::Navi48;
+    gDev.ip.setVersion(amdgpu::IPBlock::MP1, {14, 0, 3});
     gDev.ip.setBase(amdgpu::IPBlock::MP1, 1, 0x16200u);
     gS1b.gate = n48native::kGateOn; gS1b.positivePass = true;
     gBootArg.present = bootArg; gBootArg.val = level;
@@ -1183,6 +1189,107 @@ static void b5_lock() {
     }
 }
 
+// Protocol refusals run with inaccessible MMIO and VRAM: even an accidental read
+// faults the child. No sender model is substituted for these real entry points.
+static void b7_protocol() {
+    using namespace amdgpu;
+    SCEN("Navi44 diagnostic transport") {
+        world_reset(4);
+        gDev.firmwareFamily = cobalt::Family::Navi44;
+        gDev.ip.setVersion(IPBlock::MP1, {14, 0, 2});
+        uint32_t value = 0;
+        expect(smu_test_message(gDev, &value) == 0 && value == 0xABCD0002u, "Navi44 TestMessage uses the verified mailbox");
+        expect(smu_get_version(gDev, &value) == 0 && smu_get_driver_if_version(gDev, &value) == 0, "Navi44 version diagnostics are allowed");
+        expect(smu_hw_init(gDev, false) == 0 && gDev.smuOnline, "Navi44 diagnostic-only init works");
+        const size_t before = W.ppsmcSeen.size();
+        expect(smu_hw_init(gDev, true) == kIOReturnUnsupported && W.ppsmcSeen.size() == before, "Navi44 full init refuses before its ping");
+        for (uint32_t id : W.ppsmcSeen) expect(id >= 1 && id <= 3, "Navi44 emits only the three diagnostic opcodes");
+    }
+    SCEN("protocol refusals never access MMIO or VRAM") {
+        world_reset(4);
+        const size_t guardSize = 0x2000000;
+        void *guard = mmap(nullptr, guardSize, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        expect(guard != MAP_FAILED, "inaccessible memory guard is available");
+        if (guard == MAP_FAILED) scen_exit();
+        gDalShimLockCount = 0;
+        gDev.rmmio = static_cast<volatile uint32_t *>(guard); gDev.rmmioSize = guardSize;
+        gDev.bar0 = static_cast<volatile uint8_t *>(guard); gDev.bar0Size = guardSize;
+        gDev.vramLimit = guardSize; gDev.vramMcBase = 0x8000000000ull; gDev.smuOnline = true;
+        const cobalt::Family families[] = {cobalt::Family::Navi44, cobalt::Family::Unknown, cobalt::Family::Navi44, cobalt::Family::Navi48, cobalt::Family::Navi48};
+        const IPVersion versions[] = {{14,0,2}, {14,0,3}, {14,0,3}, {14,0,2}, {0,0,0}};
+        for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); ++i) {
+            gDev.firmwareFamily = families[i]; gDev.ip.setVersion(IPBlock::MP1, versions[i]);
+            for (uint32_t id = 0; id < 0x60; ++id) {
+                if (i == 0 && id >= 1 && id <= 3) continue;
+                uint32_t reply = 0xDEADBEEFu;
+                expect(smu_send_msg_with_param(gDev, id, 0, &reply) == kIOReturnUnsupported && reply == 0,
+                       "unknown identities/opcodes and Navi44 policies refuse before MMIO and clear output");
+            }
+            expect(smu_set_driver_dram_addr(gDev, 0x1000) == kIOReturnUnsupported &&
+                   smu_set_tools_dram_addr(gDev, 0x1000) == kIOReturnUnsupported &&
+                   smu_transfer_table_dram_to_smu(gDev, 0) == kIOReturnUnsupported &&
+                   smu_transfer_table_smu_to_dram(gDev, 5) == kIOReturnUnsupported,
+                   "driver/tools addressing and both table directions refuse");
+            expect(smu_driver_table_mc(gDev) == 0 && smu_smc_hw_setup(gDev) == kIOReturnUnsupported &&
+                   smu_smc_hw_setup(gDev, 0x8000001000ull) == kIOReturnUnsupported,
+                   "setup refuses before fixed-slot zeroing or explicit-slot messages");
+            SmuMetricsResult metrics{};
+            expect(smu_read_metrics(gDev, &metrics) == kIOReturnUnsupported &&
+                   smu_disable_all_features(gDev) == kIOReturnUnsupported &&
+                   smu_set_soft_freq_range(gDev, 0, 0, 200) == kIOReturnUnsupported &&
+                   smu_set_power_state(gDev, SMUPowerState::Peak) == kIOReturnUnsupported &&
+                   smu_hw_init(gDev, true) == kIOReturnUnsupported,
+                   "metrics, features, clocks, power and full init refuse without side effects");
+            if (i != 0) expect(smu_hw_init(gDev, false) == kIOReturnUnsupported, "unknown/mismatched diagnostic init refuses");
+            DalMsg msg{}; n48n_dal_result result{}; HoldRep hold{}; Decoded after{};
+            expect(smu_dal_send(gDev, kMsgGetSmuVersion, 0, &msg) == kIOReturnUnsupported && msg.refuse != 0,
+                   "DAL sender refuses unsupported family/version");
+            expect(dal_run_step(gDev, kE1b, &result) == 0 && result.verdict == kDenied && result.deny == kDenyGate,
+                   "DAL step refuses before absolute clock register reads");
+            expect(dal_hold_raise(gDev, 530000, 530000, &hold, &after) == kHrPre &&
+                   dal_hold_release(gDev, false, &hold) == kRlNotHeld,
+                   "DAL hold entry points refuse before absolute register access");
+        }
+        // Known identities still reject malformed diagnostic parameters without touching MMIO.
+        for (uint8_t revision : {uint8_t(2), uint8_t(3)}) {
+            gDev.firmwareFamily = revision == 2 ? cobalt::Family::Navi44 : cobalt::Family::Navi48;
+            gDev.ip.setVersion(IPBlock::MP1, {14,0,revision});
+            for (uint32_t id : {PPSMC::GetSmuVersion, PPSMC::GetDriverIfVersion}) {
+                uint32_t reply = 99;
+                expect(smu_send_msg_with_param(gDev, id, 1, &reply) == kIOReturnBadArgument && reply == 0,
+                       "version queries require zero parameters");
+            }
+        }
+        uint32_t invalidReply = 99;
+        expect(smu_send_msg_with_param(gDev, 0x08, 0, &invalidReply) == kIOReturnUnsupported && invalidReply == 0,
+               "Navi48 rejects opcodes outside the driver's explicit operation set");
+        expect(gDalShimLockCount == 0, "identity and capability refusals happen before acquiring the mailbox lock");
+        expect(smu_set_soft_freq_range(gDev, 2, 0, 200) == kIOReturnBadArgument &&
+               smu_set_soft_freq_range(gDev, 0, 0x10000, 200) == kIOReturnBadArgument &&
+               smu_set_soft_freq_range(gDev, 1, 0, 0x10000) == kIOReturnBadArgument,
+               "soft-frequency domains and 16-bit fields are checked before sending");
+        gDev.ip.setBase(IPBlock::MP1, 1, 0xFFFFFFF0u);
+        gDev.rmmioSize = 0x1000; // wrapped offsets would appear valid inside this BAR
+        uint32_t wrappedReply = 99;
+        expect(smu_send_msg_with_param(gDev, PPSMC::TestMessage, 0, &wrappedReply) == kIOReturnNoDevice && wrappedReply == 0,
+               "overflowing discovery base refuses before wrapped low MMIO access");
+        munmap(guard, guardSize);
+        expect(W.ppsmcSeen.empty() && W.seen.empty(), "refused calls emit no PPSMC or DAL messages");
+    }
+    SCEN("Navi48 setup AC encoding") {
+        world_reset(4);
+        std::vector<uint8_t> vram(0x1000000, 0xA5);
+        gDev.bar0 = vram.data(); gDev.bar0Size = vram.size();
+        gDev.vramLimit = vram.size(); gDev.vramMcBase = 0x8000000000ull;
+        expect(smu_smc_hw_setup(gDev) == 0, "existing Navi48 setup completes in the PMFW simulator");
+        size_t notifications = 0;
+        for (const auto &message : W.ppsmcParams) if (message.first == PPSMC::NotifyPowerSource) {
+            ++notifications; expect(message.second == 0, "NotifyPowerSource sends firmware AC=0");
+        }
+        expect(notifications == 1, "setup sends exactly one power-source notification");
+    }
+}
+
 // =====================================================================================================================================
 // S: source pins
 // =====================================================================================================================================
@@ -1194,9 +1301,9 @@ static void s_pins(const std::string &root) {
     const std::string K = root + "/src/navi48-bringup/";
     const std::string dal = slurp(K + "src/amd/smu_dal.cpp"), smu = slurp(K + "src/amd/smu_v14_0.cpp"), smuh = slurp(K + "src/amd/amdgpu_smu.h"), pure = slurp(K + "src/amd/smu_dal_pure.h");
     const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/Navi48NativeClient.cpp"), uc = slurp(K + "src/Navi48UserClient.cpp");
-    const std::string abi = slurp(K + "src/Navi48NativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile"), doc = slurp(root + "/an internal design note");
+    const std::string abi = slurp(K + "src/Navi48NativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile");
     const std::string tool = slurp(root + "/tools/native/n48dal.c"), bld = slurp(root + "/tools/native/build.sh"), dcnc = slurp(K + "src/dcn/navi48_dcn.cpp"), bringup = slurp(K + "src/Navi48Bringup.cpp");
-    expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty() && !tool.empty() && !doc.empty(), "every source file the pins read exists (and the repo root argument is right)");
+    expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty() && !tool.empty(), "every source file the pins read exists (and the repo root argument is right)");
     // the sender writes exactly the three DAL dwords
     expect_u("smu_dal.cpp has exactly three WREG32 calls", count_of(dal, "WREG32("), 3);
     expect(dal.find("WREG32(dev, kRegResp, 0u);") != std::string::npos && dal.find("WREG32(dev, kRegArg, param);") != std::string::npos && dal.find("WREG32(dev, kRegMsg, msg);") != std::string::npos, "the three writes are RESP = 0, ARG = param, MSG = id");
@@ -1263,11 +1370,25 @@ static void s_pins(const std::string &root) {
         const std::string nb = fn_body(eng, "IOReturn n1c_dal_step(");
         expect(nb.find("if (!sess_hello(ref)) return kIOReturnNotReady;") != std::string::npos && nb.find("flags != 0ull") != std::string::npos && nb.find("IOLockLock") == std::string::npos, "n1c_dal_step: Hello first, flags 0, and no client lock held across the step");
     }
+    // The survey must use the validated common transport, without its old raw sender.
+    {
+        const std::string survey = fn_body(bringup, "void Navi48Bringup::surveySMU()");
+        expect(survey.find("profile->bringupEnabled") != std::string::npos &&
+               survey.find("discoveryMatchesProfile(ipDiscovery, *profile)") != std::string::npos &&
+               survey.find("fill_ip_base_table(ipDiscovery, survey.ip)") != std::string::npos &&
+               survey.find("amdgpu::smu_test_message(survey") != std::string::npos &&
+               survey.find("amdgpu::smu_get_version(survey") != std::string::npos &&
+               survey.find("auto send =") == std::string::npos && survey.find("rmmio[") == std::string::npos,
+               "survey validates the profile and discovery before using the common transport, without raw mailbox access");
+        expect(survey.find("discoveryMatchesProfile") < survey.find("survey.firmwareFamily") &&
+               survey.find("survey.firmwareFamily") < survey.find("amdgpu::smu_test_message"),
+               "survey protocol identity is assigned only after critical-IP and topology validation");
+    }
     // lock sharing
     {
         const std::string b = fn_body(smu, "smu_send_msg_with_param(const DeviceContext &dev,\n                        uint32_t msgId, uint32_t param,\n                        uint32_t *outReturn)");
-        expect(b.find("SmuSeq seq;") != std::string::npos && b.find("smu_send_msg_with_param_body(") != std::string::npos && b.find("SmuSeq seq;") < b.find("smu_send_msg_with_param_body("), "the public PPSMC entry takes the shared lock and then calls the untouched body");
-        expect(smu.find("static __attribute__((noinline)) kern_return_t\nsmu_send_msg_with_param_body(") != std::string::npos, "the body is a separate noinline function (its disassembly is proved identical to the base)");
+        expect(b.find("SmuSeq seq;") != std::string::npos && b.find("smu_send_msg_with_param_body(") != std::string::npos && b.find("SmuSeq seq;") < b.find("smu_send_msg_with_param_body("), "the validated public PPSMC entry takes the shared lock before the transport body");
+        expect(smu.find("static __attribute__((noinline)) kern_return_t\nsmu_send_msg_with_param_body(") != std::string::npos, "the transport body remains a separate noinline function");
         expect(smuh.find("struct SmuSeq") != std::string::npos && smuh.find("bool smu_lock_enter();") != std::string::npos && smu.find("gSmuOwner") != std::string::npos && smu.find("gSmuDepth++") != std::string::npos, "the shared lock is recursive for its owner");
         expect(fn_body(uc, "IOReturn Navi48UserClient::doMetrics(").find("amdgpu::SmuSeq smuSeq;") != std::string::npos && fn_body(uc, "IOReturn Navi48UserClient::doMetrics(").find("amdgpu::SmuSeq smuSeq;") < fn_body(uc, "IOReturn Navi48UserClient::doMetrics(").find("amdgpu::smu_read_metrics("), "doMetrics holds the shared lock across smu_read_metrics");
         expect(fn_body(uc, "IOReturn Navi48UserClient::doPowerState(").find("amdgpu::SmuSeq smuSeq;") != std::string::npos && fn_body(uc, "IOReturn Navi48UserClient::doPowerState(").find("amdgpu::SmuSeq smuSeq;") < fn_body(uc, "IOReturn Navi48UserClient::doPowerState(").find("amdgpu::smu_set_power_state("), "doPowerState holds the shared lock across smu_set_power_state");
@@ -1279,9 +1400,8 @@ static void s_pins(const std::string &root) {
     expect_u("result size", sizeof(n48n_dal_result), 256);
     expect(N48N_DAL_V_PASS == kPass && N48N_DAL_V_REFUSED == kRefused && N48N_DAL_V_TIMEOUT == kTimeout && N48N_DAL_V_REGRESSED == kRegressed && N48N_DAL_V_GLITCH == kGlitch && N48N_DAL_V_DENIED == kDenied && N48N_DAL_V_SHORT == kShort, "the ABI verdict values are the pure header's");
     expect(N48N_DAL_STEP_E1B == kE1b && N48N_DAL_STEP_E2 == kE2 && N48N_DAL_STEP_E3 == kE3 && N48N_DAL_STEP_E4 == kE4, "the ABI step numbers are the pure header's");
-    expect(doc.find("## ABI 1.2 addendum") != std::string::npos && doc.find("N48N_SEL_DAL_STEP") != std::string::npos && doc.find("navi48-dalsmc") != std::string::npos && doc.find("n48dal e1b") != std::string::npos, "the contract has an ABI 1.2 addendum that names the selector, the boot-arg and the tool");
-    expect(doc.find("the temperature stop rule (\"temps > E1 + 5 C\") is NOT implemented") != std::string::npos && doc.find("DISPCLK first, then DPPCLK**") != std::string::npos && doc.find("`dc_max_resp`") != std::string::npos && doc.find("`POLL_TIMEOUT`") != std::string::npos && doc.find("`ABOVE_START`") != std::string::npos,
-           "the addendum documents the temperature deviation, the E4 order, dc_max_resp, POLL_TIMEOUT and AT_START / ABOVE_START");
+    // The original internal design note is not shipped in this repository.
+    // Runtime tests retain the code/ABI checks rather than pin missing prose.
     {   // the deny / refuse codes are distinct and the tool names the acquired denial
         const uint32_t d[] = { kDenyLatched, kDenyGate, kDenyLevel, kDenyNoE1b, kDenyBusy, kDenyBadStep, kDenyLevelArg, kDenyBaseline, kDenyFrames, kDenyAcquired };
         bool distinct = true; for (size_t i = 0; i < 10; i++) for (size_t j = i + 1; j < 10; j++) if (d[i] == d[j]) distinct = false;
@@ -1310,7 +1430,7 @@ int main(int argc, char **argv) {
     p1_did(); p2_allow(); p3_rules(); h1_state_machine(); h2_raise_release(); s_pins(root);
     const int pure = gRun, pureFail = gFail;
     std::printf("native_s2_dal_test: pure + source pins: %d checks, %d failed\n", pure, pureFail);
-    b1_sender(); b2_e1b(); b3_e2(); b3_failures(); b4_latch_busy(); b6_hold(); b5_lock();
+    b1_sender(); b2_e1b(); b3_e2(); b3_failures(); b4_latch_busy(); b6_hold(); b5_lock(); b7_protocol();
     std::printf("native_s2_dal_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

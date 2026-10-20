@@ -13,7 +13,7 @@
 //  Pre-requisites that must be true before SMU mailbox is usable:
 //      - PSP SOS loaded (psp_load_sos succeeded)
 //      - PSP km_ring created (psp_ring_create succeeded)
-//      - PMFW (smu_14_0_3.bin) loaded through the PSP by the PSPFwLoad
+//      - Family-selected PMFW loaded through the PSP by the PSPFwLoad
 //        stage — this module assumes that already happened.
 //
 //  Until PMFW is loaded the SMU silicon doesn't respond to messages.
@@ -33,8 +33,23 @@
 
 #include <stdint.h>
 #include "amdgpu_regs.h"
+#include "../smu_protocol.hpp"
 
 namespace amdgpu {
+
+// Resolve only the identity already validated from PCI and on-die discovery.
+inline const cobalt::SmuProtocol *smu_protocol_for_device(const DeviceContext &dev)
+{
+    const IPVersion version = dev.ip.getVersion(IPBlock::MP1);
+    return cobalt::smu_protocol(dev.firmwareFamily,
+                               {version.major, version.minor, version.rev});
+}
+
+inline bool smu_legacy_policies_allowed(const DeviceContext &dev)
+{
+    const cobalt::SmuProtocol *protocol = smu_protocol_for_device(dev);
+    return protocol != nullptr && protocol->legacyPowerPolicies;
+}
 
 //
 // smu_send_msg_with_param — port of smu_cmn_send_smc_msg_with_param.
@@ -97,12 +112,12 @@ kern_return_t smu_get_driver_if_version(const DeviceContext &dev,
 // Subset of smu_v14_0_2_ppsmc.h — full file is per-ASIC.
 //
 namespace PPSMCTable {
-    constexpr uint32_t SetDriverDramAddrHigh = 0x0E;
-    constexpr uint32_t SetDriverDramAddrLow  = 0x0F;
-    constexpr uint32_t SetToolsDramAddrHigh  = 0x10;
-    constexpr uint32_t SetToolsDramAddrLow   = 0x11;
-    constexpr uint32_t TransferTableSmu2Dram = 0x12;
-    constexpr uint32_t TransferTableDram2Smu = 0x13;
+    constexpr uint32_t SetDriverDramAddrHigh = static_cast<uint32_t>(cobalt::SmuMessage::SetDriverDramAddrHigh);
+    constexpr uint32_t SetDriverDramAddrLow  = static_cast<uint32_t>(cobalt::SmuMessage::SetDriverDramAddrLow);
+    constexpr uint32_t SetToolsDramAddrHigh  = static_cast<uint32_t>(cobalt::SmuMessage::SetToolsDramAddrHigh);
+    constexpr uint32_t SetToolsDramAddrLow   = static_cast<uint32_t>(cobalt::SmuMessage::SetToolsDramAddrLow);
+    constexpr uint32_t TransferTableSmu2Dram = static_cast<uint32_t>(cobalt::SmuMessage::TransferTableSmu2Dram);
+    constexpr uint32_t TransferTableDram2Smu = static_cast<uint32_t>(cobalt::SmuMessage::TransferTableDram2Smu);
 }
 
 // PSP firmware type id for the pptable blob (GFX_FW_TYPE_PPTABLE).
@@ -297,7 +312,7 @@ kern_return_t smu_set_power_state(const DeviceContext &dev, uint32_t state);
 // the wrong offset and the numbers are nonsense — so smu_read_metrics
 // checks the version first and refuses rather than reporting garbage.
 constexpr uint32_t kSMUTableMetrics        = 5;      // TABLE_SMU_METRICS
-constexpr uint32_t kSMUDriverIfVersion_14_0_2 = 0x2E;
+constexpr uint32_t kSMUDriverIfVersion_14_0_2 = cobalt::kNavi48SmuProtocol.expectedDriverIfVersion;
 constexpr uint32_t kSMUPpClkCount   = 11;   // PPCLK_COUNT
 constexpr uint32_t kSMUSviPlaneCount = 4;   // SVI_PLANE_COUNT
 constexpr uint32_t kSMUTempCount    = 12;   // TEMP_COUNT

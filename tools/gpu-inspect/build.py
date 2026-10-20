@@ -51,6 +51,22 @@ def inspect_json(executable, arguments, expected_return):
     return json.loads(result.stdout)
 
 
+def test_smu_transport(cxx):
+    # Compile actual SMU/DAL code against simulated PMFW/kernel shims.
+    # The simulation forks an isolated child per scenario and needs POSIX.
+    if os.name == "nt":
+        print("SMU transport simulation requires POSIX; macOS CI runs it.")
+        return
+    output = BUILD / "smu-transport-test"
+    run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O1",
+         "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-pthread",
+         "-D__asm__=0;", "-D__volatile__(...)=",
+         "-I", TESTS / "dalshim", "-I", SRC, "-I", SRC / "amd",
+         TESTS / "native_s2_dal_test.cpp", SRC / "amd/smu_dal.cpp",
+         SRC / "amd/smu_v14_0.cpp", "-o", output])
+    run([output, ROOT])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("build", "test", "all"), nargs="?", default="all")
@@ -69,6 +85,8 @@ def main():
     firmware_test = compile_host(cxx, "fw-profile-test", [TESTS / "fw_profile_test.cpp",
                                                        TESTS / "fw_stub_data.cpp", SRC / "amd/fw_table.cpp"])
     topology_test = compile_host(cxx, "gfx-topology-test", [TESTS / "gfx_topology_test.cpp"])
+    smu_test = compile_host(cxx, "smu-protocol-test", [TESTS / "smu_protocol_test.cpp"])
+    run([smu_test])
     run([topology_test])
     run([firmware_test])
     run([profile_test])
@@ -108,6 +126,7 @@ def main():
         assert not inspect_json(inspector, [oversized], 2)["ok"]
         assert not inspect_json(inspector, [fixtures / "does-not-exist.bin"], 2)["ok"]
     print("CLI JSON, PCI selection, disabled-target, mismatch, malformed-input and size-limit checks passed.")
+    test_smu_transport(cxx)
     print("Host tests passed. These checks do not establish GPU acceleration or hardware compatibility.")
 
 

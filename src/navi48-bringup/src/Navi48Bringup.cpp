@@ -14,6 +14,7 @@
 #include "amd/amdgpu_init.h"
 #include "amd/amdgpu_regs.h"
 #include "amd/amdgpu_sdma.h"
+#include "amd/amdgpu_smu.h"
 #include "Navi48MetalNub.hpp"   // 0.0.610: terminate a published Metal nub at stop
 #include "Navi48DisplayNub.hpp"       // 0.0.652 (M5): fbpublish 2
 #include <libkern/c++/OSData.h>
@@ -571,24 +572,19 @@ void Navi48Bringup::surveyPSP() {
 void Navi48Bringup::surveySMU() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("navi48-smu", &on, sizeof(on)) || on == 0) return;
-	uint32_t regMsg, regParam, regResp;
-	if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, n48::kSmuSeg, n48::kSmuMsgDword,   regMsg)   ||
-	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, n48::kSmuSeg, n48::kSmuParamDword, regParam) ||
-	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, n48::kSmuSeg, n48::kSmuRespDword,  regResp)) {
-		N48LOG("smu: MP1 mailbox not in discovery table"); return;
-	}
-	if (regMsg + 4 > rmmioSize || regParam + 4 > rmmioSize || regResp + 4 > rmmioSize) return;
-	auto send = [&](uint32_t msgId, uint32_t param, uint32_t *ret) -> uint32_t {
-		rmmio[regResp / 4] = 0; rmmio[regParam / 4] = param; rmmio[regMsg / 4] = msgId;
-		uint32_t resp = 0;
-		for (int i = 0; i < 500; i++) { resp = rmmio[regResp / 4]; if (resp) break; IOSleep(1); }
-		if (ret) *ret = rmmio[regParam / 4];
-		return resp;
-	};
+	const uint32_t vendorDevice = pciDevice ? pciDevice->configRead32(kIOPCIConfigVendorID) : 0;
+	const cobalt::GpuProfile *profile = cobalt::profile_for_pci(
+		static_cast<uint16_t>(vendorDevice), static_cast<uint16_t>(vendorDevice >> 16));
+	if (!profile || !profile->bringupEnabled || !discoveryMatchesProfile(ipDiscovery, *profile)) return;
+	// Diagnostic context only: no VRAM mapping or bus-master enable is needed.
+	amdgpu::DeviceContext survey;
+	survey.rmmio = rmmio; survey.rmmioSize = rmmioSize;
+	if (!amdgpu::fill_ip_base_table(ipDiscovery, survey.ip)) return;
+	survey.firmwareFamily = profile->family;
 	uint32_t ret = 0;
-	if (send(n48::kSmuMsgTestMessage, 0xC0FFEE, &ret) != n48::kSmuRespOK) { N48LOG("smu: TestMessage not acked"); return; }
+	if (amdgpu::smu_test_message(survey, &ret) != kIOReturnSuccess) { N48LOG("smu: TestMessage not acked"); return; }
 	N48LOG("smu: PING OK (ret=0x%08x)", ret);
-	if (send(n48::kSmuMsgGetSmuVersion, 0, &ret) == n48::kSmuRespOK) {
+	if (amdgpu::smu_get_version(survey, &ret) == kIOReturnSuccess) {
 		N48LOG("smu: PMFW version %u.%u.%u", (ret >> 16) & 0xff, (ret >> 8) & 0xff, ret & 0xff);
 		setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ret), 32);
 	}

@@ -31,6 +31,10 @@ It does not implement an accelerated Navi 44 driver.
 - Firmware lookup uses an explicit per-device family with separate embedded
   sets. Unknown families and missing slots return no firmware. Host tests
   exercise the actual lookup implementation with synthetic blob symbols.
+- SMU dispatch validates family and discovered MP1 version. The verified
+  shared 14.0.2/14.0.3 message map permits only three diagnostic messages
+  for the disabled Navi 44 candidate; Navi 48 power policies and DAL
+  experiments are excluded from that candidate. See [SMU14.md](SMU14.md).
 
 The inspector opens an existing file only. It never reads hardware, enables
 the driver, or extracts a ROM. A conventional expansion VBIOS dump may not
@@ -72,9 +76,10 @@ For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md
    2 SE, 2 arrays per SE, 4 WGP per array, and maximum capacity of 32 CUs.
    Capacity now flows into runtime configuration; this does not establish
    that all GFX registers and harvest semantics work on Navi 44.
-2. Implement and verify SMU 14.0.2 message/clock/feature mappings and memory
-   initialization. Correct firmware filenames do not establish compatibility
-   of the existing SMU 14.0.3 protocol.
+2. Implement and verify the Navi 44 power policy and memory initialization.
+   Linux shares the PPSMC message/clock map between 14.0.2 and 14.0.3, but
+   that does not validate the existing feature sequencing, table handling,
+   calibration, or clock policy on the target card.
 3. Verify PSP/SDMA/GFX initialization against the captured versions and
    stage hardware testing before claiming support.
 4. Validate display routing and output programming. The captured DCN 4.1.0
