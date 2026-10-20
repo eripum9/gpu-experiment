@@ -40,7 +40,7 @@ graphics acceleration or compatibility with the RX 9060 XT.
 
 ## Artifacts
 
-The job uploads the four macOS x86_64 host executables and a tar archive
+The job uploads the five macOS x86_64 host executables and a tar archive
 containing the compiled, ad-hoc-signed kext, build provenance, the project
 license/notices, and the AMD firmware license. The archive is for inspection
 and download only. Do not treat it as a tested driver or install it on a

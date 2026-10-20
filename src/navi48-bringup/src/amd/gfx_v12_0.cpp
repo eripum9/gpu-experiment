@@ -30,14 +30,9 @@
 //     reference's `#include "amdgpu_mes.h"` is dropped — the four
 //     kCP_*_DEFAULT constants it supplied now live in amdgpu_gfx.h.
 //
-//  2. Navi 48 caps: max_sh_per_se is 2, not the reference's 1.
-//     The reference comment claims "4 SEs x 1 SA x 4 RBs/SE x 8 CUs/SA"
-//     for R9700; that is 32 CUs, but R9700 and the RX 9070 XT are the
-//     same Navi 48 die with 64 CUs (32 WGPs) = 4 SE x 2 SA x 4 WGP.
-//     With max_sh_per_se = 1, get_cu_info only walks shader arrays
-//     0..3 of 8 and under-reports CUs by 2x, and setup_rb builds an
-//     RB bitmap from a 4-entry SA mask instead of 8. Everything else
-//     about the harvest decode is unchanged — the *enabled* counts
+//  2. Capacity comes from validated GC_INFO, rather than fixed Navi 48
+//     geometry. The current implementation accepts at most 4 SE x 2 SA
+//     and checks CU/RB bitmap limits before any GFX MMIO. Enabled counts
 //     still come only from the harvest registers, never assumed.
 //
 //  3. gpu_early_init split out of constants_init into its own function
@@ -352,14 +347,13 @@ gfx_get_cu_active_bitmap_per_sh(const DeviceContext &dev,
 
 //------------------------------------------------------------------
 // gfx_gpu_early_init — port of gfx_v12_0_gpu_early_init
-// (gfx_v12_0.c:1640), IP_VERSION(12, 0, 1) branch. No MMIO.
+// (gfx_v12_0.c:1640), IP_VERSION(12, 0, 0)/(12, 0, 1) branches. No MMIO.
 //
 // Upstream reads max_shader_engines / max_sh_per_se /
 // max_backends_per_se / max_cu_per_sh from the on-die GC discovery
 // table; only max_hw_contexts and the sc_* FIFO sizes come from the
-// per-IP-version switch. We hardcode the Navi 48 die geometry —
-// see deviation #2 at the top of this file. Nothing here assumes how
-// many of those units are *enabled*; that is decoded from the
+// per-IP-version switch. GC_INFO supplies geometry via DeviceContext.
+// Nothing here assumes how many of those units are *enabled*; that is decoded from the
 // harvest registers by setup_rb / get_cu_info.
 //------------------------------------------------------------------
 kern_return_t
@@ -367,12 +361,17 @@ gfx_gpu_early_init(const DeviceContext &dev, GFXConfig &cfg)
 {
     const IPVersion gc = dev.ip.getVersion(IPBlock::GC);
 
-    // Navi 48 die geometry: 4 SE x 2 SA/SE x 4 WGP/SA x 2 CU/WGP = 64 CU,
-    // 4 RB/SE = 16 RBs, 8 hardware contexts.
-    cfg.max_shader_engines  = 4;
-    cfg.max_sh_per_se       = 2;
-    cfg.max_backends_per_se = 4;
-    cfg.max_cu_per_sh       = 8;
+    if (!cobalt::gfx_topology_compatible(dev.firmwareFamily,
+            {gc.major, gc.minor, gc.rev}, dev.gcTopology)) {
+        cfg = {};
+        GFX_LOG("gpu_early_init: missing, incompatible or unrepresentable GC topology; refusing before MMIO");
+        return kIOReturnUnsupported;
+    }
+
+    cfg.max_shader_engines  = dev.gcTopology.shaderEngines;
+    cfg.max_sh_per_se       = dev.gcTopology.shaderArraysPerEngine;
+    cfg.max_backends_per_se = dev.gcTopology.renderBackendsPerEngine;
+    cfg.max_cu_per_sh       = dev.gcTopology.cuPerArray;
     cfg.max_hw_contexts     = 8;
 
     // gfx_v12_0.c:1643-1647 — IP_VERSION(12, 0, 0) / (12, 0, 1).
@@ -383,7 +382,7 @@ gfx_gpu_early_init(const DeviceContext &dev, GFXConfig &cfg)
 
     GFX_LOG("gpu_early_init: GC %u.%u.%u caps max_se=%u max_sh_per_se=%u "
             "max_be_per_se=%u max_cu_per_sh=%u max_hw_contexts=%u "
-            "(physical CUs=%u)",
+            "(maximum capacity CUs=%u)",
             gc.major, gc.minor, gc.rev,
             cfg.max_shader_engines, cfg.max_sh_per_se,
             cfg.max_backends_per_se, cfg.max_cu_per_sh,
@@ -394,11 +393,6 @@ gfx_gpu_early_init(const DeviceContext &dev, GFXConfig &cfg)
             cfg.sc_prim_fifo_size_frontend, cfg.sc_prim_fifo_size_backend,
             cfg.sc_hiz_tile_fifo_size, cfg.sc_earlyz_tile_fifo_size);
 
-    if (!dev.ip.isVersion(IPBlock::GC, 12, 0, 1)) {
-        GFX_LOG("gpu_early_init: WARNING discovery reports GC %u.%u.%u, "
-                "not 12.0.1 — the hardcoded Navi 48 caps may not apply",
-                gc.major, gc.minor, gc.rev);
-    }
     return kIOReturnSuccess;
 }
 
@@ -442,7 +436,7 @@ gfx_get_gb_addr_config(const DeviceContext &dev, GFXConfig &cfg)
             cfg.num_rb_per_se, cfg.num_pkrs, cfg.pipe_interleave_size,
             cfg.max_compressed_frags);
 
-    // Cross-check the live geometry against the hardcoded caps. Not in
+    // Cross-check the live geometry against the discovered capacity. Not in
     // the reference; log-only (deviation #5) — upstream never compares
     // these two sources either, but if they disagree the caps are wrong
     // and every harvest mask below is the wrong width.
@@ -535,11 +529,11 @@ gfx_get_cu_info(const DeviceContext &dev, GFXConfig &cfg)
             const uint32_t bitmap = gfx_get_cu_active_bitmap_per_sh(dev, cfg);
 
             // Mirror upstream's "GFX12 can have > 4 SEs but ioctl
-            // table is 4x4" layout (gfx_v12_0.c:5778). Our config
-            // limits the array to 4x2 (Navi 48 has 4 SEs x 2 SAs), so
-            // for i in [0..3] and j in [0..1] this is straightforward.
-            if (i < 4 && j < 2) {
-                cfg.active_cu_bitmap[i % 4][j + (i / 4) * 2] = bitmap;
+            // table is 4x4" layout (gfx_v12_0.c:5778). Topology validation
+            // limits this implementation to its 4x2 storage.
+            if (i < cobalt::kGfxMaxShaderEngines &&
+                j < cobalt::kGfxMaxShaderArraysPerEngine) {
+                cfg.active_cu_bitmap[i][j] = bitmap;
             }
 
             // popcount up to max_cu_per_sh.
@@ -642,15 +636,15 @@ gfx_init_compute_vmid(const DeviceContext &dev)
 kern_return_t
 gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
 {
+    cfg.inited = false;
     if (!dev.ip.isResolved(IPBlock::GC)) {
         GFX_LOG("constants_init: GC IP base not resolved");
         return kIOReturnNotReady;
     }
 
-    // Navi 48 (gfx1201) early-init caps — upstream's
-    // gfx_v12_0_gpu_early_init IP_VERSION(12, 0, 1) branch plus the
-    // discovery-sourced die geometry. No MMIO.
-    gfx_gpu_early_init(dev, cfg);
+    // Validate discovery capacity and IP-specific constants before MMIO.
+    const kern_return_t caps = gfx_gpu_early_init(dev, cfg);
+    if (caps != kIOReturnSuccess) return caps;
 
     // Deviation #4 — read-only GC BASE_IDX probe + a gate on the first
     // write. Must run BEFORE the GRBM_CNTL write below.
@@ -679,8 +673,8 @@ gfx_constants_init(const DeviceContext &dev, GFXConfig &cfg)
     // get_tcc_info is empty upstream on gfx12 (gfx_v12_0.c:1802).
     //
     // Both setup_rb and get_cu_info NEED gb_addr_config populated for
-    // some fields, but on RDNA4 the caps we use are hardcoded — the
-    // gb_addr_config read is best-effort and non-fatal.
+    // some fields. Capacity comes from GC_INFO; the gb_addr_config
+    // read remains best-effort and non-fatal.
     (void)gfx_get_gb_addr_config(dev, cfg);
     kern_return_t r;
     r = gfx_setup_rb(dev, cfg);

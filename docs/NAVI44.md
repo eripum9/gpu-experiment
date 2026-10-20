@@ -22,6 +22,12 @@ It does not implement an accelerated Navi 44 driver.
 - Optional GC_INFO v1.0 through v1.3 parsing reports maximum SE/SA/WGP/CU
   capacity after validating its bounds and checksum. It does not report
   harvested or active CU counts.
+- The runtime GFX setup uses this discovered capacity instead of fixed
+  Navi 48 geometry. It requires a supported GC_INFO table before PSP/SMU
+  initialization and checks that SE/SA dimensions and CU/RB masks fit the
+  current implementation. Missing or incompatible topology has no fallback.
+  GFX initialization propagates failure before register access; active units
+  still come from the existing hardware harvest decoding.
 - Firmware lookup uses an explicit per-device family with separate embedded
   sets. Unknown families and missing slots return no firmware. Host tests
   exercise the actual lookup implementation with synthetic blob symbols.
@@ -61,10 +67,11 @@ itself never performs bring-up. Navi 44 remains false even for a matching GC.
 
 For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md).
 
-1. Adapt the hardcoded GFX geometry to discovered capacity and independently
-   verified active/harvested topology. The captured GC_INFO v1.3 advertises
+1. Validate the GFX initialization and its harvest decoding on hardware.
+   The captured GC_INFO v1.3 advertises
    2 SE, 2 arrays per SE, 4 WGP per array, and maximum capacity of 32 CUs.
-   The existing hardware initialization still assumes Navi 48's 64 CUs.
+   Capacity now flows into runtime configuration; this does not establish
+   that all GFX registers and harvest semantics work on Navi 44.
 2. Implement and verify SMU 14.0.2 message/clock/feature mappings and memory
    initialization. Correct firmware filenames do not establish compatibility
    of the existing SMU 14.0.3 protocol.

@@ -68,6 +68,8 @@ def main():
     discovery_test = compile_host(cxx, "ipdiscovery-test", [TESTS / "ipdiscovery_test.cpp", SRC / "ipdiscovery.cpp"])
     firmware_test = compile_host(cxx, "fw-profile-test", [TESTS / "fw_profile_test.cpp",
                                                        TESTS / "fw_stub_data.cpp", SRC / "amd/fw_table.cpp"])
+    topology_test = compile_host(cxx, "gfx-topology-test", [TESTS / "gfx_topology_test.cpp"])
+    run([topology_test])
     run([firmware_test])
     run([profile_test])
     run([discovery_test])

@@ -46,7 +46,9 @@ OSDefineMetaClassAndStructors(Navi48Bringup, IOService)
 namespace {
 // Check the map before any PSP/SMU access or interrupt setup. Also validate
 // every discovered instance of SDMA (some tables use hardware id 43).
-bool discoveryMatchesProfile(const IpDiscovery &discovery, const cobalt::GpuProfile &profile) {
+bool discoveryMatchesProfile(const IpDiscovery &discovery, const cobalt::GpuProfile &profile,
+                             IpDiscovery::GcTopology *topologyOut = nullptr) {
+	if (topologyOut) *topologyOut = {};
 	struct ExpectedIp { uint16_t hwId; cobalt::Version version; };
 	const ExpectedIp expected[] = {
 		{IpDiscovery::HwGc, profile.gc}, {IpDiscovery::HwMp0, profile.psp},
@@ -67,6 +69,12 @@ bool discoveryMatchesProfile(const IpDiscovery &discovery, const cobalt::GpuProf
 		for (const auto &required : expected)
 			if (entry.hwId == required.hwId && !cobalt::version_matches(required.version, actual)) return false;
 	}
+	IpDiscovery::GcTopology topology {};
+	// The GC version was checked above. Capacity must also fit the harvest
+	// bitmaps and array dimensions used by the GFX implementation.
+	if (!discovery.gcTopology(topology) ||
+	    !cobalt::gfx_topology_compatible(profile.family, profile.gc, topology)) return false;
+	if (topologyOut) *topologyOut = topology;
 	return true;
 }
 
@@ -645,11 +653,13 @@ void Navi48Bringup::stagePSP() {
 
 bool Navi48Bringup::buildDeviceContext() {
 	dev.firmwareFamily = cobalt::Family::Unknown;
+	dev.gcTopology = {};
+	IpDiscovery::GcTopology topology {};
 	const uint32_t vendorDevice = pciDevice ? pciDevice->configRead32(kIOPCIConfigVendorID) : 0;
 	const cobalt::GpuProfile *profile = cobalt::profile_for_pci(
 		static_cast<uint16_t>(vendorDevice), static_cast<uint16_t>(vendorDevice >> 16));
-	if (!profile || !profile->bringupEnabled || !discoveryMatchesProfile(ipDiscovery, *profile)) {
-		N48LOG("dev: disabled or incompatible PCI/IP profile; refusing before enabling DMA"); return false;
+	if (!profile || !profile->bringupEnabled || !discoveryMatchesProfile(ipDiscovery, *profile, &topology)) {
+		N48LOG("dev: disabled or incompatible PCI/IP profile or GC topology; refusing before enabling DMA"); return false;
 	}
 	// Stages >= 6 DMA into system memory (IH ring, GART-mapped buffers, MES
 	// queues): the PCI nub must be a bus master. Memory space is already on.
@@ -666,6 +676,7 @@ bool Navi48Bringup::buildDeviceContext() {
 	dev.vramMcBase = static_cast<uint64_t>(fbBase & 0x00FFFFFF) << 24;
 	if (!amdgpu::fill_ip_base_table(ipDiscovery, dev.ip)) { N48LOG("dev: IP base table incomplete"); return false; }
 	dev.firmwareFamily = profile->family;
+	dev.gcTopology = topology;
 	N48LOG("dev: context ready — MC base 0x%llx, region vram+[0x%llx, 0x%llx), GC base 0x%x MP0 base 0x%x MMHUB base 0x%x",
 	       dev.vramMcBase, dev.vramBase, dev.vramLimit, dev.ip.get(amdgpu::IPBlock::GC),
 	       dev.ip.get(amdgpu::IPBlock::MP0), dev.ip.get(amdgpu::IPBlock::MMHUB));
@@ -7434,7 +7445,7 @@ bool Navi48Bringup::start(IOService *provider) {
 	} else {
 		surveyIPs();
 		if (!profile || !discoveryMatchesProfile(ipDiscovery, *profile)) {
-			N48LOG("start: critical IP version missing or incompatible with the selected GPU profile — stopping before PSP/SMU/interrupt stages");
+			N48LOG("start: critical IP version or GC topology missing or incompatible with the selected GPU profile — stopping before PSP/SMU/interrupt stages");
 			return rejectProfile();
 		}
 		surveyPSP();

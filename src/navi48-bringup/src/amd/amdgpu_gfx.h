@@ -1,9 +1,7 @@
 // Adapted from lemonade-sdk/mac-amdgpu (MIT) dext/amdgpu/amdgpu_gfx.h @ 3bdeed2.
 // Was VERBATIM; forked for the Navi48Bringup kext. Changes vs the reference:
-//   1. Navi 48 (RX 9070 XT) caps: max_sh_per_se 1 -> 2. The reference's
-//      "4 SE x 1 SA x 8 CU/SA" describes 32 CUs; Navi 48 is 4 SE x 2 SA x
-//      8 CU/SA = 64 CUs (32 WGPs). With max_sh_per_se = 1 get_cu_info only
-//      walks half the shader arrays and under-counts CUs by 2x.
+//   1. Capacity is supplied by validated GC_INFO instead of fixed per-card
+//      geometry. Its dimensions must fit the current 4x2 CU bitmap storage.
 //   2. Added GFXRegBaseIdx — the SOC15 BASE_IDX for each GC register the
 //      module touches, in one table (the reference hardcodes BASE_IDX 0 at
 //      all 13 call sites). See the comment on that namespace.
@@ -243,19 +241,16 @@ struct GFXConfig {
     uint32_t  pipe_interleave_size;  // = 1 << (8 + PIPE_INTERLEAVE_SIZE)
     uint32_t  max_compressed_frags;  // = 1 << MAX_COMPRESSED_FRAGS
 
-    // Navi 48 (gfx1201) caps, set by gfx_gpu_early_init. Upstream takes
+    // Capacity from validated GC_INFO, set by gfx_gpu_early_init. Upstream takes
     // max_shader_engines / max_sh_per_se / max_backends_per_se /
     // max_cu_per_sh from the on-die GC discovery table
     // (amdgpu_discovery.c:amdgpu_discovery_get_gfx_info) and only
     // max_hw_contexts + the sc_* FIFO sizes from
     // gfx_v12_0_gpu_early_init's IP_VERSION(12, 0, 1) branch.
-    //
-    //   4 SE x 2 SA/SE x 4 WGP/SA x 2 CU/WGP = 64 CUs  (RX 9070 XT, full die)
-    //   4 SE x 4 RB/SE                       = 16 RBs
-    uint32_t  max_shader_engines;     // 4
-    uint32_t  max_sh_per_se;          // 2  (reference said 1 — see file header)
-    uint32_t  max_backends_per_se;    // 4
-    uint32_t  max_cu_per_sh;          // 8  (4 WGPs x 2 CUs)
+    uint32_t  max_shader_engines;
+    uint32_t  max_sh_per_se;
+    uint32_t  max_backends_per_se;
+    uint32_t  max_cu_per_sh;
     uint32_t  max_hw_contexts;        // 8
 
     // gfx_v12_0_gpu_early_init IP_VERSION(12, 0, 1) constants. Nothing in
@@ -275,9 +270,8 @@ struct GFXConfig {
     uint32_t  num_rbs;
 
     // CU harvest map (set by get_cu_info). active_cu_bitmap[se][sh].
-    // For Navi 48 (gfx1201): max_shader_engines = 4, max_sh_per_se = 2,
-    // so all 8 shader arrays fit the 4x2 array exactly.
-    uint32_t  active_cu_bitmap[4][2];
+    // Topology validation rejects dimensions beyond this storage.
+    uint32_t  active_cu_bitmap[cobalt::kGfxMaxShaderEngines][cobalt::kGfxMaxShaderArraysPerEngine];
     uint32_t  num_active_cus;
     uint32_t  num_active_wgps;
 
@@ -287,9 +281,9 @@ struct GFXConfig {
 
 //
 // Port of gfx_v12_0_gpu_early_init (gfx_v12_0.c:1640, IP_VERSION(12, 0, 1)
-// branch) — fills the static per-ASIC caps in GFXConfig. No MMIO except
-// the GB_ADDR_CONFIG read that upstream does in the same function, which
-// we keep in gfx_get_gb_addr_config. Called by gfx_constants_init; exposed
+// branch) — fills discovery-derived capacity in GFXConfig without MMIO.
+// The GB_ADDR_CONFIG read stays separate in gfx_get_gb_addr_config.
+// Called by gfx_constants_init; exposed
 // so a caller that only needs the caps can get them without touching the
 // GPU's GRBM state.
 //
@@ -300,7 +294,7 @@ kern_return_t gfx_gpu_early_init(const DeviceContext &dev, GFXConfig &cfg);
 //
 // Programs the bring-up subset that the CP and shader cores expect
 // to find configured before they fetch packets:
-//   - gpu_early_init (static per-ASIC caps, no MMIO)
+//   - gpu_early_init (validated discovery capacity, no MMIO)
 //   - GRBM_CNTL.READ_TIMEOUT = 0xFF
 //   - get_gb_addr_config (GB_ADDR_CONFIG decode)
 //   - setup_rb (harvest map from SA_UNIT_DISABLE + CC_RB_BACKEND_DISABLE)
