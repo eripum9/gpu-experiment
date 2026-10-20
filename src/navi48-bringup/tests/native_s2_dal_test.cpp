@@ -18,7 +18,7 @@
 //   B3  E2 / E3 / E4: PASS with the exact messages and order (DISPCLK first, restore reversed), and every failure verdict with its restore behaviour;
 //   B4  the latch, the busy flag, the level ordering, the allowlist inside a step;
 //   B5  lock sharing: PPSMC and DAL serialise, recursion, allocation failure;
-//   S   source pins: three WREG32 only, callers, IOSleep in every wait, bounded loops, the ABI 1.2 contract text, the tool, the version.
+//   S   source pins: three WREG32 only, callers, IOSleep in every wait, bounded loops, the ABI and version.
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -1302,8 +1302,8 @@ static void s_pins(const std::string &root) {
     const std::string dal = slurp(K + "src/amd/smu_dal.cpp"), smu = slurp(K + "src/amd/smu_v14_0.cpp"), smuh = slurp(K + "src/amd/amdgpu_smu.h"), pure = slurp(K + "src/amd/smu_dal_pure.h");
     const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/Navi48NativeClient.cpp"), uc = slurp(K + "src/Navi48UserClient.cpp");
     const std::string abi = slurp(K + "src/Navi48NativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile");
-    const std::string tool = slurp(root + "/tools/native/n48dal.c"), bld = slurp(root + "/tools/native/build.sh"), dcnc = slurp(K + "src/dcn/navi48_dcn.cpp"), bringup = slurp(K + "src/Navi48Bringup.cpp");
-    expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty() && !tool.empty(), "every source file the pins read exists (and the repo root argument is right)");
+    const std::string dcnc = slurp(K + "src/dcn/navi48_dcn.cpp"), bringup = slurp(K + "src/Navi48Bringup.cpp");
+    expect(!dal.empty() && !smu.empty() && !smuh.empty() && !pure.empty() && !eng.empty() && !engh.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty() && !mk.empty() && !dcnc.empty() && !bringup.empty(), "every source file the pins read exists (and the repo root argument is right)");
     // the sender writes exactly the three DAL dwords
     expect_u("smu_dal.cpp has exactly three WREG32 calls", count_of(dal, "WREG32("), 3);
     expect(dal.find("WREG32(dev, kRegResp, 0u);") != std::string::npos && dal.find("WREG32(dev, kRegArg, param);") != std::string::npos && dal.find("WREG32(dev, kRegMsg, msg);") != std::string::npos, "the three writes are RESP = 0, ARG = param, MSG = id");
@@ -1402,11 +1402,10 @@ static void s_pins(const std::string &root) {
     expect(N48N_DAL_STEP_E1B == kE1b && N48N_DAL_STEP_E2 == kE2 && N48N_DAL_STEP_E3 == kE3 && N48N_DAL_STEP_E4 == kE4, "the ABI step numbers are the pure header's");
     // The original internal design note is not shipped in this repository.
     // Runtime tests retain the code/ABI checks rather than pin missing prose.
-    {   // the deny / refuse codes are distinct and the tool names the acquired denial
+    {   // the deny / refuse codes remain distinct
         const uint32_t d[] = { kDenyLatched, kDenyGate, kDenyLevel, kDenyNoE1b, kDenyBusy, kDenyBadStep, kDenyLevelArg, kDenyBaseline, kDenyFrames, kDenyAcquired };
         bool distinct = true; for (size_t i = 0; i < 10; i++) for (size_t j = i + 1; j < 10; j++) if (d[i] == d[j]) distinct = false;
         expect(distinct && kDenyAcquired == 10 && kDenyFrames == 9, "every deny code is distinct (acquired = 10)");
-        expect(tool.find("case 10: return \"the scanout plane is acquired") != std::string::npos, "the tool names deny 10");
     }
     // version
     {
@@ -1415,9 +1414,8 @@ static void s_pins(const std::string &root) {
         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
     }
     expect(mk.find("$(wildcard src/amd/*.cpp)") != std::string::npos, "the Makefile builds src/amd/*.cpp (smu_dal.cpp)");
-    // the tool
-    expect(tool.find("N48N_SEL_DAL_STEP") != std::string::npos && tool.find("e1b") != std::string::npos && tool.find("e4") != std::string::npos && tool.find("N48N_HELLO_F_MINOR") != std::string::npos, "n48dal drives the selector, needs the minor");
-    expect(bld.find("n48dal:n48dal.c") != std::string::npos, "build.sh builds n48dal");
+    // The upstream n48dal CLI and its build script are not shipped here.
+    // Their packaging checks do not belong in this driver transport suite.
     // banned strings in the new code
     for (const std::string *t : { &dal, &pure }) expect(t->find("+0x280") == std::string::npos && t->find("+0x282") == std::string::npos && t->find("+0x299") == std::string::npos, "the banned pipe offsets do not appear");
     expect(pure.find("#include <stdint.h>") != std::string::npos && pure.find("#include <IOKit") == std::string::npos, "the pure header includes stdint only");
