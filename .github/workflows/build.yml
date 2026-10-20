@@ -24,6 +24,9 @@ jobs:
       - name: Run offline host tests
         run: python3 tools/gpu-inspect/build.py all
 
+      - name: Test Linux hardware collector with synthetic sysfs
+        run: python3 -m unittest discover -s tools/gpu-inspect -p test_collect_linux.py -v
+
       - name: Fetch pinned compile dependencies
         run: python3 tools/ci/fetch_deps.py
 

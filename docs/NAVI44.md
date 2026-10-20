@@ -51,6 +51,8 @@ itself never performs bring-up. Navi 44 remains false even for a matching GC.
 
 ## Remaining implementation work
 
+For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md).
+
 1. Obtain this card's actual discovery data, firmware requirements, harvested
    SE/SH/CU topology, and display routing. Extend the parser if the real
    capture uses a different documented format.

@@ -23,3 +23,5 @@ runs/
 *.log
 .DS_Store
 __pycache__/
+# Local target hardware captures; do not publish real board/monitor evidence.
+gpu-capture*.json
