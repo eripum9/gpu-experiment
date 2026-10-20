@@ -27,17 +27,20 @@ def run(command):
 
 def compile_host(cxx, name, sources):
     output = BUILD / (name + (".exe" if os.name == "nt" else ""))
+    is_c = all(Path(source).suffix == ".c" for source in sources)
     if Path(cxx).stem.lower() in ("cl", "clang-cl"):
         # Separate object names also allow later incremental builds safely.
         objects = []
         for source in sources:
             obj = BUILD / f"{name}_{Path(source).stem}.obj"
-            run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/Zc:__cplusplus",
+            language = ["/std:c11", "/TC"] if is_c else ["/std:c++17", "/EHsc", "/Zc:__cplusplus"]
+            run([cxx, "/nologo", *language, "/W4", "/WX",
                  f"/I{SRC}", "/c", source, f"/Fo{obj}"])
             objects.append(obj)
         run([cxx, "/nologo", *objects, f"/Fe{output}"])
     else:
-        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
+        language = ["-x", "c", "-std=c11"] if is_c else ["-std=c++17"]
+        run([cxx, *language, "-Wall", "-Wextra", "-Werror", "-pedantic",
              "-I", SRC, *sources, "-o", output])
     return output
 
@@ -86,6 +89,10 @@ def main():
                                                        TESTS / "fw_stub_data.cpp", SRC / "amd/fw_table.cpp"])
     topology_test = compile_host(cxx, "gfx-topology-test", [TESTS / "gfx_topology_test.cpp"])
     smu_test = compile_host(cxx, "smu-protocol-test", [TESTS / "smu_protocol_test.cpp"])
+    identity_test = compile_host(cxx, "gpu-info-test", [TESTS / "gpu_info_test.cpp"])
+    identity_c_test = compile_host(cxx, "gpu-info-c-test", [TESTS / "gpu_info_c_test.c"])
+    run([identity_test])
+    run([identity_c_test])
     run([smu_test])
     run([topology_test])
     run([firmware_test])

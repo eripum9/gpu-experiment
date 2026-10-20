@@ -4,6 +4,7 @@
 //
 #include "Navi48Bringup.hpp"
 #include "gpu_profile.hpp"
+#include "gpu_info_builder.hpp"
 #include "fw/fw_table.h"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
@@ -7394,6 +7395,7 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
 }
 
 bool Navi48Bringup::start(IOService *provider) {
+	removeProperty(COBALT_GPU_INFO_PROPERTY);
 	auto *candidate = OSDynamicCast(IOPCIDevice, provider);
 	if (!candidate) { N48LOG("start: provider is not PCI; refusing before initialization"); return false; }
 	uint32_t vendorDevice = candidate->configRead32(kIOPCIConfigVendorID);
@@ -7415,6 +7417,7 @@ bool Navi48Bringup::start(IOService *provider) {
 	// A rejected discovery/profile must not leave exported helpers pointing
 	// at a service whose start() failed, or the parser at freed ROM storage.
 	auto rejectProfile = [this]() -> bool {
+		removeProperty(COBALT_GPU_INFO_PROPERTY);
 		ipDiscovery.init(nullptr, 0);
 		if (onDieDisc) { IOFree(onDieDisc, n48::kDiscTmrSize); onDieDisc = nullptr; }
 		unmapRegisters();
@@ -7440,9 +7443,25 @@ bool Navi48Bringup::start(IOService *provider) {
 		return rejectProfile();
 	} else {
 		surveyIPs();
-		if (!profile || !discoveryMatchesProfile(ipDiscovery, *profile)) {
+		IpDiscovery::GcTopology topology {};
+		if (!profile || !discoveryMatchesProfile(ipDiscovery, *profile, &topology)) {
 			N48LOG("start: critical IP version or GC topology missing or incompatible with the selected GPU profile — stopping before PSP/SMU/interrupt stages");
 			return rejectProfile();
+		}
+		// Versioned metadata for user-space backends. This describes PCI
+		// identity and maximum GC capacity, not initialized or active units.
+		IpDiscovery::IpEntry gc {};
+		cobalt_gpu_info_v1 info {};
+		const uint32_t subsystem = pciDevice->configRead32(kIOPCIConfigSubSystemVendorID);
+		if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gc) &&
+		    cobalt::make_gpu_info(static_cast<uint16_t>(vendorDevice),
+		        static_cast<uint16_t>(vendorDevice >> 16), pciDevice->configRead8(kIOPCIConfigRevisionID),
+		        static_cast<uint16_t>(subsystem), static_cast<uint16_t>(subsystem >> 16),
+		        {gc.major, gc.minor, gc.revision}, topology, info)) {
+			OSData *data = OSData::withBytes(&info, sizeof(info));
+			const bool published = data && setProperty(COBALT_GPU_INFO_PROPERTY, data);
+			if (data) data->release();
+			if (!published) N48LOG("start: GPU identity metadata could not be published");
 		}
 		surveyPSP();
 		surveySMU();
@@ -9027,6 +9046,7 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 }
 
 void Navi48Bringup::stop(IOService *provider) {
+	removeProperty(COBALT_GPU_INFO_PROPERTY);
 	// : never leave a patched className behind in a kext that is going away.
 	n48fbname::restore_on_unload();
 	// 0.0.603 (native S2a): the console plane back and every scanout watchdog thread finished BEFORE anything is unmapped (both need the registers).

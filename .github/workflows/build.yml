@@ -48,6 +48,8 @@ jobs:
             build/gpu-inspect/gfx-topology-test
             build/gpu-inspect/smu-protocol-test
             build/gpu-inspect/smu-transport-test
+            build/gpu-inspect/gpu-info-test
+            build/gpu-inspect/gpu-info-c-test
           if-no-files-found: error
           retention-days: 7
 

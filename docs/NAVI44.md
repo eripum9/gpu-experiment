@@ -35,6 +35,10 @@ It does not implement an accelerated Navi 44 driver.
   shared 14.0.2/14.0.3 message map permits only three diagnostic messages
   for the disabled Navi 44 candidate; Navi 48 power policies and DAL
   experiments are excluded from that candidate. See [SMU14.md](SMU14.md).
+- A versioned registry record publishes actual PCI identity, GFX target,
+  and validated maximum GC capacity for future backend consumers. Its C11
+  decoder validates the record before use. It does not report active units
+  or hardware readiness. See [GPU-IDENTITY.md](GPU-IDENTITY.md).
 
 The inspector opens an existing file only. It never reads hardware, enables
 the driver, or extracts a ROM. A conventional expansion VBIOS dump may not
@@ -86,7 +90,8 @@ For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md
    segment bases match the current driver, but this does not prove that its
    board-specific mode/monitor captures and output routing are suitable.
 5. Replace the RADV Darwin backend's canned gfx1201 device/PCI identity and
-   carry verified target information through the Metal bundle.
+   carry verified target information through the Metal bundle. The kernel
+   now exposes a capacity/identity record; RADV does not consume it yet.
 6. Build and test on macOS, then perform staged hardware validation on the
    target desktop before enabling Navi 44 acceleration.
 
