@@ -114,7 +114,3 @@ int main() {
 	if (failures == 0) printf("gpu info tests passed\n");
 	return static_cast<int>(failures);
 }
-
-
-
-
