@@ -1478,7 +1478,7 @@ mes_init_full(DeviceContext &dev, PSPContext &psp,
         const uint8_t *bin  = mes_fw;
         uint64_t       size = mes_fw_size;
         if (bin == nullptr || size == 0) {
-            const FwBlob *blob = fw_get(FwId::GC_UNI_MES);
+            const FwBlob *blob = fw_get(dev.firmwareFamily, FwId::GC_UNI_MES);
             if (blob != nullptr && blob->data != nullptr && blob->size != 0) {
                 bin  = blob->data;
                 size = blob->size;

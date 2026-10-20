@@ -19,13 +19,19 @@ struct GpuProfile {
 	const char *gfxTarget;
 	Version gc;
 	bool bringupEnabled;
+	Version psp;
+	Version smu;
+	Version sdma;
+	Version dcn;
 };
 
 inline constexpr GpuProfile kNavi48Profile = {
-	Family::Navi48, "Navi 48", "gfx1201", {12, 0, 1}, true
+	Family::Navi48, "Navi 48", "gfx1201", {12, 0, 1}, true,
+	{14, 0, 3}, {14, 0, 3}, {7, 0, 1}, {4, 1, 0}
 };
 inline constexpr GpuProfile kNavi44Profile = {
-	Family::Navi44, "Navi 44", "gfx1200", {12, 0, 0}, false
+	Family::Navi44, "Navi 44", "gfx1200", {12, 0, 0}, false,
+	{14, 0, 2}, {14, 0, 2}, {7, 0, 0}, {4, 1, 0}
 };
 
 constexpr const GpuProfile *profile_for_pci(uint16_t vendor, uint16_t device) {
@@ -35,10 +41,20 @@ constexpr const GpuProfile *profile_for_pci(uint16_t vendor, uint16_t device) {
 	return nullptr;
 }
 
+constexpr bool version_matches(Version expected, Version actual) {
+	return expected.major == actual.major && expected.minor == actual.minor &&
+	       expected.revision == actual.revision;
+}
+
 constexpr bool gc_matches(const GpuProfile &profile, Version version) {
-	return profile.gc.major == version.major &&
-	       profile.gc.minor == version.minor &&
-	       profile.gc.revision == version.revision;
+	return version_matches(profile.gc, version);
+}
+
+constexpr bool critical_ips_match(const GpuProfile &profile, Version gc,
+                                 Version psp, Version smu, Version sdma, Version dcn) {
+	return gc_matches(profile, gc) && version_matches(profile.psp, psp) &&
+	       version_matches(profile.smu, smu) && version_matches(profile.sdma, sdma) &&
+	       version_matches(profile.dcn, dcn);
 }
 
 } // namespace cobalt

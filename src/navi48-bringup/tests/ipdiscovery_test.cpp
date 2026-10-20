@@ -26,20 +26,36 @@ static void repairTableChecksum(Bytes &b) {
 	const size_t prefix = 0x100, offset = u16(b, prefix + 12), tableSize = u16(b, prefix + 60 + 6);
 	put16(b, prefix + 14, sum16(b, prefix + offset, prefix + offset + tableSize));
 }
+static size_t gcOffset(const Bytes &b) { return 0x100 + u16(b, 0x100 + 20); }
+static void repairGcChecksum(Bytes &b) {
+	const size_t p = gcOffset(b), n = size_t(b[p + 8]) | (size_t(b[p + 9]) << 8) |
+		(size_t(b[p + 10]) << 16) | (size_t(b[p + 11]) << 24);
+	put16(b, 0x100 + 22, sum16(b, p, p + n));
+}
 
 // Generates the documented binary v1.3 / IPDS v3 32-bit-base layout.
-static Bytes fixture(bool includeGc = true, uint8_t gcRevision = 0) {
+static Bytes fixture(bool includeGc = true, uint8_t gcRevision = 0, uint8_t gcMinor = 3) {
 	const size_t prefix = 0x100, bin = 60, ipds = prefix + bin, die = ipds + 80;
 	const unsigned count = includeGc ? 2 : 1;
 	const size_t records = 4 + (includeGc ? 12 : 0) + 12;
 	const size_t tableSize = 80 + records;
-	const size_t binSize = bin + tableSize;
+	const size_t gcTableSize = includeGc ? 164 : 0;
+	const size_t binSize = bin + tableSize + gcTableSize;
 	Bytes b(prefix + binSize + 32, 0); // trailing ROM padding must not legitimize bad nested bounds
 	put32(b, prefix, 0x28211407); put16(b, prefix + 4, 1); put16(b, prefix + 6, 3); put16(b, prefix + 10, uint16_t(binSize));
 	put16(b, prefix + 12, uint16_t(bin)); put16(b, prefix + 16, uint16_t(tableSize));
 	put32(b, ipds, 0x53445049); put16(b, ipds + 4, 3); put16(b, ipds + 6, uint16_t(tableSize));
 	put16(b, ipds + 12, 1); put16(b, ipds + 14, 0); put16(b, ipds + 16, uint16_t(die - prefix));
 	put16(b, die, 0); put16(b, die + 2, uint16_t(count));
+	if (includeGc) {
+		const size_t gc = prefix + bin + tableSize;
+		const uint32_t gcDeclaredSize = gcMinor == 0 ? 88 : gcMinor == 1 ? 100 : gcMinor == 2 ? 132 : 164;
+		put16(b, prefix + 20, uint16_t(bin + tableSize)); put16(b, prefix + 24, uint16_t(gcTableSize));
+		put32(b, gc, 0x4347); put16(b, gc + 4, 1); put16(b, gc + 6, gcMinor); put32(b, gc + 8, gcDeclaredSize);
+		put32(b, gc + 12, 2); put32(b, gc + 16, 4); put32(b, gc + 20, 0);
+		put32(b, gc + 24, 4); put32(b, gc + 60, 16); put32(b, gc + 76, 2);
+		repairGcChecksum(b);
+	}
 	size_t p = die + 4;
 	if (includeGc) {
 		put16(b, p, 11); b[p+2] = 0; b[p+3] = 1; b[p+4] = 12; b[p+5] = 0; b[p+6] = gcRevision;
@@ -75,6 +91,17 @@ int main(int argc, char **argv) {
 	uint32_t off = 0;
 	CHECK(d.regByteOffset(IpDiscovery::HwGc, 0, 0, 3, off) && off == 0x400c);
 	CHECK(!d.regByteOffset(IpDiscovery::HwGc, 0, 0, UINT32_MAX, off));
+	IpDiscovery::GcTopology topology {};
+	CHECK(d.gcTopology(topology));
+	CHECK(topology.shaderEngines == 2 && topology.shaderArraysPerEngine == 2 && topology.wgpPerArray == 4);
+	CHECK(topology.renderBackendsPerEngine == 4 && topology.maxWavesPerSimd == 16 && topology.cuPerArray == 8 && topology.maxComputeUnits == 32);
+	for (uint8_t minor = 0; minor < 3; ++minor) {
+		Bytes versioned = fixture(true, 0, minor);
+		CHECK(d.init(versioned.data(), versioned.size()));
+		CHECK(d.gcTopology(topology));
+		CHECK(topology.shaderEngines == 2 && topology.shaderArraysPerEngine == 2 && topology.wgpPerArray == 4);
+		CHECK(topology.renderBackendsPerEngine == 4 && topology.maxWavesPerSimd == 16 && topology.cuPerArray == 8 && topology.maxComputeUnits == 32);
+	}
 
 	Bytes b = fixture(true, 1); CHECK(d.init(b.data(), b.size())); CHECK(d.findIp(IpDiscovery::HwGc, 0, ip) && ip.revision == 1);
 	Bytes paddedTable = fixture();
@@ -104,6 +131,19 @@ int main(int argc, char **argv) {
 	repairTableChecksum(bad); repairBinaryChecksum(bad);
 	CHECK(!d.init(bad.data(), bad.size()));
 	bad = fixture(false); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.findIp(IpDiscovery::HwGc, 0, ip));
+	CHECK(!d.gcTopology(topology)); CHECK(topology.maxComputeUnits == 0);
+	bad = fixture(); put16(bad, 0x100 + 22, uint16_t(u16(bad, 0x100 + 22) + 1)); repairBinaryChecksum(bad);
+	CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology)); // bad GC checksum is optional-table failure
+	bad = fixture(); bad[gcOffset(bad)] ^= 1; repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put32(bad, gcOffset(bad), 0); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put16(bad, gcOffset(bad) + 6, 4); repairGcChecksum(bad); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put16(bad, gcOffset(bad) + 4, 2); repairGcChecksum(bad); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put32(bad, gcOffset(bad) + 12, 0); repairGcChecksum(bad); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put32(bad, gcOffset(bad) + 12, UINT32_MAX); repairGcChecksum(bad); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put16(bad, 0x100 + 24, 163); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put16(bad, 0x100 + 20, uint16_t(u16(bad, 0x100 + 12))); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put32(bad, gcOffset(bad) + 8, 165); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
+	bad = fixture(); put32(bad, gcOffset(bad) + 16, 0); repairGcChecksum(bad); repairBinaryChecksum(bad); CHECK(d.init(bad.data(), bad.size())); CHECK(!d.gcTopology(topology));
 	bad = fixture(); put16(bad, 0x100 + 60 + 6, 80 + 4 + 12 + 11); // nested table truncation despite trailing ROM padding
 	repairTableChecksum(bad); repairBinaryChecksum(bad);
 	CHECK(!d.init(bad.data(), bad.size()));

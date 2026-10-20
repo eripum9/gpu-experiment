@@ -2,7 +2,7 @@
 """Fetch the small, pinned input set required by the macOS compile check.
 
 This downloads only the MacKernelSDK headers/libraries used by the Makefile and
-the ten AMD firmware blobs it embeds. It does not clone linux-firmware or run
+the twenty AMD firmware blobs it embeds. It does not clone linux-firmware or run
 third-party build scripts.
 """
 from __future__ import annotations
@@ -40,6 +40,16 @@ GOOGLESOURCE_RAW = (
 # Googlesource mirror returns base64 with ?format=TEXT, so it is decoded before
 # checking against these same hashes.
 FIRMWARE = {
+    "gc_12_0_0_imu.bin": (132352, "aa15e5b3156bffc45e0c50bccbcd364fbd3f958531b695b7487a803d780b8328"),
+    "gc_12_0_0_me.bin": (267568, "c288e326b9a5ccccac377455db3c25ace047a42a8e9e5a2239b5554dd2a9a9e7"),
+    "gc_12_0_0_mec.bin": (259584, "9b0788eb46efa7d53a1d87cfe3031cd403ec1eef04314af2a55257883a4560d1"),
+    "gc_12_0_0_pfp.bin": (159616, "cb6eb3ce40c79b0ada234b70ed038983627af78287afd7e5e26123dbcf7e79f8"),
+    "gc_12_0_0_rlc.bin": (150704, "6436b582734a413456fff3d3c7195e71cc9e78a7ed31ee21c83ffd6fae1ad186"),
+    "gc_12_0_0_uni_mes.bin": (299408, "309d60ad4a0210f8a68e27cae88beddb22b5ae900d70848b1e8ca0eac9d1decd"),
+    "psp_14_0_2_sos.bin": (421216, "7b538448b57d4f9dd06b2eea90d4f86a16e65e3027cdecee8db71c2c5f1fa243"),
+    "psp_14_0_2_ta.bin": (278764, "21b8898e56524240c19a1f834fcea3dde7d98c33044658a1641f0cb3c3b1bddd"),
+    "sdma_7_0_0.bin": (47872, "beaafb53993a106edd392392d5896245ae2a957c6d0f495d0002eec72ad8ad38"),
+    "smu_14_0_2.bin": (333236, "1b2054e3f710d1ab8dbdf6ff35914ad376b51caa6337831260c955add874b2ee"),
     "gc_12_0_1_imu.bin": (132352, "b3b301fb636efc77b63ce4d2ced0f90c851d03c19681852faa45598e6f5773fd"),
     "gc_12_0_1_me.bin": (267600, "fd5eb0f205a3bb7ec41f42e83a54bdc69151706b02bbee073fa775b8270e4bec"),
     "gc_12_0_1_mec.bin": (259584, "83fe5e7bffe639ec9771219cde5c9809689168f769b147c86dfd5a1ca991c1a2"),

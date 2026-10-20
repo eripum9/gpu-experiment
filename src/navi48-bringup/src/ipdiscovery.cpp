@@ -4,6 +4,7 @@
 // table_info is 8 bytes. IPDS v3 uses the 32-bit ip_v3 base-address layout.
 static constexpr uint32_t kBinarySignature = 0x28211407;
 static constexpr uint32_t kIpdsSignature = 0x53445049;
+static constexpr uint32_t kGcSignature = 0x4347;
 static constexpr size_t kBinaryHeaderV1Size = 12 + 6 * 8;
 static constexpr size_t kIpdsV3HeaderSize = 80; // 12 + num_dies + 16 die_info + u16 padding
 
@@ -143,6 +144,62 @@ bool IpDiscovery::findIp(uint16_t hwId, uint8_t instance, IpEntry &out) const {
 		if (out.hwId == hwId && out.instance == instance) return true;
 	}
 	return false;
+}
+
+bool IpDiscovery::gcTopology(GcTopology &out) const {
+	out = {};
+	if (!valid) return false;
+	uint16_t binSize, tableOffset, tableChecksum, tableSize;
+	if (!readU16(binBase + 10, binSize) || !readU16(binBase + 20, tableOffset) ||
+	    !readU16(binBase + 22, tableChecksum) || !readU16(binBase + 24, tableSize)) return false;
+	// The table_info entry bounds the complete GC table independently of the
+	// binary header and of the declared inner table size.
+	if (tableOffset < kBinaryHeaderV1Size || tableOffset > binSize ||
+	    tableSize < 12 || tableSize > binSize - tableOffset) return false;
+	const size_t gc = binBase + tableOffset;
+	const size_t gcEnd = gc + tableSize;
+	if ((gc < dieEnd && gcEnd > binBase + 60) || gcEnd < gc) return false;
+	uint32_t signature;
+	uint16_t major, minor;
+	if (!readU32(gc, signature) || signature != kGcSignature ||
+	    !readU16(gc + 4, major) || !readU16(gc + 6, minor)) return false;
+	// gpu_info_header.size is a 32-bit value; require it inside table_info.
+	uint32_t declaredSize;
+	if (!readU32(gc + 8, declaredSize) || declaredSize < 12 || declaredSize > tableSize) return false;
+	size_t minimumSize;
+	if (major != 1) return false;
+	switch (minor) {
+	case 0: minimumSize = 88; break;
+	case 1: minimumSize = 100; break;
+	case 2: minimumSize = 132; break;
+	case 3: minimumSize = 164; break;
+	default: return false;
+	}
+	if (declaredSize < minimumSize) return false;
+	uint16_t sum = 0;
+	for (size_t i = gc; i < gc + declaredSize; ++i)
+		sum = static_cast<uint16_t>(sum + data[i]);
+	if (sum != tableChecksum) return false;
+	uint32_t se, wgp0, wgp1, rb, waves, sa;
+	if (!readU32(gc + 12, se) || !readU32(gc + 16, wgp0) ||
+	    !readU32(gc + 20, wgp1) || !readU32(gc + 24, rb) ||
+	    !readU32(gc + 60, waves) || !readU32(gc + 76, sa)) return false;
+	const uint64_t wgp = static_cast<uint64_t>(wgp0) + wgp1;
+	// Bound individual geometry before multiplication; these are generous
+	// architectural limits, not a claim about active/harvested hardware.
+	if (!se || se > 16 || !sa || sa > 16 || !wgp || wgp > 32 ||
+	    !rb || rb > 64 || !waves || waves > 1024) return false;
+	const uint64_t cuPerArray = wgp * 2;
+	const uint64_t maxCus = static_cast<uint64_t>(se) * sa * cuPerArray;
+	if (maxCus > 16384) return false;
+	out.shaderEngines = se;
+	out.shaderArraysPerEngine = sa;
+	out.wgpPerArray = static_cast<uint32_t>(wgp);
+	out.renderBackendsPerEngine = rb;
+	out.maxWavesPerSimd = waves;
+	out.cuPerArray = static_cast<uint32_t>(cuPerArray);
+	out.maxComputeUnits = static_cast<uint32_t>(maxCus);
+	return true;
 }
 
 bool IpDiscovery::regByteOffset(uint16_t hwId, uint8_t instance, uint8_t segment,

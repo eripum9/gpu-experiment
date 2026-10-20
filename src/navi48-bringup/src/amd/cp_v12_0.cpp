@@ -985,11 +985,11 @@ cp_config_rs64_caches(DeviceContext &dev, CPContext &cp)
 // not land (wrong segment / pipe not selected), not that the header is
 // empty.
 static bool
-cp_rs64_start_addr(FwId id, const char *what,
+cp_rs64_start_addr(const DeviceContext &dev, FwId id, const char *what,
                    uint32_t *out_lo, uint32_t *out_hi)
 {
     *out_lo = 0; *out_hi = 0;
-    const FwBlob *b = fw_get(id);
+    const FwBlob *b = fw_get(dev.firmwareFamily, id);
     if (b == nullptr || b->data == nullptr) {
         CP_LOG("config_gfx_rs64: %s firmware blob missing", what);
         return false;
@@ -1035,11 +1035,11 @@ cp_config_gfx_rs64(DeviceContext &dev, CPContext &cp)
 
     uint32_t pfp_lo = 0, pfp_hi = 0, me_lo = 0, me_hi = 0,
              mec_lo = 0, mec_hi = 0;
-    const bool have_pfp = cp_rs64_start_addr(FwId::GC_PFP, "PFP",
+    const bool have_pfp = cp_rs64_start_addr(dev, FwId::GC_PFP, "PFP",
                                              &pfp_lo, &pfp_hi);
-    const bool have_me  = cp_rs64_start_addr(FwId::GC_ME,  "ME",
+    const bool have_me  = cp_rs64_start_addr(dev, FwId::GC_ME,  "ME",
                                              &me_lo,  &me_hi);
-    const bool have_mec = cp_rs64_start_addr(FwId::GC_MEC, "MEC",
+    const bool have_mec = cp_rs64_start_addr(dev, FwId::GC_MEC, "MEC",
                                              &mec_lo, &mec_hi);
     if (!have_pfp || !have_me || !have_mec) {
         CP_LOG("config_gfx_rs64: missing RS64 firmware headers "

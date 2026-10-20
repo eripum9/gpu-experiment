@@ -358,7 +358,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         // Our bootloader chain (src/psp.cpp) already booted SOS before the ladder
         // runs; still parse the container so the TOC/RL sub-bins are known
         // (psp_setup_tmr's LOAD_TOC and psp_rl_load need them).
-        const FwBlob *sos = fw_get(FwId::PSP_SOS);
+        const FwBlob *sos = fw_get(dev.firmwareFamily, FwId::PSP_SOS);
         if (!sos || !sos->data) { INIT_LOG("PSPLoadSOS: embedded SOS container missing"); return kIOReturnNotFound; }
         kern_return_t r = psp_parse_sos_microcode(ctx.psp, sos->data, sos->size);
         if (r != kIOReturnSuccess) { INIT_LOG("PSPLoadSOS: SOS container parse failed %#x", r); return r; }
@@ -445,7 +445,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
     case BringupStage::MESInit: {
         kern_return_t r = ensure_gfxhub_gart(ctx);
         if (r != kIOReturnSuccess) return r;
-        // uni_mes firmware bytes default to fw_get(FwId::GC_UNI_MES); LOAD_IP_FW of
+        // uni_mes firmware defaults to this device's family; LOAD_IP_FW of
         // CP_MES/CP_MES_DATA already happened in PSPFwLoad (reference order).
         r = mes_init_full(dev, ctx.psp, ctx.gmc, ctx.mes);
         if (r != kIOReturnSuccess) {

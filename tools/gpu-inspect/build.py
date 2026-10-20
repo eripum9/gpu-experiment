@@ -66,6 +66,9 @@ def main():
         return
     profile_test = compile_host(cxx, "gpu-profile-test", [TESTS / "gpu_profile_test.cpp"])
     discovery_test = compile_host(cxx, "ipdiscovery-test", [TESTS / "ipdiscovery_test.cpp", SRC / "ipdiscovery.cpp"])
+    firmware_test = compile_host(cxx, "fw-profile-test", [TESTS / "fw_profile_test.cpp",
+                                                       TESTS / "fw_stub_data.cpp", SRC / "amd/fw_table.cpp"])
+    run([firmware_test])
     run([profile_test])
     run([discovery_test])
     with tempfile.TemporaryDirectory(prefix="fixtures-", dir=BUILD) as temporary:
@@ -78,6 +81,8 @@ def main():
             assert result["ok"] and result["profile"]["gc_compatible"]
             assert result["bringup_enabled"] is enabled
             assert result["ip_count"] == len(result["ips"]) == 2
+            assert result["gc_topology"]["status"] == "capacity"
+            assert result["gc_topology"]["max_compute_units"] == 32
         for filename, pci, status in (("navi44.bin", "1002:7550", 4),
                                       ("navi48.bin", "1002:7590", 4),
                                       ("missing-gc.bin", "1002:7590", 4),

@@ -24,7 +24,7 @@ kern_return_t fw_loader_prepare(DeviceContext &dev, PSPContext &psp, FwLoaderSta
         { FwId::SDMA,       kHostFwFile_SDMA,                  "sdma"    },
     };
     for (const Plan &pl : plans) {
-        const FwBlob *b = fw_get(pl.id);
+        const FwBlob *b = fw_get(dev.firmwareFamily, pl.id);
         if (!b || !b->data || b->size == 0) { UCODE_LOG("loader: blob %s missing — skipped", pl.what); continue; }
         UcodePayload out[kMaxUcodePayloadsPerFile];
         uint32_t n = amdgpu_ucode_extract(pl.host, b->data, b->size, out);

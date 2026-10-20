@@ -25,7 +25,9 @@ FW_SRCS  := $(patsubst firmware/%.bin,src/fw/fw_%.c,$(FW_BINS))
 # REQUIRED blobs: AMD firmware from linux-firmware, NOT in this repository (see BUILDING.md and
 # tools/fetch-firmware.sh). The kext cannot link without them, so fail early with a clear message.
 FW_REQUIRED := gc_12_0_1_imu gc_12_0_1_me gc_12_0_1_mec gc_12_0_1_pfp gc_12_0_1_rlc gc_12_0_1_uni_mes \
-               psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3
+               psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3 \
+               gc_12_0_0_imu gc_12_0_0_me gc_12_0_0_mec gc_12_0_0_pfp gc_12_0_0_rlc gc_12_0_0_uni_mes \
+               psp_14_0_2_sos psp_14_0_2_ta sdma_7_0_0 smu_14_0_2
 FW_MISSING  := $(filter-out $(patsubst firmware/%.bin,%,$(FW_BINS)),$(FW_REQUIRED))
 # Our own compute test shaders, assembled from shaders/*.s (tools/build-shader.sh) and tracked as
 # shaders/*.bin so no LLVM is needed to build the kext.

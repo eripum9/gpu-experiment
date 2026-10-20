@@ -4,6 +4,7 @@
 //
 #include "Navi48Bringup.hpp"
 #include "gpu_profile.hpp"
+#include "fw/fw_table.h"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
 #include "apple/AppleHardwareHook.hpp"
@@ -40,14 +41,35 @@
 #include <kern/clock.h>             // clock_get_uptime/absolutetime_to_nanoseconds - the owner's wait and non-owner
                                      // yields are both timed (mirrors AppleHardwareHook.cpp's n48_pol_ns)
 
-extern "C" {
-extern const uint8_t fw_psp_14_0_3_sos[];
-extern const size_t  fw_psp_14_0_3_sos_size;
-}
-
 OSDefineMetaClassAndStructors(Navi48Bringup, IOService)
 
 namespace {
+// Check the map before any PSP/SMU access or interrupt setup. Also validate
+// every discovered instance of SDMA (some tables use hardware id 43).
+bool discoveryMatchesProfile(const IpDiscovery &discovery, const cobalt::GpuProfile &profile) {
+	struct ExpectedIp { uint16_t hwId; cobalt::Version version; };
+	const ExpectedIp expected[] = {
+		{IpDiscovery::HwGc, profile.gc}, {IpDiscovery::HwMp0, profile.psp},
+		{IpDiscovery::HwMp1, profile.smu}, {IpDiscovery::HwSdma0, profile.sdma},
+		{IpDiscovery::HwDmu, profile.dcn}
+	};
+	if (!discovery.isValid()) return false;
+	for (const auto &required : expected) {
+		IpDiscovery::IpEntry entry;
+		if (!discovery.findIp(required.hwId, 0, entry) ||
+		    !cobalt::version_matches(required.version, {entry.major, entry.minor, entry.revision})) return false;
+	}
+	for (uint16_t i = 0; i < discovery.ipCount(); ++i) {
+		IpDiscovery::IpEntry entry;
+		if (!discovery.ipAt(i, entry)) return false;
+		const cobalt::Version actual {entry.major, entry.minor, entry.revision};
+		if (entry.hwId == 43 && !cobalt::version_matches(profile.sdma, actual)) return false;
+		for (const auto &required : expected)
+			if (entry.hwId == required.hwId && !cobalt::version_matches(required.version, actual)) return false;
+	}
+	return true;
+}
+
 // Everything the kext puts in VRAM fits in this span above vramBase:
 //   +0x000000 fw_pri (1 MiB)   +0x100000 PSP ring/cmd/fence   +0x200000 TMR (4 MiB)
 //   +0x1000000 fw_buf (8 MiB)  — mirrors mac-amdgpu's layout, relocated.
@@ -573,6 +595,18 @@ void Navi48Bringup::stagePSP() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("navi48-psp", &on, sizeof(on)) || on == 0) on = targetStage >= 5;
 	if (!on) return;
+	const uint32_t vendorDevice = pciDevice ? pciDevice->configRead32(kIOPCIConfigVendorID) : 0;
+	const cobalt::GpuProfile *profile = cobalt::profile_for_pci(
+		static_cast<uint16_t>(vendorDevice), static_cast<uint16_t>(vendorDevice >> 16));
+	if (!profile || !profile->bringupEnabled || !discoveryMatchesProfile(ipDiscovery, *profile)) {
+		N48LOG("psp-stage: disabled or incompatible PCI/IP profile; refusing before VRAM/mailbox writes");
+		setProperty("PSP,Stage", "profile-refused"); return;
+	}
+	const amdgpu::FwBlob *sos = amdgpu::fw_get(profile->family, amdgpu::FwId::PSP_SOS);
+	if (!sos || !sos->data || !sos->size) {
+		N48LOG("psp-stage: profile SOS firmware missing; aborting");
+		setProperty("PSP,Stage", "missing-firmware"); return;
+	}
 	N48LOG("psp-stage: requested (navi48-psp=1) — this stage WRITES to VRAM and the PSP mailbox");
 	setProperty("PSP,Stage", "requested");
 
@@ -584,7 +618,7 @@ void Navi48Bringup::stagePSP() {
 
 	HwBridge hw(this);
 	n48::PspLoader psp(hw);
-	if (!psp.parseContainer(fw_psp_14_0_3_sos, fw_psp_14_0_3_sos_size)) {
+	if (!psp.parseContainer(sos->data, sos->size)) {
 		N48LOG("psp-stage: embedded container failed to parse; aborting"); setProperty("PSP,Stage", "bad-container"); return;
 	}
 	setProperty("PSP,ContainerSOSVersion", static_cast<uint64_t>(psp.sosVersion()), 32);
@@ -610,6 +644,13 @@ void Navi48Bringup::stagePSP() {
 // ---------------------------------------------------------------------------
 
 bool Navi48Bringup::buildDeviceContext() {
+	dev.firmwareFamily = cobalt::Family::Unknown;
+	const uint32_t vendorDevice = pciDevice ? pciDevice->configRead32(kIOPCIConfigVendorID) : 0;
+	const cobalt::GpuProfile *profile = cobalt::profile_for_pci(
+		static_cast<uint16_t>(vendorDevice), static_cast<uint16_t>(vendorDevice >> 16));
+	if (!profile || !profile->bringupEnabled || !discoveryMatchesProfile(ipDiscovery, *profile)) {
+		N48LOG("dev: disabled or incompatible PCI/IP profile; refusing before enabling DMA"); return false;
+	}
 	// Stages >= 6 DMA into system memory (IH ring, GART-mapped buffers, MES
 	// queues): the PCI nub must be a bus master. Memory space is already on.
 	pciDevice->setBusMasterEnable(true);
@@ -624,6 +665,7 @@ bool Navi48Bringup::buildDeviceContext() {
 	if (fbBase == 0xFFFFFFFF) { N48LOG("dev: cannot read FB_LOCATION_BASE"); return false; }
 	dev.vramMcBase = static_cast<uint64_t>(fbBase & 0x00FFFFFF) << 24;
 	if (!amdgpu::fill_ip_base_table(ipDiscovery, dev.ip)) { N48LOG("dev: IP base table incomplete"); return false; }
+	dev.firmwareFamily = profile->family;
 	N48LOG("dev: context ready — MC base 0x%llx, region vram+[0x%llx, 0x%llx), GC base 0x%x MP0 base 0x%x MMHUB base 0x%x",
 	       dev.vramMcBase, dev.vramBase, dev.vramLimit, dev.ip.get(amdgpu::IPBlock::GC),
 	       dev.ip.get(amdgpu::IPBlock::MP0), dev.ip.get(amdgpu::IPBlock::MMHUB));
@@ -7391,10 +7433,8 @@ bool Navi48Bringup::start(IOService *provider) {
 		return rejectProfile();
 	} else {
 		surveyIPs();
-		IpDiscovery::IpEntry gcIp;
-		if (!profile || !ipDiscovery.findIp(IpDiscovery::HwGc, 0, gcIp) ||
-		    !cobalt::gc_matches(*profile, {gcIp.major, gcIp.minor, gcIp.revision})) {
-			N48LOG("start: GC IP version missing or incompatible with the selected GPU profile — stopping before PSP/SMU/interrupt stages");
+		if (!profile || !discoveryMatchesProfile(ipDiscovery, *profile)) {
+			N48LOG("start: critical IP version missing or incompatible with the selected GPU profile — stopping before PSP/SMU/interrupt stages");
 			return rejectProfile();
 		}
 		surveyPSP();

@@ -30,6 +30,17 @@
 
 class IpDiscovery {
 public:
+	// Maximum GC geometry advertised by the discovery table. These are
+	// capacity values; they do not describe harvested/active compute units.
+	struct GcTopology {
+		uint32_t shaderEngines;
+		uint32_t shaderArraysPerEngine;
+		uint32_t wgpPerArray;
+		uint32_t renderBackendsPerEngine;
+		uint32_t maxWavesPerSimd;
+		uint32_t cuPerArray;
+		uint32_t maxComputeUnits;
+	};
 	// Hardware IP ids (Linux soc15_hw_ip.h) we care about.
 	enum HwId : uint16_t {
 		HwMp1    = 1,
@@ -67,6 +78,10 @@ public:
 
 	// Find a specific IP block instance.
 	bool findIp(uint16_t hwId, uint8_t instance, IpEntry &out) const;
+
+	// Read optional GC_INFO table index 1. Failure clears `out` and does not
+	// affect validity of the IP discovery binary.
+	bool gcTopology(GcTopology &out) const;
 
 	// Convenience: absolute MMIO *byte* offset of a register, given its
 	// segment index and dword offset within the segment (the BASE_IDX /

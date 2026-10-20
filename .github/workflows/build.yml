@@ -44,6 +44,7 @@ jobs:
             build/gpu-inspect/gpu-inspect
             build/gpu-inspect/gpu-profile-test
             build/gpu-inspect/ipdiscovery-test
+            build/gpu-inspect/fw-profile-test
           if-no-files-found: error
           retention-days: 7
 

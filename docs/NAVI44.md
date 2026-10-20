@@ -10,14 +10,21 @@ It does not implement an accelerated Navi 44 driver.
   Navi 44 / gfx1200. Navi 44 is recognized but driver bring-up remains disabled.
 - Both probe and start reject disabled or unknown devices before hardware
   initialization. Existing IOKit PCI matching is unchanged.
-- Startup requires the discovered GC IP to match the enabled profile before
-  the PSP/SMU/interrupt stages, and cleans up failed discovery state.
+- Startup requires the discovered GC, PSP, SMU, SDMA, and DCN IP versions to
+  match the enabled profile before the PSP/SMU/interrupt stages, and cleans
+  up failed discovery state.
 - The offline inspector reuses the kernel's IP Discovery parser to report
   IP versions, instances, register bases, and GC/profile agreement as JSON.
   The supported input format is binary v1.3, IPDS v3, single die 0, with
   32-bit bases. Other formats are explicitly rejected.
 - The parser validates container bounds, both checksums, complete IP records,
   and register-offset arithmetic. Fixture tests run without a GPU or macOS.
+- Optional GC_INFO v1.0 through v1.3 parsing reports maximum SE/SA/WGP/CU
+  capacity after validating its bounds and checksum. It does not report
+  harvested or active CU counts.
+- Firmware lookup uses an explicit per-device family with separate embedded
+  sets. Unknown families and missing slots return no firmware. Host tests
+  exercise the actual lookup implementation with synthetic blob symbols.
 
 The inspector opens an existing file only. It never reads hardware, enables
 the driver, or extracts a ROM. A conventional expansion VBIOS dump may not
@@ -41,8 +48,9 @@ powershell -File tools/gpu-inspect/collect-windows.ps1 -OutputPath hardware.json
 ```
 
 Keep hardware reports and real ROMs out of the public repository. Test
-fixtures are synthetic; a successful fixture run does not establish that
-the stricter parser accepts any particular physical card's data.
+fixtures are synthetic. A private native-Linux capture from the target card
+also passed the binary/IPDS checksums, all 42 IP records, and GC_INFO parsing;
+all record versions and bases agreed with the same capture's Linux sysfs.
 
 Inspector exit codes: 0 = parsed and requested GC agrees (if specified),
 2 = invalid arguments/file/format, 3 = unknown PCI ID, 4 = missing or mismatched
@@ -53,14 +61,18 @@ itself never performs bring-up. Navi 44 remains false even for a matching GC.
 
 For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md).
 
-1. Obtain this card's actual discovery data, firmware requirements, harvested
-   SE/SH/CU topology, and display routing. Extend the parser if the real
-   capture uses a different documented format.
-2. Select firmware by verified per-block IP versions. The existing embedded
-   GFX firmware is `gc_12_0_1_*`; the candidate requires the gfx1200 path.
-   The exact PSP/SMU/SDMA versions must not be guessed from the PCI ID.
-3. Adapt GFX initialization, memory and power management to verified data.
-4. Replace Navi48-specific DCN bases, mode/monitor captures, and output routing.
+1. Adapt the hardcoded GFX geometry to discovered capacity and independently
+   verified active/harvested topology. The captured GC_INFO v1.3 advertises
+   2 SE, 2 arrays per SE, 4 WGP per array, and maximum capacity of 32 CUs.
+   The existing hardware initialization still assumes Navi 48's 64 CUs.
+2. Implement and verify SMU 14.0.2 message/clock/feature mappings and memory
+   initialization. Correct firmware filenames do not establish compatibility
+   of the existing SMU 14.0.3 protocol.
+3. Verify PSP/SDMA/GFX initialization against the captured versions and
+   stage hardware testing before claiming support.
+4. Validate display routing and output programming. The captured DCN 4.1.0
+   segment bases match the current driver, but this does not prove that its
+   board-specific mode/monitor captures and output routing are suitable.
 5. Replace the RADV Darwin backend's canned gfx1201 device/PCI identity and
    carry verified target information through the Metal bundle.
 6. Build and test on macOS, then perform staged hardware validation on the
@@ -68,13 +80,21 @@ For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md
 
 ## Reference evidence
 
+The target capture identifies GC 12.0.0, PSP/SMU 14.0.2, SDMA 7.0.0, and
+DCN 4.1.0. The matching candidate firmware set is `gc_12_0_0_*`,
+`psp_14_0_2_{sos,ta}`, `smu_14_0_2`, and `sdma_7_0_0`; UNI_MES is the
+choice used by the existing Cobalt load ladder. Firmware inputs are pinned
+by size and SHA-256 in the CI dependency fetcher. Embedding them does not
+enable Navi 44 or implement its hardware-specific protocols.
+
 Linux v6.19 dispatches both GC 12.0.0 and 12.0.1 to the GFX12 implementation,
 but selects PSP/SMU/SDMA handlers using discovered versions. See
 [amdgpu_discovery.c](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c),
 [gfx_v12_0.c](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c),
 [firmware naming](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c),
 and [the discovery format](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/include/discovery.h).
-These references establish code reuse opportunities, not exact versions
-or register compatibility for an uninspected card.
+These references establish code reuse opportunities; the target versions
+above come from the private capture. Register/protocol compatibility still
+requires implementation and hardware validation.
 
 For hosted build setup and the compile-only artifacts, see [CI.md](CI.md).

@@ -20,4 +20,22 @@ static_assert(cobalt::gc_matches(*cobalt::profile_for_pci(0x1002, 0x7550), {12, 
 static_assert(!cobalt::gc_matches(*cobalt::profile_for_pci(0x1002, 0x7550), {12, 0, 0}), "mismatching GC rejected");
 static_assert(!cobalt::gc_matches(*cobalt::profile_for_pci(0x1002, 0x7550), {0, 0, 0}), "missing GC rejected");
 
+static_assert(cobalt::critical_ips_match(cobalt::kNavi48Profile,
+    {12, 0, 1}, {14, 0, 3}, {14, 0, 3}, {7, 0, 1}, {4, 1, 0}), "Navi48 critical versions accepted");
+static_assert(cobalt::critical_ips_match(cobalt::kNavi44Profile,
+    {12, 0, 0}, {14, 0, 2}, {14, 0, 2}, {7, 0, 0}, {4, 1, 0}), "measured Navi44 critical versions accepted as data");
+static_assert(!cobalt::critical_ips_match(cobalt::kNavi44Profile,
+    {12, 0, 1}, {14, 0, 2}, {14, 0, 2}, {7, 0, 0}, {4, 1, 0}), "wrong GC rejected");
+static_assert(!cobalt::critical_ips_match(cobalt::kNavi44Profile,
+    {12, 0, 0}, {14, 0, 3}, {14, 0, 2}, {7, 0, 0}, {4, 1, 0}), "wrong PSP rejected");
+static_assert(!cobalt::critical_ips_match(cobalt::kNavi44Profile,
+    {12, 0, 0}, {14, 0, 2}, {14, 0, 3}, {7, 0, 0}, {4, 1, 0}), "wrong SMU rejected");
+static_assert(!cobalt::critical_ips_match(cobalt::kNavi44Profile,
+    {12, 0, 0}, {14, 0, 2}, {14, 0, 2}, {7, 0, 1}, {4, 1, 0}), "wrong SDMA rejected");
+static_assert(!cobalt::critical_ips_match(cobalt::kNavi44Profile,
+    {12, 0, 0}, {14, 0, 2}, {14, 0, 2}, {7, 0, 0}, {4, 0, 1}), "wrong DCN rejected");
+static_assert(!cobalt::critical_ips_match(cobalt::kNavi48Profile,
+    {12, 0, 1}, {0, 0, 0}, {14, 0, 3}, {7, 0, 1}, {4, 1, 0}), "missing critical IP rejected");
+static_assert(!cobalt::kNavi44Profile.bringupEnabled, "matching data does not enable Navi44 hardware");
+
 int main() { return 0; }

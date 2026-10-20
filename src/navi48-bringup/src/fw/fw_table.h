@@ -11,13 +11,15 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../gpu_profile.hpp"
 
 namespace amdgpu {
 
-// Stable index space for every firmware blob the gfx1201 (Navi 48)
-// bring-up ladder can name. Not every id has embedded data on this card:
+// Stable index space for every firmware blob the bring-up ladder can name.
+// Family selection describes embedded data, not permission to run hardware.
+// Not every id has embedded data:
 // GC_MES / GC_MES1 (legacy split MES packaging — superseded here by
-// GC_UNI_MES) and GC_TOC (only loaded for psp_14_0_5, not psp_14_0_3)
+// GC_UNI_MES) and GC_TOC (not used by these non-kicker profiles)
 // have a table entry with data=nullptr, size=0. Always check
 // FwBlob::data before use. See PORTING.md and firmware/WHENCE.*.txt.
 enum class FwId : uint32_t {
@@ -44,12 +46,13 @@ struct FwBlob {
     FwId id;
 };
 
-// Returns the table entry for `id`, or nullptr if `id` is out of range
-// (i.e. >= FwId::Count). Never returns nullptr for any in-range id —
+// Returns the family table entry for `id`, or nullptr if family is unknown
+// or `id` is out of range (i.e. >= FwId::Count).
+// For a known family, every in-range id has an entry —
 // check ->data for blobs with no embedded bytes (see FwId comment above).
-const FwBlob *fw_get(FwId id);
+const FwBlob *fw_get(cobalt::Family family, FwId id);
 
-// Looks up by bare name (e.g. "smu_14_0_3"); returns nullptr if not found.
+// Searches all embedded families by bare name; nullptr if not found.
 const FwBlob *fw_find_by_name(const char *name);
 
 } // namespace amdgpu

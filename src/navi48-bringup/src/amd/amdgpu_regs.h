@@ -15,6 +15,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOReturn.h>
 #include "amdgpu_ip.h"
+#include "../gpu_profile.hpp"
 
 // Cast-clean version of the reference macro (identical arithmetic; avoids
 // -Wsign-conversion noise from int-typed mask/shift constants).
@@ -48,6 +49,8 @@ struct DeviceContext {
 
     // --- IP register bases from on-die discovery ---
     IPBaseTable ip;
+    // Assigned only after PCI identity and critical discovery versions agree.
+    cobalt::Family firmwareFamily { cobalt::Family::Unknown };
 
     // --- state flags kept for API compatibility with the reference ---
     bool psoCAlive { false };   // (sic) SOS alive

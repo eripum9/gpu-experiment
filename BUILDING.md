@@ -24,18 +24,26 @@
   ```
 
   This only copies files (no network) into `src/navi48-bringup/firmware/`, which is
-  gitignored. The kext embeds exactly these ten files from linux-firmware's `amdgpu/`:
+  gitignored. The compile target requires these twenty files from linux-firmware's `amdgpu/`:
 
   ```
   gc_12_0_1_imu.bin  gc_12_0_1_me.bin  gc_12_0_1_mec.bin  gc_12_0_1_pfp.bin
   gc_12_0_1_rlc.bin  gc_12_0_1_uni_mes.bin
   psp_14_0_3_sos.bin  psp_14_0_3_ta.bin
   sdma_7_0_1.bin  smu_14_0_3.bin
+  gc_12_0_0_imu.bin  gc_12_0_0_me.bin  gc_12_0_0_mec.bin  gc_12_0_0_pfp.bin
+  gc_12_0_0_rlc.bin  gc_12_0_0_uni_mes.bin
+  psp_14_0_2_sos.bin  psp_14_0_2_ta.bin
+  sdma_7_0_0.bin  smu_14_0_2.bin
   ```
 
   The Makefile stops with a list if any is missing. `tools/fetch-firmware.sh` prints the
-  sha256 of each copy against the revision the project was developed with; a different
-  linux-firmware revision may work, but only that one has been run.
+  sha256 of each copy against the pinned CI input revision. It warns on a mismatch.
+  The 12.0.0/14.0.2/7.0.0 set belongs to the disabled Navi 44 profile; embedding
+  firmware does not enable that target or implement its hardware protocols.
+
+For the smaller pinned download path used by CI, run `python3 tools/ci/fetch_deps.py`
+and use `MKSDK="$PWD/build/ci-deps/MacKernelSDK"`. See [docs/CI.md](docs/CI.md).
 
 ## Build
 

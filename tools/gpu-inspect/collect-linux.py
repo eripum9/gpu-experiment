@@ -158,8 +158,11 @@ def _read_ip(directory: Path, die_id: int, hw_id_path: int, instance_path: int,
                 addresses.append(value)
             except ValueError as exc:
                 errors.append({"path": str(directory / "base_addr"), "error": f"invalid base address line {index + 1}: {exc}"})
-    if count is not None and (count < 1 or count > 256):
-        errors.append({"path": str(directory / "num_base_addresses"), "error": "must be between 1 and 256"})
+    # Discovery can describe an IP with no MMIO segments (for example HWID
+    # 10 in the captured Navi 44 table). Zero is valid metadata, not a failed
+    # read; consumers must still refuse register access to absent segments.
+    if count is not None and (count < 0 or count > 256):
+        errors.append({"path": str(directory / "num_base_addresses"), "error": "must be between 0 and 256"})
     if count is not None and len(addresses) != count:
         errors.append({"path": str(directory / "base_addr"), "error": f"declares {count} addresses but contains {len(addresses)}"})
 
@@ -180,7 +183,7 @@ def _read_ip(directory: Path, die_id: int, hw_id_path: int, instance_path: int,
         "parsed": parsed,
         "base_addresses": [f"0x{address:08x}" for address in addresses],
         "valid": all(parsed[field] is not None for field in ("hw_id", "num_instance", "major", "minor", "revision", "harvest"))
-                 and count is not None and 1 <= count <= 256 and len(addresses) == count
+                 and count is not None and 0 <= count <= 256 and len(addresses) == count
                  and all(parsed[field] <= 255 for field in ("major", "minor", "revision") if parsed[field] is not None)
                  and parsed["hw_id"] == hw_id_path and parsed["num_instance"] == instance_path,
     }

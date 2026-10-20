@@ -221,6 +221,17 @@ class FakeSysfs(unittest.TestCase):
         self.assertEqual(base64.b64decode(connector["edid"]["data"]), b"fake-edid\x00")
         self.assertEqual(connector["edid"]["sha256"], hashlib.sha256(b"fake-edid\x00").hexdigest())
 
+    def test_zero_base_ip_is_valid_metadata(self):
+        self.add_ip(10, count=0, bases="", major=9)
+        self.write(self.device / "ip_discovery/die/0/num_ips", str(len(REQUIRED) + 1))
+        report = self.collect()
+        entry = next(ip for die in report["gpu"]["ip_discovery"]["dies"]
+                     for ip in die["ips"] if ip["hw_id_path"] == 10)
+        self.assertTrue(entry["valid"])
+        self.assertEqual(entry["base_addresses"], [])
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["errors"], [])
+
 
 class CliTests(unittest.TestCase):
     def test_output_is_exclusive_and_partial_exit_is_nonzero(self):

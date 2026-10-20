@@ -81,6 +81,8 @@ int main(int argc, char **argv) {
 
 	IpDiscovery::IpEntry gc {};
 	bool hasGc = discovery.findIp(IpDiscovery::HwGc, 0, gc);
+	IpDiscovery::GcTopology topology {};
+	const bool hasTopology = discovery.gcTopology(topology);
 	const cobalt::GpuProfile *profile = havePci ? cobalt::profile_for_pci(vendor, device) : nullptr;
 	const bool compatible = profile && hasGc && cobalt::gc_matches(*profile, {gc.major, gc.minor, gc.revision});
 	const bool unknownPci = havePci && !profile;
@@ -93,6 +95,17 @@ int main(int argc, char **argv) {
 	          << ",\"ip_count\":" << discovery.ipCount() << ",\"gc_present\":" << (hasGc ? "true" : "false")
 	          << ",\"gc_version\":";
 	if (hasGc) version(std::cout, gc.major, gc.minor, gc.revision); else std::cout << "null";
+	std::cout << ",\"gc_topology\":";
+	if (hasTopology) {
+		std::cout << "{\"status\":\"capacity\",\"shader_engines\":" << topology.shaderEngines
+		          << ",\"shader_arrays_per_engine\":" << topology.shaderArraysPerEngine
+		          << ",\"wgp_per_array\":" << topology.wgpPerArray
+		          << ",\"render_backends_per_engine\":" << topology.renderBackendsPerEngine
+		          << ",\"max_waves_per_simd\":" << topology.maxWavesPerSimd
+		          << ",\"cu_per_array\":" << topology.cuPerArray
+		          << ",\"max_compute_units\":" << topology.maxComputeUnits
+		          << ",\"meaning\":\"maximum capacity; active/harvested CU count is not reported\"}";
+	} else std::cout << "null";
 	std::cout << ",\"profile\":";
 	if (profile) {
 		std::cout << "{\"name\":\"" << jsonEscape(profile->name) << "\",\"gfx_target\":\"" << jsonEscape(profile->gfxTarget)
