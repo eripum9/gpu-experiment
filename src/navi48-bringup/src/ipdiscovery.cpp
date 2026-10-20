@@ -1,22 +1,11 @@
-//
-//  ipdiscovery.cpp
-//  RDNA4FB
-//
-//  See ipdiscovery.hpp for scope and the ROM this was validated against.
-//
-
 #include "ipdiscovery.hpp"
 
-// binary_header (discovery.h): u32 signature, u16 version_major,
-// u16 version_minor, u16 binary_checksum, u16 binary_size, then the
-// table_info list (v1: at +12; v2: u16 num_tables u16 pad, list at +16).
+// AMD discovery.h v6.19: binary_header v1 table_list begins at byte 12;
+// table_info is 8 bytes. IPDS v3 uses the 32-bit ip_v3 base-address layout.
 static constexpr uint32_t kBinarySignature = 0x28211407;
-// table_info: u16 offset (from binary start), u16 checksum, u16 size, u16 pad.
-// Table index 0 is IP_DISCOVERY.
-// ip_discovery_header: u32 "IPDS", u16 version, u16 size, u32 id,
-// u16 num_dies, then die_info[16] {u16 die_id; u16 die_offset} — offsets
-// relative to the *binary* start, not the table.
-static constexpr uint32_t kIpdsSignature = 0x53445049; // "IPDS" LE
+static constexpr uint32_t kIpdsSignature = 0x53445049;
+static constexpr size_t kBinaryHeaderV1Size = 12 + 6 * 8;
+static constexpr size_t kIpdsV3HeaderSize = 80; // 12 + num_dies + 16 die_info + u16 padding
 
 bool IpDiscovery::readU8(size_t off, uint8_t &v) const {
 	if (off >= size) return false;
@@ -25,13 +14,13 @@ bool IpDiscovery::readU8(size_t off, uint8_t &v) const {
 }
 
 bool IpDiscovery::readU16(size_t off, uint16_t &v) const {
-	if (off + 2 > size) return false;
-	v = static_cast<uint16_t>(data[off] | (data[off + 1] << 8));
+	if (off > size || size - off < 2) return false;
+	v = static_cast<uint16_t>(data[off] | (static_cast<uint16_t>(data[off + 1]) << 8));
 	return true;
 }
 
 bool IpDiscovery::readU32(size_t off, uint32_t &v) const {
-	if (off + 4 > size) return false;
+	if (off > size || size - off < 4) return false;
 	v = static_cast<uint32_t>(data[off]) |
 	    (static_cast<uint32_t>(data[off + 1]) << 8) |
 	    (static_cast<uint32_t>(data[off + 2]) << 16) |
@@ -39,46 +28,67 @@ bool IpDiscovery::readU32(size_t off, uint32_t &v) const {
 	return true;
 }
 
+bool IpDiscovery::validateIpList(size_t dieOffset, size_t tableEnd, uint16_t count) const {
+	if (dieOffset > tableEnd || tableEnd - dieOffset < 4 || count == 0 || count > 256)
+		return false;
+	size_t p = dieOffset + 4;
+	for (uint16_t i = 0; i < count; ++i) {
+		if (p > tableEnd || tableEnd - p < 8) return false;
+		uint8_t nbase;
+		if (!readU8(p + 3, nbase) || nbase > MaxBases) return false;
+		const size_t baseBytes = static_cast<size_t>(nbase) * 4;
+		if (tableEnd - p - 8 < baseBytes) return false;
+		p += 8 + baseBytes;
+	}
+	return true;
+}
+
 bool IpDiscovery::validateBinary(size_t offset) {
-	uint16_t vmajor, checksum, binSize;
-	if (!readU16(offset + 4, vmajor) || !readU16(offset + 8, checksum) ||
-	    !readU16(offset + 10, binSize))
-		return false;
-	if (binSize < 16 || offset + binSize > size)
-		return false;
-
-	// Checksum: 16-bit byte sum of everything after the checksum field.
-	uint16_t sum = 0;
-	for (size_t i = offset + 10; i < offset + binSize; i++)
-		sum = static_cast<uint16_t>(sum + data[i]);
-	if (sum != checksum)
-		return false;
-
-	// IP_DISCOVERY is table_list[0]; list position depends on header version.
-	size_t tableList = offset + (vmajor >= 2 ? 16 : 12);
-	uint16_t ipdOffset, ipdSize;
-	if (!readU16(tableList, ipdOffset) || !readU16(tableList + 4, ipdSize) ||
-	    ipdOffset == 0 || ipdSize < 80)
-		return false;
-
-	size_t ipd = offset + ipdOffset;
+	uint16_t major, minor, checksum, binSize;
 	uint32_t sig;
-	uint16_t numDies;
-	if (!readU32(ipd, sig) || sig != kIpdsSignature || !readU16(ipd + 12, numDies) || numDies == 0)
-		return false;
+	if (!readU32(offset, sig) || sig != kBinarySignature ||
+	    !readU16(offset + 4, major) || !readU16(offset + 6, minor) ||
+	    !readU16(offset + 8, checksum) || !readU16(offset + 10, binSize)) return false;
+	// Only the documented v1 header is implemented; don't guess at v2 layouts.
+	if (major != 1 || minor != 3 || binSize < kBinaryHeaderV1Size ||
+	    offset > size || size - offset < binSize) return false;
+	const size_t binEnd = offset + binSize;
+	uint16_t sum = 0;
+	for (size_t i = offset + 10; i < binEnd; ++i)
+		sum = static_cast<uint16_t>(sum + data[i]);
+	if (sum != checksum) return false;
 
-	// Single-die parts only (true for all dGPUs); die_info[0] at +14.
-	uint16_t dieOffset;
-	if (!readU16(ipd + 16, dieOffset) || dieOffset == 0)
-		return false;
+	uint16_t tableOffset, tableChecksum, tableSize;
+	if (!readU16(offset + 12, tableOffset) || !readU16(offset + 14, tableChecksum) ||
+	    !readU16(offset + 16, tableSize) || tableOffset < kBinaryHeaderV1Size || tableSize < kIpdsV3HeaderSize ||
+	    tableOffset > binSize || tableSize > binSize - tableOffset) return false;
+	const size_t ipds = offset + tableOffset;
 
-	size_t die = offset + dieOffset;
-	uint16_t nips;
-	if (!readU16(die + 2, nips) || nips == 0 || nips > 256)
-		return false;
+	uint32_t ipdsSig;
+	uint16_t ipdsVersion, ipdsSize, numDies;
+	if (!readU32(ipds, ipdsSig) || ipdsSig != kIpdsSignature ||
+	    !readU16(ipds + 4, ipdsVersion) || !readU16(ipds + 6, ipdsSize) ||
+	    !readU16(ipds + 12, numDies) || ipdsVersion != 3 || ipdsSize < kIpdsV3HeaderSize ||
+	    ipdsSize > tableSize || numDies != 1) return false;
+	// Linux verifies IP_DISCOVERY using ip_discovery_header.size as the
+	// checksum length. The enclosing table_info.size is an independent bound.
+	uint16_t tableSum = 0;
+	for (size_t i = ipds; i < ipds + ipdsSize; ++i)
+		tableSum = static_cast<uint16_t>(tableSum + data[i]);
+	if (tableSum != tableChecksum) return false;
+	uint16_t listedDieId, dieOffset;
+	if (!readU16(ipds + 14, listedDieId) || listedDieId != 0 ||
+	    !readU16(ipds + 16, dieOffset) || dieOffset < tableOffset + kIpdsV3HeaderSize ||
+	    dieOffset > tableOffset + ipdsSize) return false;
+	const size_t die = offset + dieOffset;
+	uint16_t dieId, nips;
+	const size_t ipdsEnd = ipds + ipdsSize;
+	if (!readU16(die, dieId) || dieId != 0 || !readU16(die + 2, nips) ||
+	    !validateIpList(die, ipdsEnd, nips)) return false;
 
 	binBase = offset;
 	dieBase = die;
+	dieEnd = ipdsEnd;
 	numIps = nips;
 	return true;
 }
@@ -87,58 +97,50 @@ bool IpDiscovery::init(const uint8_t *buffer, size_t bufferSize) {
 	data = buffer;
 	size = bufferSize;
 	valid = false;
-	if (!data || size < 512)
-		return false;
-
-	// The binary is not alignment-guaranteed within a flash dump (this ROM:
-	// 0x34900); scan for the signature on 4-byte steps.
-	for (size_t off = 0; off + 512 <= size; off += 4) {
+	binBase = dieBase = dieEnd = 0;
+	numIps = 0;
+	if (!data || size < kBinaryHeaderV1Size) return false;
+	const size_t lastStart = size - kBinaryHeaderV1Size;
+	for (size_t off = 0; off <= lastStart;) {
 		uint32_t sig;
 		if (readU32(off, sig) && sig == kBinarySignature && validateBinary(off)) {
 			valid = true;
 			return true;
 		}
+		if (lastStart - off < 4) break;
+		off += 4;
 	}
 	return false;
 }
 
 bool IpDiscovery::ipAt(uint16_t index, IpEntry &out) const {
-	if (!valid || index >= numIps)
-		return false;
-
-	// ip_v3/v4 with 32-bit bases: u16 hw_id, u8 instance, u8 num_base,
-	// u8 major, u8 minor, u8 revision, u8 sub/variant, u32 bases[].
-	// Walk the variable-size records to the requested index.
+	if (!valid || index >= numIps) return false;
 	size_t p = dieBase + 4;
-	for (uint16_t i = 0; ; i++) {
+	for (uint16_t i = 0; i <= index; ++i) {
+		if (p > dieEnd || dieEnd - p < 8) return false;
 		uint16_t hwId;
 		uint8_t inst, nbase, major, minor, rev;
 		if (!readU16(p, hwId) || !readU8(p + 2, inst) || !readU8(p + 3, nbase) ||
-		    !readU8(p + 4, major) || !readU8(p + 5, minor) || !readU8(p + 6, rev))
-			return false;
-
-		if (i == index) {
-			out.hwId = hwId;
-			out.instance = inst;
-			out.major = major;
-			out.minor = minor;
-			out.revision = rev;
-			out.numBases = nbase < MaxBases ? nbase : MaxBases;
-			for (uint8_t b = 0; b < out.numBases; b++)
-				if (!readU32(p + 8 + 4u * b, out.bases[b]))
-					return false;
-			return true;
-		}
-		p += 8 + 4u * nbase;
+		    !readU8(p + 4, major) || !readU8(p + 5, minor) || !readU8(p + 6, rev)) return false;
+		out.hwId = hwId;
+		out.instance = inst;
+		out.major = major;
+		out.minor = minor;
+		out.revision = rev;
+		out.numBases = nbase;
+		if (nbase > MaxBases || dieEnd - p - 8 < static_cast<size_t>(nbase) * 4) return false;
+		for (uint8_t b = 0; b < nbase; ++b)
+			if (!readU32(p + 8 + static_cast<size_t>(b) * 4, out.bases[b])) return false;
+		if (i == index) return true;
+		p += 8 + static_cast<size_t>(nbase) * 4;
 	}
+	return false;
 }
 
 bool IpDiscovery::findIp(uint16_t hwId, uint8_t instance, IpEntry &out) const {
-	for (uint16_t i = 0; i < numIps; i++) {
-		if (!ipAt(i, out))
-			return false;
-		if (out.hwId == hwId && out.instance == instance)
-			return true;
+	for (uint16_t i = 0; i < numIps; ++i) {
+		if (!ipAt(i, out)) return false;
+		if (out.hwId == hwId && out.instance == instance) return true;
 	}
 	return false;
 }
@@ -146,8 +148,10 @@ bool IpDiscovery::findIp(uint16_t hwId, uint8_t instance, IpEntry &out) const {
 bool IpDiscovery::regByteOffset(uint16_t hwId, uint8_t instance, uint8_t segment,
                                 uint32_t regDwordOffset, uint32_t &byteOffset) const {
 	IpEntry ip;
-	if (!findIp(hwId, instance, ip) || segment >= ip.numBases)
-		return false;
-	byteOffset = (ip.bases[segment] + regDwordOffset) * 4;
+	if (!findIp(hwId, instance, ip) || segment >= ip.numBases) return false;
+	const uint64_t dword = static_cast<uint64_t>(ip.bases[segment]) + regDwordOffset;
+	const uint64_t bytes = dword * 4;
+	if (bytes > UINT32_MAX) return false;
+	byteOffset = static_cast<uint32_t>(bytes);
 	return true;
 }

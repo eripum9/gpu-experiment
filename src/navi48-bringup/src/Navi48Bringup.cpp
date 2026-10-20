@@ -3,6 +3,7 @@
 //  bootloader chain when navi48-psp=1.
 //
 #include "Navi48Bringup.hpp"
+#include "gpu_profile.hpp"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
 #include "apple/AppleHardwareHook.hpp"
@@ -7331,15 +7332,28 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
 	auto *pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci) return nullptr;
 	uint32_t vendorDevice = pci->configRead32(kIOPCIConfigVendorID);
+	uint16_t vendor = static_cast<uint16_t>(vendorDevice & 0xffff);
 	uint16_t device = static_cast<uint16_t>(vendorDevice >> 16);
-	if ((vendorDevice & 0xffff) != 0x1002 || (device != 0x7550 && device != 0x7551)) {
-		N48LOG("probe: 0x%08x not Navi 48, ignoring", vendorDevice); return nullptr;
+	const cobalt::GpuProfile *profile = cobalt::profile_for_pci(vendor, device);
+	if (!profile) { N48LOG("probe: 0x%08x is not a supported GPU profile, ignoring", vendorDevice); return nullptr; }
+	if (!profile->bringupEnabled) {
+		N48LOG("probe: known %s (%s, 0x%04x) — bring-up disabled pending hardware validation", profile->name, profile->gfxTarget, device);
+		return nullptr;
 	}
-	N48LOG("probe: Navi 48 %s (0x%04x) — bring-up enabled", device == 0x7550 ? "RX 9070/XT" : "R9700", device);
+	N48LOG("probe: %s (%s, 0x%04x) — bring-up enabled", profile->name, profile->gfxTarget, device);
 	return this;
 }
 
 bool Navi48Bringup::start(IOService *provider) {
+	auto *candidate = OSDynamicCast(IOPCIDevice, provider);
+	if (!candidate) { N48LOG("start: provider is not PCI; refusing before initialization"); return false; }
+	uint32_t vendorDevice = candidate->configRead32(kIOPCIConfigVendorID);
+	const cobalt::GpuProfile *profile = cobalt::profile_for_pci(
+		static_cast<uint16_t>(vendorDevice & 0xffff), static_cast<uint16_t>(vendorDevice >> 16));
+	if (!profile || !profile->bringupEnabled) {
+		N48LOG("start: PCI profile 0x%08x is unknown or disabled; refusing before initialization", vendorDevice);
+		return false;
+	}
 	if (!super::start(provider)) return false;
 	if (!gVramMmLock) gVramMmLock = IOLockAlloc();   // never freed: a verb may hold it at stop
 	if (!gScanoutLock) gScanoutLock = IOLockAlloc(); // 0.0.272: never freed, same reason
@@ -7349,6 +7363,18 @@ bool Navi48Bringup::start(IOService *provider) {
 	pciDevice = OSDynamicCast(IOPCIDevice, provider);
 	gBringupPci = pciDevice;
 	gBringupSelf = this;
+	// A rejected discovery/profile must not leave exported helpers pointing
+	// at a service whose start() failed, or the parser at freed ROM storage.
+	auto rejectProfile = [this]() -> bool {
+		ipDiscovery.init(nullptr, 0);
+		if (onDieDisc) { IOFree(onDieDisc, n48::kDiscTmrSize); onDieDisc = nullptr; }
+		unmapRegisters();
+		if (gBringupSelf == this) {
+			gBringupSelf = nullptr;
+			if (gBringupPci == pciDevice) gBringupPci = nullptr;
+		}
+		return false;
+	};
 	navi48_fbwc_boot();   // 0.0.286: boot-arg navi48-fbwc=1 only; otherwise returns at once
 	// 0.0.386: the host-page range guard's RAM top, derived once from the EFI memory map. HERE because it
 	// must run exactly once, single-threaded, before any hook exists and therefore long before gfxc_read can be called; it
@@ -7358,12 +7384,19 @@ bool Navi48Bringup::start(IOService *provider) {
 	pciDevice->setMemoryEnable(true);
 	latchPciBars(pciDevice);   // 0.0.612 (review item A): every BAR's FULL base and size, once, for BoImportHost's device-page refusal
 
-	if (!mapRegisters()) { N48LOG("start: BAR5 unavailable — aborting"); return false; }
-	if (!probeMemSize())  { N48LOG("start: MMIO not usable — aborting"); unmapRegisters(); return false; }
+	if (!mapRegisters()) { N48LOG("start: BAR5 unavailable — aborting"); return rejectProfile(); }
+	if (!probeMemSize())  { N48LOG("start: MMIO not usable — aborting"); return rejectProfile(); }
 	if (!loadOnDieDiscovery()) {
-		N48LOG("start: IP discovery unavailable — MMIO works, but no register map");
+		N48LOG("start: IP discovery unavailable — refusing an unverified register map");
+		return rejectProfile();
 	} else {
 		surveyIPs();
+		IpDiscovery::IpEntry gcIp;
+		if (!profile || !ipDiscovery.findIp(IpDiscovery::HwGc, 0, gcIp) ||
+		    !cobalt::gc_matches(*profile, {gcIp.major, gcIp.minor, gcIp.revision})) {
+			N48LOG("start: GC IP version missing or incompatible with the selected GPU profile — stopping before PSP/SMU/interrupt stages");
+			return rejectProfile();
+		}
 		surveyPSP();
 		surveySMU();
 		if (!PE_parse_boot_argn("navi48-stage", &targetStage, sizeof(targetStage))) targetStage = 0;

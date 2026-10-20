@@ -8,7 +8,9 @@
 //  the same instead of hardcoding segment bases.
 //
 //  Freestanding like AtomBios: no IOKit, no allocation, reads from a caller
-//  buffer. Verified against a board ROM image
+//  buffer. Supports binary v1.3 / IPDS v3, single die 0, 32-bit bases.
+//  The caller must keep the borrowed buffer alive and immutable until reset.
+//  The original implementation was verified against a board ROM image
 //  (binary v1.3 at 0x34900, IPDS version 3, 1 die, 46 IPs — GC v12.0.1,
 //  DMU/DCN v4.1.0, NBIF v6.3.1) and cross-checked with Linux
 //  drivers/gpu/drm/amd/include/discovery.h and amdgpu_discovery.c.
@@ -78,10 +80,12 @@ private:
 	size_t size { 0 };
 	size_t binBase { 0 };    // offset of binary_header in data
 	size_t dieBase { 0 };    // offset of die_header in data
+	size_t dieEnd { 0 };     // end of the validated IPDS table
 	uint16_t numIps { 0 };
 	bool valid { false };
 
 	bool validateBinary(size_t offset);
+	bool validateIpList(size_t dieOffset, size_t tableEnd, uint16_t count) const;
 
 	bool readU8 (size_t off, uint8_t  &v) const;
 	bool readU16(size_t off, uint16_t &v) const;

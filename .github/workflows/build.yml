@@ -1,0 +1,53 @@
+name: macOS compile check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-compile:
+    name: Host tests and x86_64 kext compile
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Run offline host tests
+        run: python3 tools/gpu-inspect/build.py all
+
+      - name: Fetch pinned compile dependencies
+        run: python3 tools/ci/fetch_deps.py
+
+      - name: Compile x86_64 bring-up kext
+        run: make -C src/navi48-bringup MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
+
+      - name: Package compile-only artifacts
+        run: python3 tools/ci/package_compile_artifact.py --output "$RUNNER_TEMP/Navi48Bringup-compile-check.tar.gz"
+
+      - name: Upload offline inspector binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: offline-inspector-macos-x86_64
+          path: |
+            build/gpu-inspect/gpu-inspect
+            build/gpu-inspect/gpu-profile-test
+            build/gpu-inspect/ipdiscovery-test
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload compile-only kext artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Navi48Bringup-compile-check-Navi44-disabled
+          path: ${{ runner.temp }}/Navi48Bringup-compile-check.tar.gz
+          if-no-files-found: error
+          retention-days: 7
