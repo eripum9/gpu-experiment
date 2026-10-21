@@ -15,6 +15,14 @@ discovery path adds bounded reads of that same register around the snapshot
 to reject a changed size. A disagreement or invalid size stops the memory
 observations.
 
+Unique physical subrange mappings can use a newly allocated backing
+descriptor. The survey validates that descriptor's physical interval and
+length against the requested BAR subrange, together with the map's physical
+interval and permissions. It does not require the new descriptor to be the
+same object as the original BAR descriptor. Failed mapping checks publish
+their specific reason and observed metadata before any memory dereference.
+This follows [XNU's `makeMapping` implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/iokit/Kernel/IOMemoryDescriptor.cpp).
+
 If the existing BAR0 window covers the entire reported VRAM, the service
 can read the 10 KiB discovery table 64 KiB below the end of VRAM directly.
 It validates the binary and table checksums, critical IP versions, and GC

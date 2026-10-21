@@ -57,6 +57,7 @@ struct Device {
         CHECK(service.strings.at("CobaltSurvey,Status")==expected);
         CHECK(service.numbers.at("CobaltSurvey,Ready")==0);
         CHECK(testState.mapsLive==0); CHECK(testState.allocations==0);
+        CHECK(testState.backingDescriptorsLive==0);
         if (std::string(expected)!="discovery-snapshot-validated")
             CHECK(service.blobs.count("CobaltSurvey,DiscoverySnapshot")==0);
     }
@@ -148,23 +149,76 @@ static void pciGuards() {
 
 static void mappingFailures() {
     using Flag = bool IOMemoryDescriptor::*;
-    const Flag flags[] = {&IOMemoryDescriptor::mapFail,&IOMemoryDescriptor::mapTruncated,
-        &IOMemoryDescriptor::mapWrongPhysical,&IOMemoryDescriptor::mapWritable,
-        &IOMemoryDescriptor::mapCached,&IOMemoryDescriptor::mapWrongDescriptor,
-        &IOMemoryDescriptor::mapFragmented};
-    for (Flag flag : flags) {
-        Device d; d.mmio.*flag=true; d.run("memsize-map-failed");
-        CHECK(testState.memsizeReads==0); CHECK(d.vram.requests==0);
-    }
-    for (Flag flag : flags) {
-        Device d; d.vram.*flag=true; d.run("discovery-map-failed");
-        CHECK(testState.memsizeReads==2); CHECK(testState.mapRequests==2);
+    struct Failure { Flag flag; const char *reason; };
+    const Failure failures[] = {
+        {&IOMemoryDescriptor::mapFail,"map-null"},
+        {&IOMemoryDescriptor::mapTruncated,"map-length"},
+        {&IOMemoryDescriptor::mapWrongPhysical,"map-physical"},
+        {&IOMemoryDescriptor::mapWritable,"map-readonly"},
+        {&IOMemoryDescriptor::mapCached,"map-cache"},
+        {&IOMemoryDescriptor::mapWrongDescriptor,"descriptor-null"},
+        {&IOMemoryDescriptor::mapFragmented,"map-segment"},
+        {&IOMemoryDescriptor::mapDescriptorWrongLength,"descriptor-length"},
+        {&IOMemoryDescriptor::mapDescriptorWrongPhysical,"descriptor-physical"},
+        {&IOMemoryDescriptor::mapDescriptorFragmented,"descriptor-segment"},
+        {&IOMemoryDescriptor::mapDescriptorWrongSegment,"descriptor-segment"},
+        {&IOMemoryDescriptor::mapSegmentWrongPhysical,"map-segment"},
+        {&IOMemoryDescriptor::sourceWrongSegment,"source-segment"},
+        {&IOMemoryDescriptor::sourceFragmented,"source-segment"}
+    };
+    for (unsigned stage : {0u,1u}) {
+        for (const auto &failure : failures) {
+            Device d;
+            auto &memory = stage==0 ? d.mmio : d.vram;
+            memory.*failure.flag=true;
+            d.run(stage==0 ? "memsize-map-failed" : "discovery-map-failed");
+            CHECK(testState.memsizeReads==(stage==0 ? 0u : 2u));
+            CHECK(d.service.strings.at("CobaltSurvey,MapStage")== (stage==0 ? "memsize" : "discovery"));
+            CHECK(d.service.strings.at("CobaltSurvey,MapFailure")==failure.reason);
+            CHECK(d.service.numbers.at("CobaltSurvey,MapRequestedOffset")==memory.expectedOffset);
+            CHECK(d.service.numbers.at("CobaltSurvey,MapRequestedLength")==memory.expectedLength);
+            CHECK(d.service.numbers.at("CobaltSurvey,MapRequestedOptions")==
+                (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache));
+            if (failure.flag==&IOMemoryDescriptor::mapFail) {
+                CHECK(d.service.strings.at("CobaltSurvey,MapDescriptorIdentity")=="none");
+                CHECK(d.service.numbers.at("CobaltSurvey,MapObservedLength")==0);
+            } else if (failure.flag==&IOMemoryDescriptor::mapDescriptorWrongLength) {
+                CHECK(d.service.strings.at("CobaltSurvey,MapDescriptorIdentity")=="replacement");
+                CHECK(d.service.numbers.at("CobaltSurvey,MapDescriptorLength")==memory.expectedLength+1);
+                CHECK(d.service.numbers.at("CobaltSurvey,MapDescriptorPhysical")==memory.physical+memory.expectedOffset);
+            }
+            if (stage==0) CHECK(d.vram.requests==0);
+        }
     }
     {
         Device d; d.mmio.mapNullAddress=true; d.run("memsize-map-invalid"); CHECK(testState.memsizeReads==0);
+        CHECK(d.service.strings.at("CobaltSurvey,MapFailure")=="map-address");
     }
     {
         Device d; d.vram.mapNullAddress=true; d.run("discovery-map-invalid"); CHECK(testState.memsizeReads==2);
+        CHECK(d.service.strings.at("CobaltSurvey,MapFailure")=="map-address");
+    }
+    {
+        Device d; d.mmio.mapOriginalDescriptor=d.vram.mapOriginalDescriptor=true;
+        d.run("discovery-snapshot-validated"); CHECK(testState.backingDescriptorReleases==0);
+    }
+    {
+        // The default fake follows XNU's unique physical clone, so this test
+        // rejects the old map-descriptor == provider-descriptor assumption.
+        Device d; d.run("discovery-snapshot-validated");
+        CHECK(testState.backingDescriptorReleases==2);
+        CHECK(d.service.strings.count("CobaltSurvey,MapFailure")==0);
+    }
+    {
+        Device d; d.mmio.mapFail=true; d.run("memsize-map-failed");
+        d.service.stop(&d.pci); d.mmio.mapFail=false;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.count("CobaltSurvey,MapFailure")==0);
+        CHECK(d.service.strings.count("CobaltSurvey,MapStage")==0);
+        CHECK(d.service.strings.count("CobaltSurvey,MapDescriptorIdentity")==0);
+        CHECK(d.service.numbers.count("CobaltSurvey,MapRequestedLength")==0);
+        CHECK(d.service.numbers.count("CobaltSurvey,MapObservedLength")==0);
+        CHECK(d.service.numbers.count("CobaltSurvey,MapDescriptorLength")==0);
     }
 }
 

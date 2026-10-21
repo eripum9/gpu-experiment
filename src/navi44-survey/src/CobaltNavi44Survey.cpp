@@ -102,22 +102,110 @@ bool apertureUnchanged(IOPCIDevice *pci, unsigned index, const Aperture &a) {
 }
 
 class Map {
-public:
     IOMemoryMap *value {nullptr};
-    ~Map() { if (value) value->release(); }
+    const char *failure {"none"};
+    const char *descriptorIdentity {"none"};
+    uint64_t requestedOffset {0}, requestedLength {0};
+    uint64_t sourcePhysical {0}, sourceContiguous {0};
+    uint64_t mapPhysical {0}, mapLength {0}, mapSegmentPhysical {0}, mapContiguous {0};
+    uint64_t descriptorPhysical {0}, descriptorLength {0};
+    uint64_t descriptorSegmentPhysical {0}, descriptorContiguous {0};
+    IOOptionBits mapOptions {0};
+    bool fail(const char *reason) {
+        failure = reason;
+        reset();
+        return false;
+    }
+public:
+    ~Map() { reset(); }
+    void reset() { if (value) { value->release(); value = nullptr; } }
+    Map() = default;
+    Map(const Map &) = delete;
+    Map &operator=(const Map &) = delete;
+    static void clearFailure(IOService *service) {
+        const char *keys[] = {"MapStage", "MapFailure", "MapDescriptorIdentity",
+            "MapRequestedOffset", "MapRequestedLength", "MapRequestedOptions",
+            "MapSourcePhysical", "MapSourceContiguous", "MapObservedPhysical",
+            "MapObservedLength", "MapObservedOptions", "MapObservedSegmentPhysical",
+            "MapObservedContiguous", "MapDescriptorPhysical", "MapDescriptorLength",
+            "MapDescriptorSegmentPhysical", "MapDescriptorContiguous"};
+        for (const char *key : keys) {
+            char property[64];
+            snprintf(property, sizeof(property), "CobaltSurvey,%s", key);
+            service->removeProperty(property);
+        }
+    }
     bool create(const Aperture &a, uint64_t offset, uint64_t length) {
-        if (offset > a.length || length > a.length - offset ||
-            !range(a.physical + offset, length)) return false;
-        value = a.memory->createMappingInTask(kernel_task, 0, kMapOptions, offset, length);
-        if (!value || value->getLength() != length ||
-            value->getPhysicalAddress() != a.physical + offset ||
-            value->getMemoryDescriptor() != a.memory) return false;
-        const IOOptionBits options = value->getMapOptions();
-        if (!(options & kIOMapReadOnly) ||
-            (options & kIOMapCacheMask) != kIOMapInhibitCache) return false;
+        requestedOffset = offset;
+        requestedLength = length;
+        if (!a.memory || !range(a.physical, a.length) ||
+            offset > a.length || length > a.length - offset ||
+            !range(a.physical + offset, length)) return fail("request-range");
+        const uint64_t expectedPhysical = a.physical + offset;
         IOByteCount contiguous = 0;
-        return value->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone) ==
-            a.physical + offset && contiguous >= length;
+        sourcePhysical = a.memory->getPhysicalSegment(offset, &contiguous, kIOMemoryMapperNone);
+        sourceContiguous = contiguous;
+        if (sourcePhysical != expectedPhysical || contiguous < length)
+            return fail("source-segment");
+        value = a.memory->createMappingInTask(kernel_task, 0, kMapOptions, offset, length);
+        if (!value) return fail("map-null");
+        mapLength = value->getLength();
+        mapPhysical = value->getPhysicalAddress();
+        mapOptions = value->getMapOptions();
+        IOMemoryDescriptor *descriptor = value->getMemoryDescriptor();
+        if (descriptor) {
+            const bool original = descriptor == a.memory;
+            descriptorIdentity = original ? "original" : "replacement";
+            descriptorLength = descriptor->getLength();
+            descriptorPhysical = descriptor->getPhysicalAddress();
+            descriptorSegmentPhysical = descriptor->getPhysicalSegment(
+                original ? offset : 0, &contiguous, kIOMemoryMapperNone);
+            descriptorContiguous = contiguous;
+            mapSegmentPhysical = value->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+            mapContiguous = contiguous;
+        }
+        if (mapLength != length) return fail("map-length");
+        if (mapPhysical != expectedPhysical) return fail("map-physical");
+        if (!descriptor) return fail("descriptor-null");
+        // XNU IOMemoryDescriptor::makeMapping (xnu-12377.1.9) creates a new
+        // physical descriptor for kIOMapUnique and resets the map offset to 0.
+        // Pointer identity with the provider is therefore not an API invariant.
+        // Accept that replacement only when its entire physical interval is
+        // exactly the requested interval of the still-validated PCI descriptor.
+        const bool original = descriptor == a.memory;
+        if (descriptorLength != (original ? a.length : length))
+            return fail("descriptor-length");
+        if (descriptorPhysical != (original ? a.physical : expectedPhysical))
+            return fail("descriptor-physical");
+        if (descriptorSegmentPhysical != expectedPhysical || descriptorContiguous < length)
+            return fail("descriptor-segment");
+        if (!(mapOptions & kIOMapReadOnly)) return fail("map-readonly");
+        if ((mapOptions & kIOMapCacheMask) != kIOMapInhibitCache)
+            return fail("map-cache");
+        if (mapSegmentPhysical != expectedPhysical || mapContiguous < length)
+            return fail("map-segment");
+        return true;
+    }
+    void publishFailure(IOService *service, const char *stage, const char *reason = nullptr) {
+        if (reason) fail(reason);
+        // Bounded metadata only: never publish kernel pointers or mapped bytes.
+        service->setProperty("CobaltSurvey,MapStage", stage);
+        service->setProperty("CobaltSurvey,MapFailure", failure);
+        service->setProperty("CobaltSurvey,MapDescriptorIdentity", descriptorIdentity);
+        service->setProperty("CobaltSurvey,MapRequestedOffset", requestedOffset, 64);
+        service->setProperty("CobaltSurvey,MapRequestedLength", requestedLength, 64);
+        service->setProperty("CobaltSurvey,MapRequestedOptions", kMapOptions, 32);
+        service->setProperty("CobaltSurvey,MapSourcePhysical", sourcePhysical, 64);
+        service->setProperty("CobaltSurvey,MapSourceContiguous", sourceContiguous, 64);
+        service->setProperty("CobaltSurvey,MapObservedPhysical", mapPhysical, 64);
+        service->setProperty("CobaltSurvey,MapObservedLength", mapLength, 64);
+        service->setProperty("CobaltSurvey,MapObservedOptions", mapOptions, 32);
+        service->setProperty("CobaltSurvey,MapObservedSegmentPhysical", mapSegmentPhysical, 64);
+        service->setProperty("CobaltSurvey,MapObservedContiguous", mapContiguous, 64);
+        service->setProperty("CobaltSurvey,MapDescriptorPhysical", descriptorPhysical, 64);
+        service->setProperty("CobaltSurvey,MapDescriptorLength", descriptorLength, 64);
+        service->setProperty("CobaltSurvey,MapDescriptorSegmentPhysical", descriptorSegmentPhysical, 64);
+        service->setProperty("CobaltSurvey,MapDescriptorContiguous", descriptorContiguous, 64);
     }
     const volatile uint8_t *bytes() const {
         const uintptr_t address = value->getVirtualAddress();
@@ -178,6 +266,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     if (!pci || pci->configRead32(static_cast<UInt8>(0)) != kIdentity) return false;
     if (!super::start(provider)) return false;
     removeProperty("CobaltSurvey,DiscoverySnapshot");
+    Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);
@@ -227,6 +316,7 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
         status("pci-state-changed"); return;
     }
     if (!registers.create(mmio, kMemsizePage, kMemsizePageSize)) {
+        registers.publishFailure(this, "memsize");
         status("memsize-map-failed"); return;
     }
     if (!unchanged(pci, s) || !apertureUnchanged(pci, 5, mmio)) {
@@ -234,6 +324,7 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     }
     const volatile uint8_t *regBytes = registers.bytes();
     if (!regBytes || (reinterpret_cast<uintptr_t>(regBytes) & 3)) {
+        registers.publishFailure(this, "memsize", "map-address");
         status("memsize-map-invalid"); return;
     }
     if (!unchanged(pci, s) || !apertureUnchanged(pci, 5, mmio)) {
@@ -265,11 +356,15 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
         !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
     Map discovery;
-    if (!discovery.create(vram, offset, kDiscoverySize)) { status("discovery-map-failed"); return; }
+    if (!discovery.create(vram, offset, kDiscoverySize)) {
+        discovery.publishFailure(this, "discovery"); status("discovery-map-failed"); return;
+    }
     if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
         !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
     const volatile uint8_t *source = discovery.bytes();
-    if (!source) { status("discovery-map-invalid"); return; }
+    if (!source) {
+        discovery.publishFailure(this, "discovery", "map-address"); status("discovery-map-invalid"); return;
+    }
     if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
         !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
     if (readMemsize(regBytes) != first) { status("memsize-changed"); return; }
@@ -305,6 +400,8 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     if (failure) { IOFree(snapshot, kDiscoverySize); status(failure); return; }
     const uint64_t binaryOffset = parser.binaryOffset();
     const uint32_t ipCount = parser.ipCount();
+    discovery.reset();
+    registers.reset();
     OSData *data = OSData::withBytes(snapshot, static_cast<unsigned>(kDiscoverySize));
     IOFree(snapshot, kDiscoverySize);
     if (!data) { status("snapshot-publication-allocation-failed"); return; }

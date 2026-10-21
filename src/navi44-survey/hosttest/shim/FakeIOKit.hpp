@@ -17,7 +17,7 @@ using IOOptionBits = uint32_t;
 using IOByteCount = uint64_t;
 using task_t = void *;
 inline task_t kernel_task = reinterpret_cast<void *>(1);
-constexpr IOOptionBits kIOMapAnywhere = 1, kIOMapUnique = 2;
+constexpr IOOptionBits kIOMapAnywhere = 1, kIOMapUnique = 0x04000000;
 constexpr IOOptionBits kIOMapReadOnly = 0x1000, kIOMapInhibitCache = 0x100;
 constexpr IOOptionBits kIOMapCacheMask = 0xf00, kIOMemoryMapperNone = 0x800;
 
@@ -26,7 +26,7 @@ struct TestState {
     bool bootPresent = true, superStart = true, allocFail = false, dataFail = false;
     bool publicationFail = false;
     unsigned allocations = 0, mapsLive = 0, mapRequests = 0, mapReleases = 0;
-    unsigned memsizeReads = 0;
+    unsigned memsizeReads = 0, backingDescriptorsLive = 0, backingDescriptorReleases = 0;
     std::vector<uint32_t> memsizeValues;
     std::function<void(unsigned)> onMemsize;
 };
@@ -69,6 +69,8 @@ public:
     bool setProperty(const char *key, uint64_t value, unsigned) { numbers[key] = value; return true; }
     bool setProperty(const char *key, bool value) { numbers[key] = value ? 1 : 0; return true; }
     bool setProperty(const char *key, OSObject *object) {
+        if (testState.mapsLive || testState.backingDescriptorsLive)
+            throw std::runtime_error("GPU resources retained at snapshot publication");
         if (testState.publicationFail) return false;
         auto *value = dynamic_cast<OSData *>(object);
         if (!value) throw std::runtime_error("non OSData publication");
@@ -76,7 +78,8 @@ public:
     }
     void removeProperty(const char *key) { strings.erase(key); numbers.erase(key); blobs.erase(key); }
     void registerService() {
-        if (testState.mapsLive || testState.allocations) throw std::runtime_error("GPU resources retained at registerService");
+        if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)
+            throw std::runtime_error("GPU resources retained at registerService");
         registered = true;
     }
 };
@@ -84,19 +87,22 @@ public:
 class IOMemoryDescriptor;
 class IOMemoryMap : public OSObject {
 public:
-    uint64_t physical = 0, length = 0, contiguous = 0;
+    uint64_t physical = 0, length = 0;
     uintptr_t address = 0;
     IOOptionBits options = 0;
     IOMemoryDescriptor *descriptor = nullptr;
+    bool ownsDescriptor = false;
+    IOByteCount descriptorOffset = 0;
+    bool fragmented = false, wrongSegment = false;
     std::function<void()> onAddress;
     IOMemoryMap() { ++testState.mapsLive; }
-    ~IOMemoryMap() override { --testState.mapsLive; ++testState.mapReleases; }
+    ~IOMemoryMap() override;
     uint64_t getPhysicalAddress() { return physical; }
     IOByteCount getLength() { return length; }
     uintptr_t getVirtualAddress() { if (onAddress) onAddress(); return address; }
     IOOptionBits getMapOptions() { return options; }
     IOMemoryDescriptor *getMemoryDescriptor() { return descriptor; }
-    uint64_t getPhysicalSegment(IOByteCount, IOByteCount *n, IOOptionBits) { *n = contiguous; return physical; }
+    uint64_t getPhysicalSegment(IOByteCount offset, IOByteCount *n, IOOptionBits segmentOptions);
 };
 
 class IOMemoryDescriptor : public OSObject {
@@ -106,14 +112,26 @@ public:
     bool mapFail = false, mapTruncated = false, mapWrongPhysical = false;
     bool mapWritable = false, mapCached = false, mapNullAddress = false;
     bool mapWrongDescriptor = false, mapFragmented = false;
+    bool mapOriginalDescriptor = false, mapDescriptorWrongLength = false;
+    bool mapDescriptorWrongPhysical = false, mapDescriptorFragmented = false;
+    bool mapDescriptorWrongSegment = false, mapSegmentWrongPhysical = false;
+    bool sourceWrongSegment = false, sourceFragmented = false;
+    bool physicalSegmentWrong = false;
+    bool uniqueBacking = false;
     uint64_t expectedOffset = 0, expectedLength = 0;
     unsigned requests = 0;
     std::function<void()> onMap, onAddress;
+    ~IOMemoryDescriptor() override {
+        if (uniqueBacking) { --testState.backingDescriptorsLive; ++testState.backingDescriptorReleases; }
+    }
     uint64_t getPhysicalAddress() { return physical; }
     IOByteCount getLength() { return length; }
-    uint64_t getPhysicalSegment(IOByteCount, IOByteCount *n, IOOptionBits options) {
+    uint64_t getPhysicalSegment(IOByteCount offset, IOByteCount *n, IOOptionBits options) {
         if (options != kIOMemoryMapperNone) throw std::runtime_error("translated physical descriptor");
-        *n = contiguous; return physical;
+        if (offset >= length || offset >= contiguous) { *n = 0; return 0; }
+        *n = contiguous - offset;
+        if (sourceFragmented && offset) *n = expectedLength - 1;
+        return physical + offset + ((sourceWrongSegment && offset) || physicalSegmentWrong ? 4 : 0);
     }
     IOMemoryMap *createMappingInTask(task_t task, uint64_t address, IOOptionBits options,
                                    uint64_t offset, uint64_t n) {
@@ -126,15 +144,45 @@ public:
         auto *map = new IOMemoryMap;
         map->physical = physical + offset + (mapWrongPhysical ? 4 : 0);
         map->length = n - (mapTruncated ? 1 : 0);
-        map->contiguous = n - (mapFragmented ? 1 : 0);
+        map->fragmented = mapFragmented;
+        map->wrongSegment = mapSegmentWrongPhysical;
         map->options = options & ~(mapWritable ? kIOMapReadOnly : 0u);
         if (mapCached) map->options &= ~kIOMapCacheMask;
-        map->descriptor = mapWrongDescriptor ? nullptr : this;
+        // Reproduce XNU makeMapping's unique-physical branch: withAddressRange
+        // creates a separate exact-length descriptor; the map offset is zero.
+        if (!mapWrongDescriptor) {
+            if (mapOriginalDescriptor) {
+                map->descriptor = this;
+                map->descriptorOffset = offset;
+            } else {
+                auto *backing = new IOMemoryDescriptor;
+                backing->uniqueBacking = true;
+                ++testState.backingDescriptorsLive;
+                backing->physical = physical + offset + (mapDescriptorWrongPhysical ? 4 : 0);
+                backing->length = n + (mapDescriptorWrongLength ? 1 : 0);
+                backing->contiguous = n - (mapDescriptorFragmented ? 1 : 0);
+                // A deliberately inconsistent descriptor must fail independently
+                // of the map's reported start/length.
+                backing->physicalSegmentWrong = mapDescriptorWrongSegment;
+                map->descriptor = backing;
+                map->ownsDescriptor = true;
+            }
+        }
         map->address = mapNullAddress ? 0 : reinterpret_cast<uintptr_t>(storage.data());
         map->onAddress = onAddress;
         return map;
     }
 };
+inline IOMemoryMap::~IOMemoryMap() {
+    if (ownsDescriptor) descriptor->release();
+    --testState.mapsLive; ++testState.mapReleases;
+}
+inline uint64_t IOMemoryMap::getPhysicalSegment(IOByteCount offset, IOByteCount *n, IOOptionBits segmentOptions) {
+    if (!descriptor) throw std::runtime_error("null mapping descriptor");
+    const uint64_t result = descriptor->getPhysicalSegment(descriptorOffset + offset, n, segmentOptions);
+    if (fragmented) *n = length - 1;
+    return result + (wrongSegment ? 4 : 0);
+}
 using IODeviceMemory = IOMemoryDescriptor;
 
 class IOPCIDevice : public IOService {
