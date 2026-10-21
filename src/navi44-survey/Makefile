@@ -1,4 +1,4 @@
-# Independent read-only survey. No firmware, bring-up, display or accelerator objects.
+# Independent survey. Optional bounded indexed discovery; no GPU activation objects.
 .DEFAULT_GOAL := all
 PRODUCT := CobaltNavi44Survey
 BUILD ?= build

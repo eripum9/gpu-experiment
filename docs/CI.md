@@ -68,6 +68,8 @@ The host/kext job also tests and compiles the separate
 artifact contains only that diagnostic bundle, a collection script, notices,
 source revision, and SHA-256 manifest. This is an opt-in hardware-test
 candidate; CI has not loaded it on the target. It contains no firmware and
-does not enable Navi 44 acceleration. See [the survey test](NAVI44-SURVEY.md)
+does not enable Navi 44 acceleration. Its default is read-only; the separately
+gated indexed-discovery experiment permits address-selector writes. See
+[the survey test](NAVI44-SURVEY.md)
 for its observation limits and collection procedure. The existing
 `Navi48Bringup` and RADV artifacts retain their compile-only status.

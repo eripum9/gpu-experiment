@@ -3,6 +3,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSIterator.h>
 #include <libkern/OSByteOrder.h>
 #include <pexpert/pexpert.h>
 #include "ipdiscovery.hpp"
@@ -30,6 +31,11 @@ bool armed() {
     // of buffer size. Require value 1, rather than accepting arbitrary nonzero.
     uint32_t value = 0;
     return PE_parse_boot_argn("cobalt-survey", &value, sizeof(value)) && value == 1u;
+}
+
+bool indexedArmed() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-indexed", &value, sizeof(value)) && value == 1u;
 }
 
 struct PciState {
@@ -111,6 +117,7 @@ class Map {
     uint64_t descriptorPhysical {0}, descriptorLength {0};
     uint64_t descriptorSegmentPhysical {0}, descriptorContiguous {0};
     IOOptionBits mapOptions {0};
+    IOOptionBits requestedOptions {kMapOptions};
     bool fail(const char *reason) {
         failure = reason;
         reset();
@@ -136,6 +143,13 @@ public:
         }
     }
     bool create(const Aperture &a, uint64_t offset, uint64_t length) {
+        return createPolicy(a, offset, length, false);
+    }
+    // The only writable mapping policy is this fixed BAR5 selector page.
+    bool createIndexedPage(const Aperture &a) { return createPolicy(a, 0, 4096, true); }
+private:
+    bool createPolicy(const Aperture &a, uint64_t offset, uint64_t length, bool indexed) {
+        requestedOptions = indexed ? (kMapOptions & ~kIOMapReadOnly) : kMapOptions;
         requestedOffset = offset;
         requestedLength = length;
         if (!a.memory || !range(a.physical, a.length) ||
@@ -147,7 +161,7 @@ public:
         sourceContiguous = contiguous;
         if (sourcePhysical != expectedPhysical || contiguous < length)
             return fail("source-segment");
-        value = a.memory->createMappingInTask(kernel_task, 0, kMapOptions, offset, length);
+        value = a.memory->createMappingInTask(kernel_task, 0, requestedOptions, offset, length);
         if (!value) return fail("map-null");
         mapLength = value->getLength();
         mapPhysical = value->getPhysicalAddress();
@@ -179,13 +193,15 @@ public:
             return fail("descriptor-physical");
         if (descriptorSegmentPhysical != expectedPhysical || descriptorContiguous < length)
             return fail("descriptor-segment");
-        if (!(mapOptions & kIOMapReadOnly)) return fail("map-readonly");
+        if (bool(mapOptions & kIOMapReadOnly) == indexed)
+            return fail(indexed ? "map-not-writable" : "map-readonly");
         if ((mapOptions & kIOMapCacheMask) != kIOMapInhibitCache)
             return fail("map-cache");
         if (mapSegmentPhysical != expectedPhysical || mapContiguous < length)
             return fail("map-segment");
         return true;
     }
+public:
     void publishFailure(IOService *service, const char *stage, const char *reason = nullptr) {
         if (reason) fail(reason);
         // Bounded metadata only: never publish kernel pointers or mapped bytes.
@@ -194,7 +210,7 @@ public:
         service->setProperty("CobaltSurvey,MapDescriptorIdentity", descriptorIdentity);
         service->setProperty("CobaltSurvey,MapRequestedOffset", requestedOffset, 64);
         service->setProperty("CobaltSurvey,MapRequestedLength", requestedLength, 64);
-        service->setProperty("CobaltSurvey,MapRequestedOptions", kMapOptions, 32);
+        service->setProperty("CobaltSurvey,MapRequestedOptions", requestedOptions, 32);
         service->setProperty("CobaltSurvey,MapSourcePhysical", sourcePhysical, 64);
         service->setProperty("CobaltSurvey,MapSourceContiguous", sourceContiguous, 64);
         service->setProperty("CobaltSurvey,MapObservedPhysical", mapPhysical, 64);
@@ -212,6 +228,11 @@ public:
         if (!range(address, value->getLength())) return nullptr;
         return reinterpret_cast<const volatile uint8_t *>(address);
     }
+    volatile uint32_t *selectorPage() const {
+        if (requestedOffset != 0 || requestedLength != 4096 ||
+            requestedOptions != (kMapOptions & ~kIOMapReadOnly)) return nullptr;
+        return reinterpret_cast<volatile uint32_t *>(const_cast<volatile uint8_t *>(bytes()));
+    }
 };
 
 uint32_t readMemsize(const volatile uint8_t *bytes) {
@@ -220,6 +241,228 @@ uint32_t readMemsize(const volatile uint8_t *bytes) {
 
 bool plausibleMemsize(uint32_t mib) {
     return mib >= 1024 && mib <= 64 * 1024;
+}
+
+// Cooperative ownership only: this does not exclude firmware, forced removal,
+// or clients which ignore provider open. Never seize an existing owner.
+class ProviderSession {
+    IOPCIDevice *pci;
+    IOService *owner;
+    bool opened {false};
+public:
+    ProviderSession(IOPCIDevice *device, IOService *service) : pci(device), owner(service) {}
+    ~ProviderSession() { close(); }
+    bool open() { opened = pci->open(owner, 0); return opened; }
+    bool owns() const { return opened && !pci->isInactive() && pci->isOpen(owner); }
+    void close() { if (opened) { pci->close(owner, 0); opened = false; } }
+};
+
+bool onlyClient(IOPCIDevice *pci, IOService *service) {
+    OSIterator *iterator = pci->getClientIterator();
+    if (!iterator) {
+        service->setProperty("CobaltSurvey,IndexedPeers", "iterator-failed");
+        return false;
+    }
+    unsigned count = 0, unexpected = 0, self = 0;
+    OSObject *entry = nullptr;
+    while (count < 64 && (entry = iterator->getNextObject())) {
+        ++count;
+        if (entry == service) ++self;
+        else {
+            if (!unexpected) service->setProperty("CobaltSurvey,IndexedFirstPeerClass",
+                entry->getMetaClass()->getClassName());
+            ++unexpected;
+        }
+    }
+    const bool valid = iterator->isValid() && count < 64;
+    iterator->release();
+    service->setProperty("CobaltSurvey,IndexedClientCount", count, 32);
+    service->setProperty("CobaltSurvey,IndexedUnexpectedClientCount", unexpected, 32);
+    const bool alone = valid && count == 1 && self == 1 && unexpected == 0;
+    service->setProperty("CobaltSurvey,IndexedPeers", alone ? "self-only" : "refused");
+    return alone;
+}
+
+// Deliberately no generic register-write or MM_DATA-write operation. Production
+// builds are x86_64: aligned volatile dword accesses to the uncached page retain
+// order. The host build substitutes an event-recording MMIO device, not RAM.
+class SelectorIO {
+    volatile uint32_t *page;
+    static uint32_t read(volatile uint32_t *address) {
+#if defined(COBALT_SURVEY_HOSTTEST)
+        return cobaltSurveyTestRead32(address);
+#else
+        return *address;
+#endif
+    }
+    static void write(volatile uint32_t *address, uint32_t value) {
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestWriteSelector32(address, value);
+#else
+        *address = value;
+#endif
+    }
+public:
+    explicit SelectorIO(volatile uint32_t *bytes) : page(bytes) {}
+    uint32_t low() const { return read(page); }
+    uint32_t high() const { return read(page + 6); }
+    uint32_t data() const { return read(page + 1); }
+    void low(uint32_t value) { write(page, value); }
+    void high(uint32_t value) { write(page + 6, value); }
+};
+
+class IndexedTransaction {
+    IOService *service;
+    IOPCIDevice *pci;
+    const PciState &state;
+    const Aperture &mmio, &vram;
+    ProviderSession &session;
+    SelectorIO io;
+    uint32_t savedLow {0}, savedHigh {0}, writes {0}, reads {0};
+    bool dirty {false};
+public:
+    IndexedTransaction(IOService *s, IOPCIDevice *p, const PciState &st,
+        const Aperture &m, const Aperture &v, ProviderSession &owner, volatile uint32_t *page)
+        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), io(page) {}
+    bool guard() const {
+        return session.owns() && unchanged(pci, state) &&
+            apertureUnchanged(pci, 5, mmio) && apertureUnchanged(pci, 0, vram);
+    }
+    bool selectors(uint32_t &low, uint32_t &high) const {
+        if (!guard()) return false;
+        low = io.low();
+        if (!guard()) return false;
+        high = io.high();
+        return guard();
+    }
+    const char *save() {
+        uint32_t low = 0, high = 0;
+        if (!selectors(savedLow, savedHigh) || !selectors(low, high)) return "pci-state-changed";
+        if (savedLow == UINT32_MAX || savedHigh == UINT32_MAX ||
+            low != savedLow || high != savedHigh) return "indexed-selectors-unreadable-or-unstable";
+        return nullptr;
+    }
+    bool low(uint32_t value) {
+        if (!guard()) return false;
+        dirty = true; ++writes; io.low(value); return true;
+    }
+    bool high(uint32_t value) {
+        if (!guard()) return false;
+        dirty = true; ++writes; io.high(value); return true;
+    }
+    const char *copy(uint64_t vramBytes, uint8_t *snapshot) {
+        // No caller-supplied address or size: only the validated discovery tail.
+        if (vramBytes < kGiB || vramBytes > 64 * kGiB) return "indexed-range-invalid";
+        const uint64_t begin = vramBytes - kDiscoveryTail;
+        const uint64_t end = begin + kDiscoverySize;
+        if ((begin & 3) || end > vramBytes) return "indexed-range-invalid";
+        auto *words = reinterpret_cast<uint32_t *>(snapshot);
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            if (!guard()) return "pci-state-changed";
+            if (!onlyClient(pci, service)) return "indexed-peer-refused";
+            uint32_t lastHigh = UINT32_MAX;
+            for (uint64_t pos = begin; pos < end; pos += 4) {
+                const uint32_t targetLow = static_cast<uint32_t>(pos) | 0x80000000u;
+                const uint32_t targetHigh = static_cast<uint32_t>(pos >> 31);
+                if (!low(targetLow)) return "pci-state-changed";
+                if (targetHigh != lastHigh) {
+                    if (!high(targetHigh)) return "pci-state-changed";
+                    lastHigh = targetHigh;
+                }
+                uint32_t observedLow = 0, observedHigh = 0;
+                if (!selectors(observedLow, observedHigh)) return "pci-state-changed";
+                if (observedLow != targetLow || observedHigh != targetHigh)
+                    return "indexed-selector-readback-mismatch";
+                if (!guard()) return "pci-state-changed";
+                words[pass * (kDiscoverySize / 4) + (pos - begin) / 4] = io.data();
+                ++reads;
+            }
+            if (!guard()) return "pci-state-changed";
+            if (!onlyClient(pci, service)) return "indexed-peer-refused";
+        }
+        for (uint64_t i = 0; i < kDiscoverySize; ++i)
+            if (snapshot[i] != snapshot[kDiscoverySize + i]) return "discovery-snapshot-unstable";
+        return nullptr;
+    }
+    bool cleanup() {
+        const char *result = "not-needed";
+        bool restored = !dirty;
+        if (dirty) {
+            // One bounded attempt. Never restore through a stale BAR mapping.
+            if (!low(savedLow) || !high(savedHigh)) result = "restore-skipped-device-changed";
+            else {
+                uint32_t observedLow = 0, observedHigh = 0;
+                if (!selectors(observedLow, observedHigh)) result = "restore-skipped-device-changed";
+                else if (observedLow != savedLow || observedHigh != savedHigh)
+                    result = "restore-readback-mismatch";
+                else { result = "restored-observed"; restored = true; }
+            }
+        }
+        const bool reported = service->setProperty("CobaltSurvey,IndexedCleanup", result) &&
+            service->setProperty("CobaltSurvey,IndexedSelectorWritesIssued", writes, 32) &&
+            service->setProperty("CobaltSurvey,IndexedDataReads", reads, 32);
+        return restored && reported;
+    }
+};
+
+const char *indexedSnapshot(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, Map &registers,
+    const volatile uint8_t *regBytes, uint32_t mib, uint8_t *snapshot) {
+    if (!service->setProperty("CobaltSurvey,VRAMBytes", static_cast<uint64_t>(mib) << 20, 64) ||
+        !service->setProperty("CobaltSurvey,DiscoveryOffset", (static_cast<uint64_t>(mib) << 20) - kDiscoveryTail, 64) ||
+        !service->setProperty("CobaltSurvey,DiscoverySize", kDiscoverySize, 64) ||
+        !service->setProperty("CobaltSurvey,Ready", false) ||
+        !service->setProperty("CobaltSurvey,IndexedOwnership", "not-acquired") ||
+        !service->setProperty("CobaltSurvey,IndexedCleanup", "not-needed") ||
+        !service->setProperty("CobaltSurvey,IndexedAttempted", false) ||
+        !service->setProperty("CobaltSurvey,IndexedSelectorWritesIssued", 0ULL, 32) ||
+        !service->setProperty("CobaltSurvey,IndexedDataReads", 0ULL, 32))
+        return "indexed-metadata-publication-failed";
+    if (pci->isInactive()) return "indexed-provider-inactive";
+    if (!onlyClient(pci, service)) return "indexed-peer-refused";
+    ProviderSession session(pci, service);
+    if (!session.open()) return "indexed-provider-busy";
+    if (!service->setProperty("CobaltSurvey,IndexedOwnership", "exclusive-cooperative"))
+        return "indexed-metadata-publication-failed";
+    if (!onlyClient(pci, service)) return "indexed-peer-refused";
+    if (!session.owns() || !unchanged(pci, state) ||
+        !apertureUnchanged(pci, 0, vram) || !apertureUnchanged(pci, 5, mmio))
+        return "pci-state-changed";
+    if (readMemsize(regBytes) != mib) return "memsize-changed";
+    if (pci->getProperty("CobaltSurvey,IndexedAttempt-v1")) return "indexed-already-attempted";
+    Map page;
+    if (!page.createIndexedPage(mmio)) {
+        page.publishFailure(service, "indexed"); return "indexed-map-failed";
+    }
+    volatile uint32_t *bytes = page.selectorPage();
+    if (!bytes || (reinterpret_cast<uintptr_t>(bytes) & 3)) return "indexed-map-invalid";
+    IndexedTransaction transaction(service, pci, state, mmio, vram, session, bytes);
+    const char *failure = transaction.save();
+    if (failure) return failure;
+    if (!transaction.guard()) return "pci-state-changed";
+    // Ownership serializes this claim among cooperative instances. Keep the
+    // provider property after stop/unload; it is never cleared by this driver.
+    if (pci->getProperty("CobaltSurvey,IndexedAttempt-v1")) return "indexed-already-attempted";
+    if (!pci->setProperty("CobaltSurvey,IndexedAttempt-v1", true)) return "indexed-claim-failed";
+    if (!service->setProperty("CobaltSurvey,Schema", 2ULL, 32) ||
+        !service->setProperty("CobaltSurvey,ReadOnly", false) ||
+        !service->setProperty("CobaltSurvey,AccessMode", "indexed-selector-writes") ||
+        !service->setProperty("CobaltSurvey,IndexedAttempted", true))
+        return "indexed-metadata-publication-failed";
+    failure = transaction.copy(static_cast<uint64_t>(mib) << 20, snapshot);
+    // Last MMIO outside cleanup. If the device changed, do not dereference even
+    // the read-only memsize mapping. After cleanup there is no further MMIO.
+    if (transaction.guard()) {
+        if (readMemsize(regBytes) != mib && !failure) failure = "memsize-changed";
+    } else if (!failure) failure = "pci-state-changed";
+    const bool restored = transaction.cleanup();
+    page.reset();
+    registers.reset();
+    session.close();
+    if (!restored) return "indexed-cleanup-unverified";
+    if (pci->isInactive() || !unchanged(pci, state) || !apertureUnchanged(pci, 0, vram) ||
+        !apertureUnchanged(pci, 5, mmio)) return "pci-state-changed";
+    return failure;
 }
 
 bool criticalIps(const IpDiscovery &d) {
@@ -266,6 +509,14 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     if (!pci || pci->configRead32(static_cast<UInt8>(0)) != kIdentity) return false;
     if (!super::start(provider)) return false;
     removeProperty("CobaltSurvey,DiscoverySnapshot");
+    const char *indexedProperties[] = {"AccessMode", "DiscoverySize", "IndexedOwnership", "IndexedCleanup",
+        "IndexedAttempted", "IndexedSelectorWritesIssued", "IndexedDataReads", "IndexedPeers",
+        "IndexedFirstPeerClass", "IndexedClientCount", "IndexedUnexpectedClientCount"};
+    for (const char *name : indexedProperties) {
+        char key[64];
+        snprintf(key, sizeof(key), "CobaltSurvey,%s", name);
+        removeProperty(key);
+    }
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -350,45 +601,59 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     // Permit the prefetchable flag, require MEM64. No aperture size probing.
     if ((s.bars[0] & 7) != 4 || !apertureValid(vram, vramBase) ||
         !range(vramBase, vramBytes)) { status("bar0-invalid"); return; }
-    if (vram.length < vramBytes) { status("discovery-aperture-too-small"); return; }
     const uint64_t offset = vramBytes - kDiscoveryTail;
+    // Preserve the default refusal and avoid opening the provider unless the
+    // separately armed experiment is actually needed for a small aperture.
+    const bool indexed = vram.length < vramBytes && indexedArmed();
+    if (vram.length < vramBytes && !indexed) { status("discovery-aperture-too-small"); return; }
     setProperty("CobaltSurvey,DiscoveryOffset", offset, 64);
-    if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
-        !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
+    if (indexed) setProperty("CobaltSurvey,DiscoverySize", kDiscoverySize, 64);
+    const uint64_t allocationSize = indexed ? 2 * kDiscoverySize : kDiscoverySize;
     Map discovery;
-    if (!discovery.create(vram, offset, kDiscoverySize)) {
-        discovery.publishFailure(this, "discovery"); status("discovery-map-failed"); return;
-    }
-    if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
-        !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
-    const volatile uint8_t *source = discovery.bytes();
-    if (!source) {
-        discovery.publishFailure(this, "discovery", "map-address"); status("discovery-map-invalid"); return;
-    }
-    if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
-        !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
-    if (readMemsize(regBytes) != first) { status("memsize-changed"); return; }
-    if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
-        !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
-    uint8_t *snapshot = static_cast<uint8_t *>(IOMalloc(kDiscoverySize));
-    if (!snapshot) { status("snapshot-allocation-failed"); return; }
-    for (size_t i = 0; i < kDiscoverySize; ++i) snapshot[i] = source[i];
-    if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
-        !apertureUnchanged(pci, 5, mmio)) {
-        IOFree(snapshot, kDiscoverySize); status("pci-state-changed"); return;
-    }
-    bool stable = true;
-    for (size_t i = 0; i < kDiscoverySize; ++i)
-        if (snapshot[i] != source[i]) { stable = false; break; }
-    const bool current = unchanged(pci, s) && apertureUnchanged(pci, 0, vram) &&
-        apertureUnchanged(pci, 5, mmio);
-    if (!current || !stable || readMemsize(regBytes) != first) {
-        IOFree(snapshot, kDiscoverySize);
-        status(current ? "discovery-snapshot-unstable" : "pci-state-changed"); return;
-    }
-    if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
-        !apertureUnchanged(pci, 5, mmio)) {
-        IOFree(snapshot, kDiscoverySize); status("pci-state-changed"); return;
+    uint8_t *snapshot = nullptr;
+    if (indexed) {
+        snapshot = static_cast<uint8_t *>(IOMalloc(allocationSize));
+        if (!snapshot) { status("snapshot-allocation-failed"); return; }
+        const char *failure = indexedSnapshot(this, pci, s, mmio, vram, registers,
+            regBytes, first, snapshot);
+        if (failure) { IOFree(snapshot, allocationSize); status(failure); return; }
+    } else {
+        if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
+            !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
+        if (!discovery.create(vram, offset, kDiscoverySize)) {
+            discovery.publishFailure(this, "discovery"); status("discovery-map-failed"); return;
+        }
+        if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
+            !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
+        const volatile uint8_t *source = discovery.bytes();
+        if (!source) {
+            discovery.publishFailure(this, "discovery", "map-address"); status("discovery-map-invalid"); return;
+        }
+        if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
+            !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
+        if (readMemsize(regBytes) != first) { status("memsize-changed"); return; }
+        if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
+            !apertureUnchanged(pci, 5, mmio)) { status("pci-state-changed"); return; }
+        snapshot = static_cast<uint8_t *>(IOMalloc(kDiscoverySize));
+        if (!snapshot) { status("snapshot-allocation-failed"); return; }
+        for (size_t i = 0; i < kDiscoverySize; ++i) snapshot[i] = source[i];
+        if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
+            !apertureUnchanged(pci, 5, mmio)) {
+            IOFree(snapshot, kDiscoverySize); status("pci-state-changed"); return;
+        }
+        bool stable = true;
+        for (size_t i = 0; i < kDiscoverySize; ++i)
+            if (snapshot[i] != source[i]) { stable = false; break; }
+        const bool current = unchanged(pci, s) && apertureUnchanged(pci, 0, vram) &&
+            apertureUnchanged(pci, 5, mmio);
+        if (!current || !stable || readMemsize(regBytes) != first) {
+            IOFree(snapshot, kDiscoverySize);
+            status(current ? "discovery-snapshot-unstable" : "pci-state-changed"); return;
+        }
+        if (!unchanged(pci, s) || !apertureUnchanged(pci, 0, vram) ||
+            !apertureUnchanged(pci, 5, mmio)) {
+            IOFree(snapshot, kDiscoverySize); status("pci-state-changed"); return;
+        }
     }
     IpDiscovery parser;
     IpDiscovery::GcTopology topology {};
@@ -397,13 +662,13 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     else if (!criticalIps(parser)) failure = "discovery-profile-mismatch";
     else if (!parser.gcTopology(topology) || !cobalt::gfx_topology_compatible(
         cobalt::Family::Navi44, cobalt::kNavi44Profile.gc, topology)) failure = "discovery-topology-invalid";
-    if (failure) { IOFree(snapshot, kDiscoverySize); status(failure); return; }
+    if (failure) { IOFree(snapshot, allocationSize); status(failure); return; }
     const uint64_t binaryOffset = parser.binaryOffset();
     const uint32_t ipCount = parser.ipCount();
     discovery.reset();
     registers.reset();
     OSData *data = OSData::withBytes(snapshot, static_cast<unsigned>(kDiscoverySize));
-    IOFree(snapshot, kDiscoverySize);
+    IOFree(snapshot, allocationSize);
     if (!data) { status("snapshot-publication-allocation-failed"); return; }
     const bool published = setProperty("CobaltSurvey,DiscoverySnapshot", data);
     data->release();

@@ -3,7 +3,8 @@
 
 Windows: run in a VS developer shell and pass --cxx cl.
 macOS/Linux: defaults to CXX or clang++/g++/c++.
-The fake API deliberately has no PCI/register writes, DMA, IRQ, or open calls.
+The fake API instruments selector writes and provider ownership. It deliberately
+has no PCI/config writes, MM_DATA writes, DMA, IRQ, or GPU activation APIs.
 """
 import argparse
 import os
@@ -39,11 +40,11 @@ def main():
         for source in sources:
             obj = BUILD / (source.stem + ".obj")
             run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/Zc:__cplusplus",
-                 *[f"/I{path}" for path in includes], "/c", source, f"/Fo{obj}"])
+                 "/DCOBALT_SURVEY_HOSTTEST=1", *[f"/I{path}" for path in includes], "/c", source, f"/Fo{obj}"])
             objects.append(obj)
         run([cxx, "/nologo", *objects, f"/Fe{executable}"])
     else:
-        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1",
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1", "-DCOBALT_SURVEY_HOSTTEST=1",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              *[part for path in includes for part in ("-I", path)], *sources, "-o", executable])
     run([executable])

@@ -21,10 +21,27 @@ constexpr IOOptionBits kIOMapAnywhere = 1, kIOMapUnique = 0x04000000;
 constexpr IOOptionBits kIOMapReadOnly = 0x1000, kIOMapInhibitCache = 0x100;
 constexpr IOOptionBits kIOMapCacheMask = 0xf00, kIOMemoryMapperNone = 0x800;
 
+class IOService;
+struct MmioEvent { char operation; uint32_t offset, value; };
+
 struct TestState {
     std::string boot = "1";
     bool bootPresent = true, superStart = true, allocFail = false, dataFail = false;
     bool publicationFail = false;
+    std::string indexedBoot = "1";
+    bool indexedBootPresent = false, claimFail = false;
+    std::string propertyFailKey;
+    unsigned openCalls = 0, closeCalls = 0, openLive = 0, iteratorsLive = 0;
+    unsigned selectorWrites = 0, indexedDataReads = 0;
+    bool indexedMapLive = false;
+    volatile uint32_t *indexedPage = nullptr;
+    IOService *indexedOwner = nullptr;
+    uint64_t discoveryOffset = 0;
+    std::vector<uint8_t> discovery;
+    std::vector<MmioEvent> mmioEvents;
+    std::function<void(const MmioEvent &)> onMmio;
+    std::function<uint32_t(uint32_t, uint32_t)> selectorRead;
+    std::function<uint32_t(unsigned, uint32_t)> dataRead;
     unsigned allocations = 0, mapsLive = 0, mapRequests = 0, mapReleases = 0;
     unsigned memsizeReads = 0, backingDescriptorsLive = 0, backingDescriptorReleases = 0;
     std::vector<uint32_t> memsizeValues;
@@ -39,9 +56,26 @@ inline TestState testState;
 class OSObject {
     unsigned refs = 1;
 public:
+    struct MetaClass {
+        const char *name = "FakeIOService";
+        const char *getClassName() const { return name; }
+    } meta;
+    const MetaClass *getMetaClass() const { return &meta; }
     virtual ~OSObject() = default;
     void retain() { ++refs; }
     void release() { if (--refs == 0) delete this; }
+};
+class OSIterator : public OSObject {
+    std::vector<OSObject *> objects;
+    size_t next = 0;
+    bool valid;
+public:
+    OSIterator(std::vector<OSObject *> entries, bool good) : objects(std::move(entries)), valid(good) {
+        ++testState.iteratorsLive;
+    }
+    ~OSIterator() override { --testState.iteratorsLive; }
+    OSObject *getNextObject() { return next < objects.size() ? objects[next++] : nullptr; }
+    bool isValid() const { return valid; }
 };
 class OSData : public OSObject {
 public:
@@ -58,6 +92,7 @@ public:
 class IOService : public OSObject {
 public:
     bool registered = false;
+    bool inactive = false;
     unsigned stopCalls = 0, startCalls = 0;
     std::map<std::string, std::string> strings;
     std::map<std::string, uint64_t> numbers;
@@ -65,11 +100,25 @@ public:
     virtual IOService *probe(IOService *, SInt32 *) { return this; }
     virtual bool start(IOService *) { ++startCalls; return testState.superStart; }
     virtual void stop(IOService *) { ++stopCalls; }
-    bool setProperty(const char *key, const char *value) { strings[key] = value; return true; }
-    bool setProperty(const char *key, uint64_t value, unsigned) { numbers[key] = value; return true; }
-    bool setProperty(const char *key, bool value) { numbers[key] = value ? 1 : 0; return true; }
+    bool setProperty(const char *key, const char *value) {
+        if (testState.propertyFailKey == key) return false;
+        strings[key] = value; return true;
+    }
+    bool setProperty(const char *key, uint64_t value, unsigned) {
+        if (testState.propertyFailKey == key) return false;
+        numbers[key] = value; return true;
+    }
+    bool setProperty(const char *key, bool value) {
+        if (testState.propertyFailKey == key) return false;
+        if (std::string(key) == "CobaltSurvey,IndexedAttempt-v1" && testState.claimFail) return false;
+        numbers[key] = value ? 1 : 0; return true;
+    }
+    OSObject *getProperty(const char *key) {
+        return numbers.count(key) || strings.count(key) || blobs.count(key) ? this : nullptr;
+    }
+    bool isInactive() const { return inactive; }
     bool setProperty(const char *key, OSObject *object) {
-        if (testState.mapsLive || testState.backingDescriptorsLive)
+        if (testState.mapsLive || testState.backingDescriptorsLive || testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at snapshot publication");
         if (testState.publicationFail) return false;
         auto *value = dynamic_cast<OSData *>(object);
@@ -78,7 +127,8 @@ public:
     }
     void removeProperty(const char *key) { strings.erase(key); numbers.erase(key); blobs.erase(key); }
     void registerService() {
-        if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)
+        if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
+            testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at registerService");
         registered = true;
     }
@@ -94,6 +144,7 @@ public:
     bool ownsDescriptor = false;
     IOByteCount descriptorOffset = 0;
     bool fragmented = false, wrongSegment = false;
+    bool indexedMapping = false;
     std::function<void()> onAddress;
     IOMemoryMap() { ++testState.mapsLive; }
     ~IOMemoryMap() override;
@@ -118,6 +169,8 @@ public:
     bool sourceWrongSegment = false, sourceFragmented = false;
     bool physicalSegmentWrong = false;
     bool uniqueBacking = false;
+    bool indexedMapFail = false, indexedMapReadOnly = false;
+    std::vector<uint32_t> selectorStorage = std::vector<uint32_t>(1024);
     uint64_t expectedOffset = 0, expectedLength = 0;
     unsigned requests = 0;
     std::function<void()> onMap, onAddress;
@@ -136,17 +189,23 @@ public:
     IOMemoryMap *createMappingInTask(task_t task, uint64_t address, IOOptionBits options,
                                    uint64_t offset, uint64_t n) {
         ++testState.mapRequests; ++requests;
-        if (task != kernel_task || address != 0 || offset != expectedOffset || n != expectedLength ||
-            options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))
+        const bool indexed = offset == 0 && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        if (task != kernel_task || address != 0 || (!indexed &&
+            (offset != expectedOffset || n != expectedLength ||
+             options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
+        if (indexed && physical != 0xc0000000)
+            throw std::runtime_error("writable mapping outside BAR5 page zero");
         if (onMap) onMap();
-        if (mapFail) return nullptr;
+        if (mapFail || (indexed && indexedMapFail)) return nullptr;
         auto *map = new IOMemoryMap;
         map->physical = physical + offset + (mapWrongPhysical ? 4 : 0);
         map->length = n - (mapTruncated ? 1 : 0);
         map->fragmented = mapFragmented;
         map->wrongSegment = mapSegmentWrongPhysical;
         map->options = options & ~(mapWritable ? kIOMapReadOnly : 0u);
+        if (indexed && indexedMapReadOnly) map->options |= kIOMapReadOnly;
         if (mapCached) map->options &= ~kIOMapCacheMask;
         // Reproduce XNU makeMapping's unique-physical branch: withAddressRange
         // creates a separate exact-length descriptor; the map offset is zero.
@@ -168,12 +227,19 @@ public:
                 map->ownsDescriptor = true;
             }
         }
-        map->address = mapNullAddress ? 0 : reinterpret_cast<uintptr_t>(storage.data());
+        map->address = mapNullAddress ? 0 : reinterpret_cast<uintptr_t>(
+            indexed ? selectorStorage.data() : storage.data());
+        if (indexed) {
+            map->indexedMapping = true;
+            testState.indexedMapLive = true;
+            testState.indexedPage = selectorStorage.data();
+        }
         map->onAddress = onAddress;
         return map;
     }
 };
 inline IOMemoryMap::~IOMemoryMap() {
+    if (indexedMapping) testState.indexedMapLive = false;
     if (ownsDescriptor) descriptor->release();
     --testState.mapsLive; ++testState.mapReleases;
 }
@@ -187,6 +253,28 @@ using IODeviceMemory = IOMemoryDescriptor;
 
 class IOPCIDevice : public IOService {
 public:
+    IOService *owner = nullptr;
+    bool openBusy = false, iteratorFail = false, iteratorInvalid = false;
+    std::vector<OSObject *> clients;
+    std::function<void()> onOpen, onClose, onCensus;
+    bool open(IOService *client, IOOptionBits options) {
+        if (options != 0) throw std::runtime_error("nonzero provider open flags");
+        ++testState.openCalls;
+        if (openBusy || owner) return false;
+        owner = client; ++testState.openLive; testState.indexedOwner = client;
+        if (onOpen) onOpen();
+        return true;
+    }
+    void close(IOService *client, IOOptionBits options) {
+        if (options != 0 || owner != client) throw std::runtime_error("invalid provider close");
+        owner = nullptr; --testState.openLive; ++testState.closeCalls;
+        if (onClose) onClose();
+    }
+    bool isOpen(const IOService *client) const { return owner == client; }
+    OSIterator *getClientIterator() const {
+        if (onCensus) onCensus();
+        return iteratorFail ? nullptr : new OSIterator(clients, !iteratorInvalid);
+    }
     uint32_t identity = 0x75901002, classRevision = 0x030000c0, subsystem = 0x12341002;
     uint16_t command = 2;
     uint8_t header = 0;
@@ -220,16 +308,52 @@ public:
         if (offset < 0x10 || offset > 0x24 || offset % 4) throw std::runtime_error("unexpected descriptor");
         return memories[(offset - 0x10) / 4];
     }
-    // Deliberately no config-write, enable, DMA, IRQ, or provider-open methods.
+    // Deliberately no config-write, enable, DMA or IRQ methods.
 };
 
+inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
+    if (!testState.indexedMapLive || testState.openLive != 1 || !testState.indexedPage)
+        throw std::runtime_error("MMIO read without mapping and ownership");
+    const auto offset = static_cast<uint32_t>(address - testState.indexedPage) * 4;
+    uint32_t value = 0;
+    if (offset == 0 || offset == 0x18) {
+        value = *address;
+        if (testState.selectorRead) value = testState.selectorRead(offset, value);
+    } else if (offset == 4) {
+        const uint32_t low = testState.indexedPage[0], high = testState.indexedPage[6];
+        const uint64_t pos = (uint64_t(high) << 31) | (low & 0x7fffffffu);
+        if (!(low & 0x80000000u) || (pos & 3) || pos < testState.discoveryOffset ||
+            pos + 4 > testState.discoveryOffset + 10240 || testState.discovery.size() != 10240)
+            throw std::runtime_error("MM_DATA read outside fixed discovery range");
+        std::memcpy(&value, testState.discovery.data() + (pos - testState.discoveryOffset), 4);
+        if (testState.dataRead) value = testState.dataRead(testState.indexedDataReads, value);
+        ++testState.indexedDataReads;
+    } else throw std::runtime_error("unexpected register read");
+    const MmioEvent event {'r', offset, value}; testState.mmioEvents.push_back(event);
+    if (testState.onMmio) testState.onMmio(event);
+    return value;
+}
+inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t value) {
+    if (!testState.indexedMapLive || testState.openLive != 1 || !testState.indexedOwner ||
+        testState.indexedOwner->numbers.at("CobaltSurvey,ReadOnly") != 0 ||
+        testState.indexedOwner->numbers.at("CobaltSurvey,Ready") != 0)
+        throw std::runtime_error("selector write without explicit writable mode");
+    const auto offset = static_cast<uint32_t>(address - testState.indexedPage) * 4;
+    if (offset != 0 && offset != 0x18) throw std::runtime_error("write outside selectors");
+    *address = value; ++testState.selectorWrites;
+    const MmioEvent event {'w', offset, value}; testState.mmioEvents.push_back(event);
+    if (testState.onMmio) testState.onMmio(event);
+}
+
 inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
-    if (std::string(key) != "cobalt-survey") throw std::runtime_error("unexpected boot argument");
-    if (!testState.bootPresent) return false;
+    const bool indexed = std::string(key) == "cobalt-survey-indexed";
+    if (std::string(key) != "cobalt-survey" && !indexed) throw std::runtime_error("unexpected boot argument");
+    if (indexed ? !testState.indexedBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const std::string token = testState.boot.substr(0, testState.boot.find_first_of(" \t"));
+    const auto &argument = indexed ? testState.indexedBoot : testState.boot;
+    const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
     const auto numeric = std::strtoll(token.c_str(), &end, 0);
     if (!token.empty() && end && *end == '\0') {
@@ -242,12 +366,12 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     return true;
 }
 inline void *IOMalloc(uint64_t n) {
-    if (n != 10240) throw std::runtime_error("unbounded allocation");
+    if (n != 10240 && n != 20480) throw std::runtime_error("unbounded allocation");
     if (testState.allocFail) return nullptr;
     ++testState.allocations; return std::malloc(static_cast<size_t>(n));
 }
 inline void IOFree(void *p, uint64_t n) {
-    if (!p || n != 10240) throw std::runtime_error("invalid IOFree");
+    if (!p || (n != 10240 && n != 20480)) throw std::runtime_error("invalid IOFree");
     --testState.allocations; std::free(p);
 }
 inline void IOLog(const char *, ...) {}

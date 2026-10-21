@@ -54,7 +54,7 @@ capture() {
     return "$result"
 }
 
-printf 'CobaltNavi44Survey read-only capture\nStarted: %s\n' "$stamp" >"$report_dir/README.txt"
+printf 'CobaltNavi44Survey diagnostic capture\nStarted: %s\n' "$stamp" >"$report_dir/README.txt"
 printf 'Files contain command output and separate stderr. No system changes are made.\n' >>"$report_dir/README.txt"
 printf 'Command results:\n' >"$report_dir/status.txt"
 

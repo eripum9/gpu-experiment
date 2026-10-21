@@ -50,14 +50,25 @@ struct Device {
         vram.expectedOffset=(16ULL<<30)-65536; vram.expectedLength=10240;
         vram.storage.resize(10240/4);
         load(fixture()); pci.memories[0]=&vram; pci.memories[5]=&mmio;
+        pci.clients.push_back(&service);
     }
-    void load(const Bytes &b) { std::memcpy(vram.storage.data(),b.data(),b.size()); }
+    void load(const Bytes &b) {
+        std::memcpy(vram.storage.data(),b.data(),b.size()); testState.discovery=b;
+    }
+    void indexed(uint32_t mib=16304) {
+        testState.indexedBootPresent=true;
+        mmio.storage[0x78c/4]=mib;
+        vram.length=vram.contiguous=256ULL<<20;
+        testState.discoveryOffset=(uint64_t(mib)<<20)-65536;
+        mmio.selectorStorage[0]=0x12345678; mmio.selectorStorage[6]=2;
+    }
     void run(const char *expected) {
         CHECK(service.start(&pci)); CHECK(service.registered);
         CHECK(service.strings.at("CobaltSurvey,Status")==expected);
         CHECK(service.numbers.at("CobaltSurvey,Ready")==0);
         CHECK(testState.mapsLive==0); CHECK(testState.allocations==0);
         CHECK(testState.backingDescriptorsLive==0);
+        CHECK(testState.openLive==0); CHECK(testState.iteratorsLive==0);
         if (std::string(expected)!="discovery-snapshot-validated")
             CHECK(service.blobs.count("CobaltSurvey,DiscoverySnapshot")==0);
     }
@@ -106,6 +117,258 @@ static void gates() {
     {
         Device d; testState.superStart=false; CHECK(!d.service.start(&d.pci));
         CHECK(!d.service.registered); CHECK(d.pci.otherReads==0);
+    }
+}
+
+static void noIndexedWrites() {
+    CHECK(testState.selectorWrites==0); CHECK(testState.indexedDataReads==0);
+}
+static void restored(Device &d) {
+    CHECK(d.mmio.selectorStorage[0]==0x12345678); CHECK(d.mmio.selectorStorage[6]==2);
+    CHECK(d.service.strings.at("CobaltSurvey,IndexedCleanup")=="restored-observed");
+    CHECK(d.service.numbers.at("CobaltSurvey,IndexedSelectorWritesIssued")==testState.selectorWrites);
+    CHECK(d.service.numbers.at("CobaltSurvey,IndexedDataReads")==testState.indexedDataReads);
+    CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly")==0);
+    CHECK(d.service.numbers.at("CobaltSurvey,Ready")==0);
+}
+static void indexedGatesAndPreflight() {
+    for (const auto *argument : {"", "0", "2", "-1", "1x", "true"}) {
+        Device d; d.indexed(); testState.indexedBoot=argument;
+        d.run("discovery-aperture-too-small"); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    {
+        Device d; d.indexed(); testState.indexedBootPresent=false;
+        d.run("discovery-aperture-too-small"); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    {
+        Device d; d.indexed(); testState.boot="0";
+        CHECK(!d.service.start(&d.pci)); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    {
+        Device d; d.indexed(); d.pci.identity=0x75501002;
+        CHECK(!d.service.start(&d.pci)); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    {
+        Device d; testState.indexedBootPresent=true;
+        d.run("discovery-snapshot-validated"); noIndexedWrites(); CHECK(testState.openCalls==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==1);
+    }
+    {
+        Device d; d.indexed(); IOService other; other.meta.name="UnexpectedGpuHelper";
+        d.pci.clients.push_back(&other); d.run("indexed-peer-refused"); noIndexedWrites();
+        CHECK(testState.openCalls==0); CHECK(d.service.numbers.at("CobaltSurvey,IndexedClientCount")==2);
+        CHECK(d.service.strings.at("CobaltSurvey,IndexedFirstPeerClass")=="UnexpectedGpuHelper");
+    }
+    for (unsigned condition : {0u,1u,2u}) {
+        Device d; d.indexed();
+        if (condition==0) d.pci.iteratorFail=true;
+        if (condition==1) d.pci.iteratorInvalid=true;
+        if (condition==2) d.pci.clients.clear();
+        d.run("indexed-peer-refused"); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    {
+        Device d; d.indexed(); d.pci.openBusy=true;
+        d.run("indexed-provider-busy"); noIndexedWrites(); CHECK(testState.openCalls==1);
+        CHECK(testState.closeCalls==0);
+    }
+    {
+        Device d; d.indexed(); d.pci.inactive=true;
+        d.run("indexed-provider-inactive"); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    {
+        Device d; d.indexed(); IOService other;
+        d.pci.onOpen=[&d,&other]() { d.pci.clients.push_back(&other); };
+        d.run("indexed-peer-refused"); noIndexedWrites(); CHECK(testState.closeCalls==1);
+    }
+    for (unsigned condition : {0u,1u,2u,3u}) {
+        Device d; d.indexed();
+        d.pci.onOpen=[&d,condition]() {
+            if (condition==0) d.pci.bars[5]+=4096;
+            if (condition==1) d.mmio.length-=4096;
+            if (condition==2) d.pci.inactive=true;
+            if (condition==3) d.vram.physical+=4096;
+        };
+        d.run("pci-state-changed"); noIndexedWrites(); CHECK(testState.closeCalls==1);
+    }
+    {
+        Device d; d.indexed(); testState.memsizeValues={16304,16304,8192};
+        d.run("memsize-changed"); noIndexedWrites(); CHECK(testState.closeCalls==1);
+    }
+    {
+        Device d; d.indexed(); testState.allocFail=true;
+        d.run("snapshot-allocation-failed"); noIndexedWrites(); CHECK(testState.openCalls==0);
+    }
+    for (unsigned condition : {0u,1u,2u}) {
+        Device d; d.indexed();
+        if (condition==0) d.mmio.indexedMapFail=true;
+        if (condition==1) d.mmio.indexedMapReadOnly=true;
+        if (condition==2) d.mmio.onMap=[&d]() { if(d.mmio.requests==2) d.mmio.mapNullAddress=true; };
+        d.run(condition==2 ? "indexed-map-invalid" : "indexed-map-failed");
+        noIndexedWrites(); CHECK(testState.closeCalls==1);
+    }
+    {
+        Device d; d.indexed(); testState.claimFail=true;
+        d.run("indexed-claim-failed"); noIndexedWrites();
+        CHECK(!d.pci.getProperty("CobaltSurvey,IndexedAttempt-v1"));
+    }
+    for (const auto *key : {"VRAMBytes", "DiscoveryOffset", "DiscoverySize", "Ready", "IndexedOwnership",
+        "IndexedCleanup", "IndexedAttempted", "IndexedSelectorWritesIssued", "IndexedDataReads",
+        "Schema", "ReadOnly", "AccessMode"}) {
+        Device d; d.indexed(); testState.propertyFailKey=std::string("CobaltSurvey,")+key;
+        // Ready's initial publication also fails: do not use Device::run's Ready assertion.
+        CHECK(d.service.start(&d.pci)); CHECK(d.service.registered);
+        CHECK(d.service.strings.at("CobaltSurvey,Status")=="indexed-metadata-publication-failed");
+        noIndexedWrites(); CHECK(testState.mapsLive==0); CHECK(testState.openLive==0);
+        CHECK(testState.allocations==0); CHECK(testState.backingDescriptorsLive==0);
+    }
+    for (unsigned condition : {0u,1u,2u}) {
+        Device d; d.indexed();
+        if (condition==0) d.mmio.selectorStorage[0]=UINT32_MAX;
+        if (condition==1) d.mmio.selectorStorage[6]=UINT32_MAX;
+        unsigned lowReads=0;
+        if (condition==2) testState.selectorRead=[&lowReads](uint32_t off,uint32_t val) {
+            return off==0 && ++lowReads==2 ? val^4u : val;
+        };
+        d.run("indexed-selectors-unreadable-or-unstable"); noIndexedWrites();
+        CHECK(!d.pci.getProperty("CobaltSurvey,IndexedAttempt-v1"));
+    }
+}
+
+static void indexedExactTransfer() {
+    Device d; d.indexed();
+    d.run("discovery-snapshot-validated"); restored(d);
+    CHECK(testState.openCalls==1); CHECK(testState.closeCalls==1);
+    CHECK(testState.indexedDataReads==5120); CHECK(testState.selectorWrites==5124);
+    CHECK(d.service.numbers.at("CobaltSurvey,Schema")==2);
+    CHECK(d.service.strings.at("CobaltSurvey,AccessMode")=="indexed-selector-writes");
+    CHECK(d.service.numbers.at("CobaltSurvey,IndexedAttempted")==1);
+    CHECK(d.service.numbers.at("CobaltSurvey,DiscoveryOffset")==0x3faff0000ULL);
+    CHECK(d.service.numbers.at("CobaltSurvey,DiscoverySize")==10240);
+    CHECK(d.service.blobs.at("CobaltSurvey,DiscoverySnapshot")==fixture());
+    size_t at=0;
+    const auto event=[&at](char op,uint32_t off,uint32_t value) {
+        CHECK(at<testState.mmioEvents.size()); const auto &e=testState.mmioEvents[at++];
+        CHECK(e.operation==op); CHECK(e.offset==off); CHECK(e.value==value);
+    };
+    for (unsigned n=0;n<2;++n) { event('r',0,0x12345678); event('r',0x18,2); }
+    const auto expected=fixture();
+    for (unsigned pass=0;pass<2;++pass) for(unsigned word=0;word<2560;++word) {
+        const uint32_t low=0xfaff0000u+4*word;
+        event('w',0,low); if(!word) event('w',0x18,7);
+        event('r',0,low); event('r',0x18,7);
+        uint32_t data=0; std::memcpy(&data,expected.data()+word*4,4); event('r',4,data);
+    }
+    event('w',0,0x12345678); event('w',0x18,2);
+    event('r',0,0x12345678); event('r',0x18,2);
+    CHECK(at==testState.mmioEvents.size());
+    d.service.stop(&d.pci);
+    CobaltNavi44Survey reloaded; d.pci.clients={&reloaded};
+    CHECK(reloaded.start(&d.pci)); CHECK(reloaded.registered);
+    CHECK(reloaded.strings.at("CobaltSurvey,Status")=="indexed-already-attempted");
+    CHECK(testState.selectorWrites==5124); CHECK(testState.openLive==0);
+    CHECK(reloaded.blobs.empty());
+    // Same-instance restart in default mode clears stale indexed scope fields.
+    testState.indexedBootPresent=false; d.pci.clients={&d.service};
+    d.run("discovery-aperture-too-small");
+    CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly")==1);
+    CHECK(d.service.numbers.at("CobaltSurvey,Schema")==1);
+    CHECK(!d.service.numbers.count("CobaltSurvey,IndexedAttempted"));
+    CHECK(!d.service.strings.count("CobaltSurvey,AccessMode"));
+    CHECK(d.pci.getProperty("CobaltSurvey,IndexedAttempt-v1"));
+}
+
+static void indexedFaults() {
+    for (uint32_t offset : {0u,0x18u}) {
+        Device d; d.indexed(); bool mismatched=false;
+        testState.selectorRead=[offset,&mismatched](uint32_t off,uint32_t value) {
+            if (testState.selectorWrites && off==offset && !mismatched) { mismatched=true; return value^4u; }
+            return value;
+        };
+        d.run("indexed-selector-readback-mismatch"); restored(d);
+        CHECK(testState.indexedDataReads==0); CHECK(testState.selectorWrites==4);
+    }
+    for (uint32_t offset : {0u,0x18u}) {
+        Device d; d.indexed(); bool restoring=false;
+        testState.onMmio=[&restoring](const MmioEvent &e) {
+            if(e.operation=='w' && e.offset==0 && e.value==0x12345678) restoring=true;
+        };
+        testState.selectorRead=[offset,&restoring](uint32_t off,uint32_t value) {
+            return restoring && off==offset ? value^4u : value;
+        };
+        d.run("indexed-cleanup-unverified"); CHECK(testState.indexedDataReads==5120);
+        CHECK(testState.selectorWrites==5124);
+        CHECK(d.service.strings.at("CobaltSurvey,IndexedCleanup")=="restore-readback-mismatch");
+    }
+    {
+        Device d; d.indexed();
+        testState.dataRead=[](unsigned n,uint32_t value) { return n==2560 ? value^1u : value; };
+        d.run("discovery-snapshot-unstable"); restored(d); CHECK(testState.indexedDataReads==5120);
+    }
+    {
+        Device d; d.indexed(); testState.memsizeValues={16304,16304,16304,8192};
+        d.run("memsize-changed"); restored(d); CHECK(testState.indexedDataReads==5120);
+    }
+    for (unsigned condition : {0u,1u,2u,3u,4u}) {
+        Device d; d.indexed();
+        testState.onMmio=[&d,condition](const MmioEvent &e) {
+            if (e.operation!='r' || e.offset!=4 || testState.indexedDataReads!=17) return;
+            if(condition==0) d.pci.identity=UINT32_MAX;
+            if(condition==1) d.pci.bars[5]+=4096;
+            if(condition==2) d.mmio.length-=4096;
+            if(condition==3) d.pci.inactive=true;
+            if(condition==4) d.vram.length-=4096;
+        };
+        d.run("indexed-cleanup-unverified"); CHECK(testState.indexedDataReads==17);
+        CHECK(testState.selectorWrites==18);
+        CHECK(d.service.strings.at("CobaltSurvey,IndexedCleanup")=="restore-skipped-device-changed");
+    }
+    {
+        Device d; d.indexed(); testState.onMmio=[&d](const MmioEvent &e) {
+            if(e.operation=='w' && testState.selectorWrites==1) d.pci.command=0;
+        };
+        d.run("indexed-cleanup-unverified"); CHECK(testState.selectorWrites==1);
+        CHECK(testState.indexedDataReads==0);
+    }
+    {
+        Device d; d.indexed(); testState.onMmio=[&d](const MmioEvent &e) {
+            if(e.operation=='w' && e.offset==0 && e.value==0x12345678) d.pci.bars[5]+=4096;
+        };
+        d.run("indexed-cleanup-unverified"); CHECK(testState.selectorWrites==5123);
+        CHECK(d.service.strings.at("CobaltSurvey,IndexedCleanup")=="restore-skipped-device-changed");
+    }
+    {
+        Device d; d.indexed(); d.pci.onClose=[&d]() { d.pci.command=0; };
+        d.run("pci-state-changed"); restored(d); CHECK(testState.indexedDataReads==5120);
+    }
+    {
+        Device d; d.indexed(); IOService latePeer;
+        testState.onMmio=[&d,&latePeer](const MmioEvent &e) {
+            if(e.operation=='r' && e.offset==4 && testState.indexedDataReads==2560)
+                d.pci.clients.push_back(&latePeer);
+        };
+        d.run("indexed-peer-refused"); restored(d); CHECK(testState.indexedDataReads==2560);
+    }
+    for (unsigned condition : {0u,1u,2u,3u,4u}) {
+        Device d; d.indexed(); Bytes data=fixture();
+        if(condition==0) data[prefix+8]^=1;
+        if(condition==1) { data[die+4+6]^=1; repair(data); }
+        if(condition==2) { put32(data,gc+12,8); repair(data); }
+        if(condition==3) testState.dataFail=true;
+        if(condition==4) testState.publicationFail=true;
+        d.load(data);
+        const char *statuses[]={"discovery-parser-invalid", "discovery-profile-mismatch",
+            "discovery-topology-invalid", "snapshot-publication-allocation-failed", "snapshot-publication-failed"};
+        d.run(statuses[condition]); restored(d); CHECK(testState.indexedDataReads==5120);
+    }
+    for (const auto *argument : {"1", "01", "0x1", "1 ", "1\t"}) {
+        Device d; d.indexed(); testState.indexedBoot=argument;
+        d.run("discovery-snapshot-validated"); restored(d);
+    }
+    for (uint32_t mib : {1024u,1025u,8192u,65536u}) {
+        Device d; d.indexed(mib); d.run("discovery-snapshot-validated"); restored(d);
+        CHECK(testState.indexedDataReads==5120);
+        CHECK(d.service.numbers.at("CobaltSurvey,DiscoveryOffset")==testState.discoveryOffset);
     }
 }
 
@@ -363,6 +626,7 @@ int main() {
     try {
         gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
         revalidation(); parserAndPublication();
+        indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"; return 1;
