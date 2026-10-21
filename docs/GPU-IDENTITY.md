@@ -43,12 +43,37 @@ decoder. Hardware readiness still requires a separate runtime check.
 
 ## Integration status
 
-The Mesa Darwin patches still select canned gfx1201 information and PCI
-1002:7550. They do not consume this property yet. Mesa itself is external,
-at the revision described in `mesa-patches/README.txt`; the Metal build
-script also consumes an external RADV dylib. This step supplies the missing
-kernel data and shared decoder, while backend selection and replacement of
-canned active-unit and memory information remain separate work.
+Mesa patch 0010 reads the property before opening the native IOKit client.
+It uses the selected Navi48Bringup service, or the exact provider chain
+Navi48Accelerator -> Navi48MetalNub -> Navi48Bringup for the sandboxed route.
+It does not search globally for an unrelated driver's metadata. The decoder
+is mirrored from the shared header; CI checks that the copies agree.
+
+The native connection retains a decoded identity snapshot. RADV enumeration
+and its device-info query use the actual PCI device/revision and subsystem
+IDs rather than always identifying as 1002:7550. The native marketing name
+is neutral because PCI identity alone does not establish an XT board model.
+The handshake separately checks the live QueryInfo GC version and retains
+the existing ABI, address-configuration, VA-range and readiness checks.
+
+Missing, malformed, disabled, and gfx1200 records are refused before
+IOServiceOpen. Older kernels without the property must be updated together
+with the backend. Explicit MOCK and HOST_BO modes retain synthetic data;
+they do not establish hardware compatibility.
+
+The pinned Mesa base has a canned gfx1201 device record and no gfx1200
+record. The backend still uses that record for active CU masks, other
+hardware properties and clocks; this change does not make those fields
+live. In particular it does not turn maximum CU capacity into active units.
+Runtime memory pools and budgets continue to come from QueryInfo. A future
+gfx1200 path needs verified runtime hardware information before it can
+replace the existing template and address-configuration assumptions.
+
+Mesa remains external at the revision in `mesa-patches/README.txt`; the
+Metal build script also consumes an external RADV dylib. CI now applies
+the complete patch series, runs simulated native-transport tests, checks
+the IOKit source against Apple's real headers, and builds the full x86_64
+RADV library. Its artifact is a compile check, with Navi 44 still disabled.
 
 Synthetic C and C++ host tests cover both families, preserved device IDs,
 malformed records, bounds, capacity consistency, and unaligned/overlapping

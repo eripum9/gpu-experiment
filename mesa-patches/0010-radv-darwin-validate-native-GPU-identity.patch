@@ -1,0 +1,931 @@
+diff --git a/include/darwin/cobalt_gpu_info.h b/include/darwin/cobalt_gpu_info.h
+new file mode 100644
+index 0000000..1c97f95
+--- /dev/null
++++ b/include/darwin/cobalt_gpu_info.h
+@@ -0,0 +1,115 @@
++#ifndef COBALT_GPU_INFO_H
++#define COBALT_GPU_INFO_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#define COBALT_GPU_INFO_VERSION 1u
++#define COBALT_GPU_INFO_PROPERTY "Cobalt,GpuInfo-v1"
++#define COBALT_GPU_INFO_CAPACITY_VALID 1u
++#define COBALT_GPU_INFO_BRINGUP_ENABLED 2u
++#define COBALT_GPU_GFX_TARGET_1200 1200u
++#define COBALT_GPU_GFX_TARGET_1201 1201u
++
++struct cobalt_gpu_info_v1 {
++	uint32_t version;
++	uint32_t size;
++	uint32_t flags;
++	uint32_t pci_vendor;
++	uint32_t pci_device;
++	uint32_t pci_revision;
++	uint32_t pci_subsystem_vendor;
++	uint32_t pci_subsystem_device;
++	uint32_t gfx_target;
++	uint32_t gc_major;
++	uint32_t gc_minor;
++	uint32_t gc_revision;
++	uint32_t shader_engines;
++	uint32_t shader_arrays_per_engine;
++	uint32_t wgp_per_array;
++	uint32_t cu_per_array;
++	uint32_t max_compute_units;
++	uint32_t render_backends_per_engine;
++	uint32_t max_waves_per_simd;
++	uint32_t reserved[13];
++};
++
++/* Wire values use native little-endian uint32_t encoding on the x86 target.
++ * max_compute_units is discovered capacity, not active CUs or readiness. */
++#if defined(__cplusplus)
++static_assert(sizeof(struct cobalt_gpu_info_v1) == 128, "gpu info v1 wire size");
++static_assert(offsetof(struct cobalt_gpu_info_v1, gfx_target) == 32, "gpu info target offset");
++static_assert(offsetof(struct cobalt_gpu_info_v1, gc_major) == 36, "gpu info GC offset");
++static_assert(offsetof(struct cobalt_gpu_info_v1, reserved) == 76, "gpu info reserved offset");
++#else
++_Static_assert(sizeof(struct cobalt_gpu_info_v1) == 128, "gpu info v1 wire size");
++_Static_assert(offsetof(struct cobalt_gpu_info_v1, gfx_target) == 32, "gpu info target offset");
++_Static_assert(offsetof(struct cobalt_gpu_info_v1, gc_major) == 36, "gpu info GC offset");
++_Static_assert(offsetof(struct cobalt_gpu_info_v1, reserved) == 76, "gpu info reserved offset");
++#endif
++
++/* Decode an exact v1 wire record. The source may be unaligned. */
++static inline int cobalt_gpu_info_v1_decode(
++	const void *bytes, size_t length, struct cobalt_gpu_info_v1 *out)
++{
++	struct cobalt_gpu_info_v1 record;
++	uint32_t total_rb;
++	uint32_t expected_target;
++	uint32_t expected_gc_revision;
++	int must_be_disabled;
++	unsigned i;
++
++	if (out == NULL) return 0;
++	if (bytes == NULL || length != sizeof(record)) {
++		memset(out, 0, sizeof(*out));
++		return 0;
++	}
++	/* Copy first so bytes may alias or partially overlap out. */
++	memcpy(&record, bytes, sizeof(record));
++	must_be_disabled = 0;
++
++	if (record.version != COBALT_GPU_INFO_VERSION || record.size != sizeof(record)) goto invalid;
++	if ((record.flags & ~(COBALT_GPU_INFO_CAPACITY_VALID | COBALT_GPU_INFO_BRINGUP_ENABLED)) != 0 ||
++	    (record.flags & COBALT_GPU_INFO_CAPACITY_VALID) == 0) goto invalid;
++	if (record.pci_vendor != 0x1002u || record.pci_revision > 0xffu ||
++	    record.pci_subsystem_vendor > 0xffffu || record.pci_subsystem_device > 0xffffu) goto invalid;
++	if (record.pci_device == 0x7550u || record.pci_device == 0x7551u) {
++		expected_target = COBALT_GPU_GFX_TARGET_1201;
++		expected_gc_revision = 1;
++	} else if (record.pci_device == 0x7590u) {
++		expected_target = COBALT_GPU_GFX_TARGET_1200;
++		expected_gc_revision = 0;
++		must_be_disabled = 1;
++	} else {
++		goto invalid;
++	}
++	if (record.gfx_target != expected_target || record.gc_major != 12 ||
++	    record.gc_minor != 0 || record.gc_revision != expected_gc_revision ||
++	    (must_be_disabled && (record.flags & COBALT_GPU_INFO_BRINGUP_ENABLED) != 0)) goto invalid;
++
++	if (record.shader_engines == 0 || record.shader_engines > 4 ||
++	    record.shader_arrays_per_engine == 0 || record.shader_arrays_per_engine > 2 ||
++	    record.wgp_per_array == 0 || record.wgp_per_array > 16 ||
++	    record.cu_per_array == 0 || record.cu_per_array > 32 ||
++	    record.max_waves_per_simd == 0 || record.max_waves_per_simd > 1024 ||
++	    record.render_backends_per_engine == 0 || record.max_compute_units == 0) goto invalid;
++	if (record.render_backends_per_engine > 32u / record.shader_engines ||
++	    record.render_backends_per_engine % record.shader_arrays_per_engine != 0) goto invalid;
++	if (record.wgp_per_array > UINT32_MAX / 2u ||
++	    record.wgp_per_array * 2u != record.cu_per_array) goto invalid;
++	if (record.shader_engines > UINT32_MAX / record.shader_arrays_per_engine) goto invalid;
++	total_rb = record.shader_engines * record.shader_arrays_per_engine;
++	if (total_rb > UINT32_MAX / record.cu_per_array ||
++	    total_rb * record.cu_per_array != record.max_compute_units) goto invalid;
++	for (i = 0; i < 13; ++i) if (record.reserved[i] != 0) goto invalid;
++
++	*out = record;
++	return 1;
++
++invalid:
++	memset(out, 0, sizeof(*out));
++	return 0;
++}
++
++#endif
+diff --git a/src/amd/common/ac_linux_drm.c b/src/amd/common/ac_linux_drm.c
+index 9c3b071..bd837bb 100644
+--- a/src/amd/common/ac_linux_drm.c
++++ b/src/amd/common/ac_linux_drm.c
+@@ -10,6 +10,7 @@
+ #include "util/u_sync_provider.h"
+ #include "ac_gpu_info.h"
+ 
++#include <errno.h>
+ #include <stdlib.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -63,6 +64,11 @@ ac_drm_ioctl_write_read(ac_drm_device *dev, unsigned drm_command_index, void *da
+ 
+ #ifdef HAVE_AMDGPU_DARWIN
+ /* Darwin-only: the native kext connection behind this device (for the scanout API). */
++const struct cobalt_gpu_info_v1 *ac_drm_darwin_identity(ac_drm_device *dev)
++{
++   return dev->is_darwin ? acd_device_identity(dev->ddev) : NULL;
++}
++
+ struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor);
+ struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor)
+ {
+@@ -85,7 +91,7 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
+ 
+    *dev = malloc(sizeof(ac_drm_device));
+    if (!(*dev))
+-      return -1;
++      return -ENOMEM;
+ 
+ #ifdef HAVE_AMDGPU_DARWIN
+    /* No DRM node: fd and is_virtio are ignored. */
+diff --git a/src/amd/common/ac_linux_drm.h b/src/amd/common/ac_linux_drm.h
+index 2c605a3..8e65bbc 100644
+--- a/src/amd/common/ac_linux_drm.h
++++ b/src/amd/common/ac_linux_drm.h
+@@ -332,6 +332,11 @@ extern "C" {
+ 
+ struct ac_drm_device;
+ typedef struct ac_drm_device ac_drm_device;
++
++#ifdef HAVE_AMDGPU_DARWIN
++struct cobalt_gpu_info_v1;
++const struct cobalt_gpu_info_v1 *ac_drm_darwin_identity(ac_drm_device *dev);
++#endif
+ struct util_sync_provider;
+ struct radeon_info;
+ 
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 9e35f84..dfdf475 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -7,6 +7,7 @@
+ #include "ac_darwin_drm.h"
+ #include "ac_darwin_kext.h"
+ #include "ac_darwin_budget.h"
++#include "ac_darwin_identity.h"
+ 
+ #include <errno.h>
+ #include <pthread.h>
+@@ -142,6 +143,14 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+       return r;
+    }
+ 
++   const struct cobalt_gpu_info_v1 *identity = acd_kext_identity(kext);
++   if (identity && !acd_identity_gc_matches(identity, info.gc_version)) {
++      fprintf(stderr, "radv-darwin: live QueryInfo GC 0x%06x disagrees with "
++                      "Cobalt,GpuInfo-v1 GC %u.%u.%u\n", info.gc_version,
++              identity->gc_major, identity->gc_minor, identity->gc_revision);
++      return -ENODEV;
++   }
++
+    /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. QueryInfo carries the live value
+     * (n48n_info.gb_addr_config); ReadRegs is root-only and refused for a user-application (G4 APP) session, so it is
+     * only the fallback for a kernel that left the field 0. */
+@@ -193,6 +202,12 @@ acd_device_kext(acd_device_handle dev, uint32_t *abi_minor)
+    return dev->core->kext;
+ }
+ 
++const struct cobalt_gpu_info_v1 *
++acd_device_identity(acd_device_handle dev)
++{
++   return acd_kext_identity(dev->core->kext);
++}
++
+ /* Builds the core: connection (unless the HOST_BO stand-in), handshake, VA manager, master provider. */
+ static int
+ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_core **out)
+@@ -272,8 +287,13 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+    } else {
+       pthread_mutex_lock(&g_core_lock);
+       if (g_core) {
+-         g_core->refcount++;
+-         dev->core = g_core;
++         if (mock != (acd_kext_identity(g_core->kext) == NULL)) {
++            fprintf(stderr, "radv-darwin: cannot switch native/mock backend while a shared device is alive\n");
++            r = -ENODEV;
++         } else {
++            g_core->refcount++;
++            dev->core = g_core;
++         }
+       } else {
+          r = acd_core_create(dev->canned, false, &g_core);
+          if (r == 0) {
+@@ -331,7 +351,7 @@ acd_device_get_sync_provider(acd_device_handle dev)
+ const char *
+ acd_get_marketing_name(acd_device_handle dev)
+ {
+-   return ACD_MARKETING_NAME;
++   return acd_device_identity(dev) ? "AMD Radeon (gfx1201)" : ACD_MARKETING_NAME;
+ }
+ 
+ int
+@@ -469,6 +489,14 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+       return 0;
+    case AMDGPU_INFO_DEV_INFO:
+       *(struct drm_amdgpu_info_device *)out = d->dev;
++      {
++         const struct cobalt_gpu_info_v1 *identity = acd_device_identity(dev);
++         if (identity) {
++            struct drm_amdgpu_info_device *di = out;
++            di->device_id = identity->pci_device;
++            di->pci_rev = identity->pci_revision;
++         }
++      }
+       return 0;
+    case AMDGPU_INFO_MEMORY:
+       if (dev->core->kext)
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+index 0d92684..0af85db 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.h
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -41,6 +41,8 @@ int acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned si
+ /* The process's native kext connection (NULL in the HOST_BO stand-in) and the ABI minor it reported. */
+ struct acd_kext;
+ struct acd_kext *acd_device_kext(acd_device_handle dev, uint32_t *abi_minor);
++struct cobalt_gpu_info_v1;
++const struct cobalt_gpu_info_v1 *acd_device_identity(acd_device_handle dev);
+ 
+ const char *acd_get_marketing_name(acd_device_handle dev);
+ int acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value);
+diff --git a/src/amd/common/darwin/ac_darwin_identity.h b/src/amd/common/darwin/ac_darwin_identity.h
+new file mode 100644
+index 0000000..faae069
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_identity.h
+@@ -0,0 +1,28 @@
++#ifndef AC_DARWIN_IDENTITY_H
++#define AC_DARWIN_IDENTITY_H
++
++#include "cobalt_gpu_info.h"
++
++static inline const char *
++acd_identity_decode(const void *bytes, size_t length, struct cobalt_gpu_info_v1 *out)
++{
++   if (!bytes) {
++      memset(out, 0, sizeof(*out));
++      return "missing Cobalt,GpuInfo-v1; update the Cobalt kernel driver";
++   }
++   if (!cobalt_gpu_info_v1_decode(bytes, length, out))
++      return "malformed Cobalt,GpuInfo-v1";
++   if (out->gfx_target != COBALT_GPU_GFX_TARGET_1201)
++      return "gfx1200 / Navi 44 is unsupported and remains disabled";
++   if (!(out->flags & COBALT_GPU_INFO_BRINGUP_ENABLED))
++      return "Cobalt,GpuInfo-v1 bringup profile is disabled";
++   return NULL;
++}
++
++static inline int
++acd_identity_gc_matches(const struct cobalt_gpu_info_v1 *identity, uint32_t gc_version)
++{
++   return gc_version == ((identity->gc_major << 16) | (identity->gc_minor << 8) | identity->gc_revision);
++}
++
++#endif
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+index 5fe860c..94e4191 100644
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -7,10 +7,12 @@
+  */
+ 
+ #include "ac_darwin_kext.h"
++#include "ac_darwin_identity.h"
+ 
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ 
+ #include <IOKit/IOKitLib.h>
+@@ -65,9 +67,61 @@ iokit_close(void *ctx)
+    free(c);
+ }
+ 
++static int
++iokit_read_identity(io_service_t svc, struct cobalt_gpu_info_v1 *identity)
++{
++   io_registry_entry_t owner = svc;
++   bool release_owner = false;
++   if (IOObjectConformsTo(svc, ACD_SERVICE_ACCELERATOR)) {
++      io_registry_entry_t nub = IO_OBJECT_NULL;
++      if (IORegistryEntryGetParentEntry(svc, kIOServicePlane, &nub) != KERN_SUCCESS)
++         goto ancestry_error;
++      if (!IOObjectConformsTo(nub, "Navi48MetalNub")) {
++         IOObjectRelease(nub);
++         goto ancestry_error;
++      }
++      kern_return_t kr = IORegistryEntryGetParentEntry(nub, kIOServicePlane, &owner);
++      IOObjectRelease(nub);
++      if (kr != KERN_SUCCESS)
++         goto ancestry_error;
++      release_owner = true;
++   }
++   if (!IOObjectConformsTo(owner, ACD_SERVICE_BRINGUP)) {
++      if (release_owner)
++         IOObjectRelease(owner);
++      goto ancestry_error;
++   }
++
++   CFTypeRef property = IORegistryEntryCreateCFProperty(owner, CFSTR(COBALT_GPU_INFO_PROPERTY),
++                                                       kCFAllocatorDefault, 0);
++   if (release_owner)
++      IOObjectRelease(owner);
++   const char *reason;
++   if (!property) {
++      reason = acd_identity_decode(NULL, 0, identity);
++   } else if (CFGetTypeID(property) != CFDataGetTypeID()) {
++      reason = "Cobalt,GpuInfo-v1 must be CFData";
++   } else {
++      reason = acd_identity_decode(CFDataGetBytePtr((CFDataRef)property),
++                                   CFDataGetLength((CFDataRef)property), identity);
++   }
++   if (property)
++      CFRelease(property);
++   if (!reason)
++      return 0;
++   fprintf(stderr, "radv-darwin: native identity refused before IOServiceOpen: %s\n", reason);
++   return -ENODEV;
++
++ancestry_error:
++   fprintf(stderr, "radv-darwin: native identity refused before IOServiceOpen: expected selected "
++                   "Navi48Bringup or Navi48Accelerator -> Navi48MetalNub -> Navi48Bringup\n");
++   return -ENODEV;
++}
++
+ int
+ acd_kext_open_iokit(struct acd_kext **out)
+ {
++   *out = NULL;
+    const char *svc_class = acd_kext_service_class(); /* G6: Navi48Bringup unless the bundle chose the accelerator */
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(svc_class));
+    if (!svc) {
+@@ -76,6 +130,13 @@ acd_kext_open_iokit(struct acd_kext **out)
+       return -ENODEV;
+    }
+ 
++   struct cobalt_gpu_info_v1 identity = {0};
++   int r = iokit_read_identity(svc, &identity);
++   if (r) {
++      IOObjectRelease(svc);
++      return r;
++   }
++
+    io_connect_t conn = 0;
+    kern_return_t kr = KERN_FAILURE;
+    /* A previous client (e.g. RADV's throw-away device used for the physical-device query) may
+@@ -109,6 +170,6 @@ acd_kext_open_iokit(struct acd_kext **out)
+       .unmap = iokit_unmap,
+       .close = iokit_close,
+    };
+-   *out = acd_kext_create(&ops, c);
++   *out = acd_kext_create_with_identity(&ops, c, &identity);
+    return *out ? 0 : -ENOMEM;
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index 15cf72d..6dbbd6e 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -72,6 +72,8 @@ _Static_assert(N48N_GEM_DOMAIN_GTT == AMDGPU_GEM_DOMAIN_GTT && N48N_GEM_DOMAIN_V
+ struct acd_kext {
+    struct acd_kext_ops ops;
+    void *ctx;
++   bool has_identity;
++   struct cobalt_gpu_info_v1 identity;
+ };
+ 
+ /* G6: the service class of the N48N open. A pointer to one of the two string literals below (never to the caller's buffer). */
+@@ -99,6 +101,13 @@ acd_kext_service_class(void)
+ 
+ struct acd_kext *
+ acd_kext_create(const struct acd_kext_ops *ops, void *ctx)
++{
++   return acd_kext_create_with_identity(ops, ctx, NULL);
++}
++
++struct acd_kext *
++acd_kext_create_with_identity(const struct acd_kext_ops *ops, void *ctx,
++                              const struct cobalt_gpu_info_v1 *identity)
+ {
+    struct acd_kext *k = calloc(1, sizeof(*k));
+    if (!k) {
+@@ -108,9 +117,19 @@ acd_kext_create(const struct acd_kext_ops *ops, void *ctx)
+    }
+    k->ops = *ops;
+    k->ctx = ctx;
++   if (identity) {
++      k->identity = *identity;
++      k->has_identity = true;
++   }
+    return k;
+ }
+ 
++const struct cobalt_gpu_info_v1 *
++acd_kext_identity(const struct acd_kext *k)
++{
++   return k && k->has_identity ? &k->identity : NULL;
++}
++
+ void
+ acd_kext_destroy(struct acd_kext *k)
+ {
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index 115188e..545c97b 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -17,6 +17,7 @@
+ 
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "navi48_native_abi.h"
++#include "cobalt_gpu_info.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -93,6 +94,9 @@ struct acd_kext;
+ 
+ /* Takes ownership of ctx (ops->close is called at destroy). */
+ struct acd_kext *acd_kext_create(const struct acd_kext_ops *ops, void *ctx);
++struct acd_kext *acd_kext_create_with_identity(const struct acd_kext_ops *ops, void *ctx,
++                                             const struct cobalt_gpu_info_v1 *identity);
++const struct cobalt_gpu_info_v1 *acd_kext_identity(const struct acd_kext *k);
+ void acd_kext_destroy(struct acd_kext *k);
+ 
+ /* Backend selection: RADV_DARWIN_MOCK=1 gives the in-process mock, otherwise the
+diff --git a/src/amd/common/darwin/test/acd_identity_test.c b/src/amd/common/darwin/test/acd_identity_test.c
+new file mode 100644
+index 0000000..667239a
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_identity_test.c
+@@ -0,0 +1,65 @@
++#include "ac_darwin_identity.h"
++
++#include <assert.h>
++#include <stdio.h>
++
++static struct cobalt_gpu_info_v1
++record(void)
++{
++   return (struct cobalt_gpu_info_v1){
++      .version = COBALT_GPU_INFO_VERSION,
++      .size = sizeof(struct cobalt_gpu_info_v1),
++      .flags = COBALT_GPU_INFO_CAPACITY_VALID | COBALT_GPU_INFO_BRINGUP_ENABLED,
++      .pci_vendor = 0x1002,
++      .pci_device = 0x7551,
++      .pci_revision = 0xc8,
++      .pci_subsystem_vendor = 0x1da2,
++      .pci_subsystem_device = 0xe499,
++      .gfx_target = COBALT_GPU_GFX_TARGET_1201,
++      .gc_major = 12,
++      .gc_revision = 1,
++      .shader_engines = 4,
++      .shader_arrays_per_engine = 2,
++      .wgp_per_array = 4,
++      .cu_per_array = 8,
++      .max_compute_units = 64,
++      .render_backends_per_engine = 4,
++      .max_waves_per_simd = 16,
++   };
++}
++
++int main(void)
++{
++   struct cobalt_gpu_info_v1 in = record(), out;
++   assert(acd_identity_decode(&in, sizeof(in), &out) == NULL);
++   assert(out.pci_device == 0x7551 && out.pci_revision == 0xc8);
++   assert(out.pci_subsystem_vendor == 0x1da2 && out.pci_subsystem_device == 0xe499);
++   assert(acd_identity_gc_matches(&out, 0xc0001));
++   assert(!acd_identity_gc_matches(&out, 0xc0000));
++   assert(!acd_identity_gc_matches(&out, 0));
++   assert(acd_identity_decode(NULL, 0, &out));
++   assert(out.version == 0 && out.pci_device == 0);
++   assert(acd_identity_decode(&in, sizeof(in) - 1, &out));
++   in.reserved[7] = 1;
++   assert(acd_identity_decode(&in, sizeof(in), &out));
++   in = record();
++   in.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED;
++   assert(acd_identity_decode(&in, sizeof(in), &out));
++   in.pci_device = 0x7590;
++   in.gfx_target = COBALT_GPU_GFX_TARGET_1200;
++   in.gc_revision = 0;
++   assert(cobalt_gpu_info_v1_decode(&in, sizeof(in), &out));
++   assert(acd_identity_decode(&in, sizeof(in), &out));
++   in.flags |= COBALT_GPU_INFO_BRINGUP_ENABLED;
++   assert(!cobalt_gpu_info_v1_decode(&in, sizeof(in), &out));
++   assert(acd_identity_decode(&in, sizeof(in), &out));
++   in = record();
++   in.pci_device = 0x7550;
++   assert(acd_identity_decode(&in, sizeof(in), &out) == NULL);
++   unsigned char unaligned[sizeof(in) + 1];
++   memcpy(unaligned + 1, &in, sizeof(in));
++   assert(acd_identity_decode(unaligned + 1, sizeof(in), &out) == NULL);
++   assert(acd_identity_decode(&out, sizeof(out), &out) == NULL);
++   puts("acd_identity_test: passed");
++   return 0;
++}
+diff --git a/src/amd/common/darwin/test/acd_iokit_test.c b/src/amd/common/darwin/test/acd_iokit_test.c
+new file mode 100644
+index 0000000..59d328a
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_iokit_test.c
+@@ -0,0 +1,235 @@
++#include "ac_darwin_kext.h"
++#include <IOKit/IOKitLib.h>
++
++#include <assert.h>
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++
++#ifdef ACD_TEST_ALLOCATOR
++#undef calloc
++static unsigned alloc_calls, fail_alloc_call;
++void *acd_test_calloc(size_t count, size_t size)
++{
++   if (++alloc_calls == fail_alloc_call)
++      return NULL;
++   return calloc(count, size);
++}
++#endif
++
++enum { BRINGUP = 1, ACCELERATOR, NUB, WRONG };
++static struct cobalt_gpu_info_v1 wire;
++static unsigned refs[5], matches, opens, closes, property_refs, reads;
++static io_service_t selected;
++static io_registry_entry_t nub_parent, accelerator_parent;
++static int property_kind, parent_failure, open_error;
++static CFIndex wire_length;
++
++static void reset(void)
++{
++   for (unsigned i = 0; i < 5; i++)
++      assert(refs[i] == 0);
++   assert(property_refs == 0);
++#ifdef ACD_TEST_ALLOCATOR
++   alloc_calls = fail_alloc_call = 0;
++#endif
++   matches = opens = closes = reads = 0;
++   selected = BRINGUP;
++   nub_parent = BRINGUP;
++   accelerator_parent = NUB;
++   property_kind = 1;
++   parent_failure = open_error = 0;
++   wire_length = sizeof(wire);
++   wire = (struct cobalt_gpu_info_v1){
++      .version = 1, .size = sizeof(wire), .flags = 3,
++      .pci_vendor = 0x1002, .pci_device = 0x7551, .pci_revision = 0xc8,
++      .pci_subsystem_vendor = 0x1da2, .pci_subsystem_device = 0xe499,
++      .gfx_target = 1201, .gc_major = 12, .gc_revision = 1,
++      .shader_engines = 4, .shader_arrays_per_engine = 2, .wgp_per_array = 4,
++      .cu_per_array = 8, .max_compute_units = 64,
++      .render_backends_per_engine = 4, .max_waves_per_simd = 16,
++   };
++}
++
++CFMutableDictionaryRef IOServiceMatching(const char *name)
++{
++   return (void *)name;
++}
++io_service_t IOServiceGetMatchingService(mach_port_t port, CFMutableDictionaryRef matching)
++{
++   (void)port; (void)matching;
++   matches++;
++   if (selected)
++      refs[selected]++;
++   return selected;
++}
++int IOObjectConformsTo(io_object_t object, const char *name)
++{
++   assert(object && refs[object]);
++   return (object == BRINGUP && !strcmp(name, ACD_SERVICE_BRINGUP)) ||
++          (object == ACCELERATOR && !strcmp(name, ACD_SERVICE_ACCELERATOR)) ||
++          (object == NUB && !strcmp(name, "Navi48MetalNub"));
++}
++kern_return_t IOObjectRelease(io_object_t object)
++{
++   assert(object && refs[object]);
++   refs[object]--;
++   return KERN_SUCCESS;
++}
++kern_return_t IORegistryEntryGetParentEntry(io_registry_entry_t entry, const char *plane,
++                                           io_registry_entry_t *parent)
++{
++   assert(refs[entry] && !strcmp(plane, kIOServicePlane));
++   if ((int)entry == parent_failure)
++      return KERN_FAILURE;
++   *parent = entry == ACCELERATOR ? accelerator_parent : nub_parent;
++   refs[*parent]++;
++   return KERN_SUCCESS;
++}
++CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, const char *key,
++                                         const void *allocator, uint32_t options)
++{
++   (void)allocator; (void)options;
++   assert(refs[entry] && entry == BRINGUP);
++   assert(!strcmp(key, COBALT_GPU_INFO_PROPERTY));
++   reads++;
++   if (!property_kind)
++      return NULL;
++   property_refs++;
++   return &wire;
++}
++CFTypeID CFGetTypeID(CFTypeRef property)
++{
++   assert(property == &wire && property_refs);
++   return property_kind;
++}
++CFTypeID CFDataGetTypeID(void) { return 1; }
++const uint8_t *CFDataGetBytePtr(CFDataRef property)
++{
++   assert(property == &wire && property_refs);
++   return (const uint8_t *)&wire;
++}
++CFIndex CFDataGetLength(CFDataRef property)
++{
++   assert(property == &wire && property_refs);
++   return wire_length;
++}
++void CFRelease(CFTypeRef property)
++{
++   assert(property == &wire && property_refs);
++   property_refs--;
++}
++kern_return_t IOServiceOpen(io_service_t service, mach_port_t task, uint32_t type, io_connect_t *conn)
++{
++   (void)task;
++   assert(service == selected && refs[service] && type == N48N_UC_TYPE);
++   assert(reads == 1 && property_refs == 0);
++   opens++;
++   if (open_error)
++      return open_error;
++   *conn = 99;
++   return KERN_SUCCESS;
++}
++kern_return_t IOServiceClose(io_connect_t conn)
++{
++   assert(conn == 99);
++   closes++;
++   return KERN_SUCCESS;
++}
++kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel, const uint64_t *sin, uint32_t nsin,
++                                  const void *stin, size_t stinsz, uint64_t *sout, uint32_t *nsout,
++                                  void *stout, size_t *stoutsz)
++{
++   (void)conn; (void)sel; (void)sin; (void)nsin; (void)stin; (void)stinsz;
++   (void)sout; (void)nsout; (void)stout; (void)stoutsz;
++   assert(0);
++   return KERN_FAILURE;
++}
++kern_return_t IOConnectMapMemory64(io_connect_t conn, uint32_t handle, mach_port_t task,
++                                   mach_vm_address_t *addr, mach_vm_size_t *size, uint32_t options)
++{
++   (void)conn; (void)handle; (void)task; (void)addr; (void)size; (void)options;
++   assert(0);
++   return KERN_FAILURE;
++}
++kern_return_t IOConnectUnmapMemory64(io_connect_t conn, uint32_t handle, mach_port_t task,
++                                     mach_vm_address_t addr)
++{
++   (void)conn; (void)handle; (void)task; (void)addr;
++   assert(0);
++   return KERN_FAILURE;
++}
++int acd_mock_open(struct acd_kext **out) { (void)out; return -ENODEV; }
++
++static void rejected(void)
++{
++   struct acd_kext *k = (void *)1;
++   assert(acd_kext_open_iokit(&k) == -ENODEV);
++   assert(k == NULL && opens == 0 && closes == 0 && matches == 1);
++   for (unsigned i = 0; i < 5; i++)
++      assert(refs[i] == 0);
++   assert(property_refs == 0);
++}
++
++int main(void)
++{
++   reset();
++   struct acd_kext *k;
++   assert(acd_kext_open_iokit(&k) == 0);
++   const struct cobalt_gpu_info_v1 *snapshot = acd_kext_identity(k);
++   assert(snapshot && snapshot != &wire && snapshot->pci_device == 0x7551);
++   assert(snapshot->pci_revision == 0xc8 && snapshot->pci_subsystem_device == 0xe499);
++   wire.pci_device = 0x7550;
++   selected = ACCELERATOR;
++   for (unsigned i = 0; i < 10; i++)
++      assert(acd_kext_identity(k) == snapshot && snapshot->pci_device == 0x7551);
++   assert(matches == 1 && reads == 1 && opens == 1 && closes == 0);
++   acd_kext_destroy(k);
++   assert(closes == 1);
++
++   reset();
++   selected = ACCELERATOR;
++   assert(acd_kext_set_service_class(ACD_SERVICE_ACCELERATOR) == 0);
++   assert(acd_kext_open_iokit(&k) == 0);
++   assert(acd_kext_identity(k)->pci_device == 0x7551);
++   acd_kext_destroy(k);
++   assert(closes == 1);
++
++   reset(); property_kind = 0; rejected();
++   reset(); property_kind = 2; rejected();
++   reset(); wire_length--; rejected();
++   reset(); wire.version++; rejected();
++   reset(); wire.reserved[0] = 1; rejected();
++   reset(); wire.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED; rejected();
++   reset(); wire.pci_device = 0x7590; wire.gfx_target = 1200; wire.gc_revision = 0;
++   wire.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED; rejected();
++   reset(); selected = ACCELERATOR; parent_failure = ACCELERATOR; rejected();
++   reset(); selected = ACCELERATOR; accelerator_parent = WRONG; rejected();
++   reset(); selected = ACCELERATOR; parent_failure = NUB; rejected();
++   reset(); selected = ACCELERATOR; nub_parent = WRONG; rejected();
++   reset(); selected = WRONG; rejected();
++   reset(); selected = IO_OBJECT_NULL; rejected();
++   reset(); open_error = (int)ACD_KR_NOT_READY;
++   assert(acd_kext_open_iokit(&k) == -ENODEV && k == NULL);
++   assert(opens == 1 && closes == 0);
++   reset();
++
++#ifdef ACD_TEST_ALLOCATOR
++   fail_alloc_call = 1;
++   assert(acd_kext_open_iokit(&k) == -ENOMEM && k == NULL);
++   assert(opens == 1 && closes == 1);
++   reset();
++   fail_alloc_call = 2;
++   assert(acd_kext_open_iokit(&k) == -ENOMEM && k == NULL);
++   assert(opens == 1 && closes == 1);
++   reset();
++#endif
++
++   const struct acd_kext_ops ops = {0};
++   k = acd_kext_create(&ops, NULL);
++   assert(k && acd_kext_identity(k) == NULL);
++   acd_kext_destroy(k);
++   assert(acd_kext_identity(NULL) == NULL);
++   puts("acd_iokit_test: passed");
++   return 0;
++}
+diff --git a/src/amd/common/darwin/test/iokit-stubs/IOKit/IOKitLib.h b/src/amd/common/darwin/test/iokit-stubs/IOKit/IOKitLib.h
+new file mode 100644
+index 0000000..b1c9822
+--- /dev/null
++++ b/src/amd/common/darwin/test/iokit-stubs/IOKit/IOKitLib.h
+@@ -0,0 +1,51 @@
++#ifndef ACD_TEST_IOKIT_H
++#define ACD_TEST_IOKIT_H
++#include <stddef.h>
++#include <stdint.h>
++
++typedef uint32_t io_service_t;
++typedef uint32_t io_connect_t;
++typedef uint32_t io_registry_entry_t;
++typedef uint32_t io_object_t;
++typedef uint32_t mach_port_t;
++typedef int kern_return_t;
++typedef uint64_t mach_vm_address_t;
++typedef uint64_t mach_vm_size_t;
++typedef long CFIndex;
++typedef unsigned long CFTypeID;
++typedef const void *CFTypeRef;
++typedef const void *CFDataRef;
++typedef void *CFMutableDictionaryRef;
++#define IO_OBJECT_NULL 0
++#define kIOMainPortDefault 0
++#define KERN_SUCCESS 0
++#define KERN_FAILURE 5
++#define kIOReturnSuccess 0
++#define kIOMapAnywhere 1
++#define kIOServicePlane "IOService"
++#define kCFAllocatorDefault NULL
++#define CFSTR(x) (x)
++
++CFMutableDictionaryRef IOServiceMatching(const char *name);
++io_service_t IOServiceGetMatchingService(mach_port_t port, CFMutableDictionaryRef matching);
++int IOObjectConformsTo(io_object_t object, const char *name);
++kern_return_t IOObjectRelease(io_object_t object);
++kern_return_t IORegistryEntryGetParentEntry(io_registry_entry_t entry, const char *plane,
++                                           io_registry_entry_t *parent);
++CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, const char *key,
++                                         const void *allocator, uint32_t options);
++CFTypeID CFGetTypeID(CFTypeRef property);
++CFTypeID CFDataGetTypeID(void);
++const uint8_t *CFDataGetBytePtr(CFDataRef property);
++CFIndex CFDataGetLength(CFDataRef property);
++void CFRelease(CFTypeRef property);
++kern_return_t IOServiceOpen(io_service_t service, mach_port_t task, uint32_t type, io_connect_t *conn);
++kern_return_t IOServiceClose(io_connect_t conn);
++kern_return_t IOConnectCallMethod(io_connect_t conn, uint32_t sel, const uint64_t *sin, uint32_t nsin,
++                                  const void *stin, size_t stinsz, uint64_t *sout, uint32_t *nsout,
++                                  void *stout, size_t *stoutsz);
++kern_return_t IOConnectMapMemory64(io_connect_t conn, uint32_t handle, mach_port_t task,
++                                   mach_vm_address_t *addr, mach_vm_size_t *size, uint32_t options);
++kern_return_t IOConnectUnmapMemory64(io_connect_t conn, uint32_t handle, mach_port_t task,
++                                     mach_vm_address_t addr);
++#endif
+diff --git a/src/amd/common/darwin/test/iokit-stubs/acd_test_alloc.h b/src/amd/common/darwin/test/iokit-stubs/acd_test_alloc.h
+new file mode 100644
+index 0000000..3fb293d
+--- /dev/null
++++ b/src/amd/common/darwin/test/iokit-stubs/acd_test_alloc.h
+@@ -0,0 +1,7 @@
++#ifndef ACD_TEST_ALLOC_H
++#define ACD_TEST_ALLOC_H
++#include <stdlib.h>
++void *acd_test_calloc(size_t count, size_t size);
++#define calloc acd_test_calloc
++#define ACD_TEST_ALLOCATOR 1
++#endif
+diff --git a/src/amd/common/darwin/test/iokit-stubs/mach/mach.h b/src/amd/common/darwin/test/iokit-stubs/mach/mach.h
+new file mode 100644
+index 0000000..5f5ee85
+--- /dev/null
++++ b/src/amd/common/darwin/test/iokit-stubs/mach/mach.h
+@@ -0,0 +1,2 @@
++#include <IOKit/IOKitLib.h>
++static inline mach_port_t mach_task_self(void) { return 1; }
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 1730aab..a2e067f 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -43,6 +43,10 @@ typedef void *drmDevicePtr;
+ #endif
+ #include "git_sha1.h"
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++#include "cobalt_gpu_info.h"
++#endif
++
+ #if AMD_LLVM_AVAILABLE
+ #include <llvm-c/TargetMachine.h>
+ #endif
+@@ -2999,16 +3003,33 @@ radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
+    struct radv_instance *instance = (struct radv_instance *)vk_instance;
+    struct radv_physical_device *pdev = NULL;
+ 
+-   /* Fake PCI identity of the RX 9070 XT (vendor 0x1002, device 0x7550). */
+-   static char *nodes[DRM_NODE_MAX];
+-   static drmPciBusInfo bus_info;
+-   static drmPciDeviceInfo device_info = {
+-      .vendor_id = 0x1002,
+-      .device_id = 0x7550,
+-      .subvendor_id = 0x1002,
+-      .subdevice_id = 0x0000,
+-      .revision_id = 0xC0,
+-   };
++   ac_drm_device *dev;
++   uint32_t major, minor;
++   int r = ac_drm_device_initialize(-1, false, &major, &minor, &dev);
++   if (r)
++      return r == -ENOMEM ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
++
++   const struct cobalt_gpu_info_v1 *identity = ac_drm_darwin_identity(dev);
++   char *nodes[DRM_NODE_MAX] = {0};
++   drmPciBusInfo bus_info = {0};
++   drmPciDeviceInfo device_info;
++   if (identity) {
++      device_info = (drmPciDeviceInfo){
++         .vendor_id = identity->pci_vendor,
++         .device_id = identity->pci_device,
++         .subvendor_id = identity->pci_subsystem_vendor,
++         .subdevice_id = identity->pci_subsystem_device,
++         .revision_id = identity->pci_revision,
++      };
++   } else {
++      device_info = (drmPciDeviceInfo){
++         .vendor_id = 0x1002,
++         .device_id = 0x7550,
++         .subvendor_id = 0x1002,
++         .subdevice_id = 0x0000,
++         .revision_id = 0xC0,
++      };
++   }
+    drmDevice drm_device = {
+       .nodes = nodes,
+       .available_nodes = 0,
+@@ -3019,10 +3040,14 @@ radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
+ 
+    VkResult result = radv_physical_device_try_create(instance, &drm_device, &pdev);
+    if (result != VK_SUCCESS) {
++      ac_drm_device_deinitialize(dev);
+       /* The backend already said why on stderr (kext missing, Hello refused, ...): no device. */
+       return result == VK_ERROR_OUT_OF_HOST_MEMORY ? result : VK_SUCCESS;
+    }
+ 
++   assert(!pdev->drm_device);
++   pdev->drm_device = dev;
++
+    list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
+    return VK_SUCCESS;
+ }
