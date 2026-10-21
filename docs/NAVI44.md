@@ -89,9 +89,11 @@ For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md
 4. Validate display routing and output programming. The captured DCN 4.1.0
    segment bases match the current driver, but this does not prove that its
    board-specific mode/monitor captures and output routing are suitable.
-5. Replace the RADV Darwin backend's canned gfx1201 device/PCI identity and
-   carry verified target information through the Metal bundle. The kernel
-   now exposes a capacity/identity record; RADV does not consume it yet.
+5. Complete the RADV Darwin hardware description and carry verified target
+   information through the Metal bundle. RADV now consumes kernel identity
+   and active-layout records for Navi 48. The gfx1200 reference is covered
+   by source tests; a native path still needs actual macOS firmware reporting
+   and staged initialization before the existing refusal can be removed.
 6. Build and test on macOS, then perform staged hardware validation on the
    target desktop before enabling Navi 44 acceleration.
 

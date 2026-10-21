@@ -40,7 +40,7 @@ graphics acceleration or compatibility with the RX 9060 XT.
 
 ## Artifacts
 
-The job uploads the nine macOS x86_64 host executables and a tar archive
+The job uploads the eleven macOS x86_64 host executables and a tar archive
 containing the compiled, ad-hoc-signed kext, build provenance, the project
 license/notices, and the AMD firmware license. The archive is for inspection
 and download only. Do not treat it as a tested driver or install it on a
@@ -56,3 +56,9 @@ GitHub-hosted macOS x86_64 capacity is time-limited by GitHub's runner support
 policy. The workflow uses `macos-15-intel`, the Intel macOS 15 label documented
 by GitHub. If that runner is later retired, the project will need another
 Intel macOS build host because the current Makefile targets an x86_64 kext.
+
+A separate Mesa job applies the twelve ordered patches to the pinned external
+source, runs native transport simulations, and builds the full x86_64 RADV
+library. It also builds and runs `acd_gpu_info_test` against Mesa's real chip,
+memory and hardware-info code, including the disabled gfx1200 reference.
+The library artifact includes source/patch hashes and remains compile-only.

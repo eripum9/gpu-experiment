@@ -66,11 +66,12 @@ described in `GFX-RUNTIME.md`. It replaces canned CU/RB masks and tiling
 configuration with validated runtime values and cross-checks live QueryInfo.
 Maximum CU capacity is never substituted for the active-unit count.
 
-The pinned Mesa base has a canned gfx1201 device record and no gfx1200
-record. Other hardware properties, cache information and clocks still use
-that template. Runtime memory pools and budgets continue to come from
-QueryInfo. A future gfx1200 path needs verified values for the remaining
-parameters before it can replace the template.
+The pinned Mesa base has a canned gfx1201 device record. Patch 0012 derives
+a separate gfx1200 reference using verified target hardware data and the
+runtime overlay. Platform VM policy stays unchanged; runtime memory pools
+and budgets continue to come from QueryInfo. The gfx1200 reference leaves
+CP firmware versions unset and cannot pass the native identity gate.
+See `GFX-RUNTIME.md` for the reference's scope and hardware-info checks.
 
 Mesa remains external at the revision in `mesa-patches/README.txt`; the
 Metal build script also consumes an external RADV dylib. CI now applies

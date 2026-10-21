@@ -28,11 +28,25 @@ use that description. The handshake checks the runtime GC and GB_ADDR_CONFIG
 against live QueryInfo; an environment override cannot bypass disagreement.
 Explicit MOCK and HOST_BO modes retain their synthetic descriptions.
 
-The native template still has gfx1201 cache, clock, firmware and other
-device parameters. gfx1200 remains refused before IOServiceOpen, and Navi 44
-remains disabled in the kernel. A runtime mask cannot supply those missing
-parameters. The same decoder is tested with disabled gfx1200 metadata and
-harvested layouts without enabling a native gfx1200 device.
+Mesa patch 0012 adds a gfx1200 reference description for the verified
+2-SE, 2-SA, 32-CU capacity. It sets the family revision, 128-bit GDDR6 bus,
+16 TCC blocks, 4-MiB L2 and 32-MiB MALL, cache geometry and reported clock
+limits from the target's native Linux queries. The runtime overlay supplies
+the active masks and tiling configuration. This is a reference for this
+device configuration; other gfx1200 capacities are refused.
+
+The reference preserves the platform template's VM ranges, heaps, flags
+and link policy. Its CP firmware versions are zero: the captured Linux
+ME/PFP/MEC versions (2930/3010/3250) differ from the pinned macOS blobs
+(3110/3220/3490). Neither Linux firmware versions nor the old gfx1201
+template can describe firmware actually loaded by a future macOS path.
+gfx1200 remains refused before IOServiceOpen and disabled in the kernel.
+
+The full Mesa CI build runs `acd_gpu_info_test` against Mesa's actual
+chip identification, memory-info and hardware-info functions. It checks
+both families, cache sizes, unit conversions, a harvested gfx1200 engine,
+and preservation of platform memory policy. Standalone tests also check
+invalid metadata and templates without enabling a native gfx1200 device.
 
 ## Collecting the missing hardware description
 
@@ -58,8 +72,14 @@ exist. The default sysfs capture retains its existing `complete` meaning;
 `gpu.drm_runtime.complete` separately describes the required runtime queries.
 Absent optional engines/firmware are recorded without invalidating successful
 required queries. Old kernels may leave new trailing UAPI fields zero, so
-these buffers do not establish availability of every field. No actual target
-runtime capture has been collected for this change yet.
+these buffers do not establish availability of every field.
+
+A private native Ubuntu capture from the target RX 9060 XT completed all
+queries. Raw query sizes, SHA-256 digests and decoded fields were checked.
+It reports 32 active CUs, RB mask 0xff and GB_ADDR_CONFIG 0x08200545.
+All 42 parsed IP records and the GC topology match the earlier capture;
+the changed cached-blob bytes are outside its declared discovery binary.
+This establishes Linux-reported hardware data, not macOS initialization.
 
 Linux's VM address ranges and heap policy are diagnostic data, not values to
 copy into the macOS allocator. macOS memory-pool sizes, budgets and VA limits

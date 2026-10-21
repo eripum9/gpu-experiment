@@ -1,0 +1,455 @@
+diff --git a/src/amd/common/darwin/ac_darwin_runtime.h b/src/amd/common/darwin/ac_darwin_runtime.h
+index 457b4b9..8156f7a 100644
+--- a/src/amd/common/darwin/ac_darwin_runtime.h
++++ b/src/amd/common/darwin/ac_darwin_runtime.h
+@@ -7,6 +7,90 @@
+ #include "common/amdgpu_devices.h"
+ #include "cobalt_gfx_runtime.h"
+ 
++static inline bool
++acd_runtime_reference(const struct amdgpu_device *canned_template,
++                      const struct cobalt_gpu_info_v1 *identity,
++                      struct amdgpu_device *out)
++{
++   struct cobalt_gpu_info_v1 checked_identity;
++   struct amdgpu_device reference;
++
++   if (!canned_template || !identity || !out || !canned_template->name ||
++       strcmp(canned_template->name, "gfx1201") ||
++       canned_template->radeon_family != CHIP_GFX1201 ||
++       canned_template->hw_ip_gfx.hw_ip_version_major != 12 ||
++       canned_template->hw_ip_gfx.hw_ip_version_minor != 0 ||
++       canned_template->hw_ip_gfx.ip_discovery_version != 0xc0001 ||
++       canned_template->hw_ip_compute.hw_ip_version_major != 12 ||
++       canned_template->hw_ip_compute.hw_ip_version_minor != 0 ||
++       canned_template->hw_ip_compute.ip_discovery_version != 0xc0001 ||
++       canned_template->mmr_reg_count >
++          sizeof(canned_template->mmr_regs) / (3 * sizeof(canned_template->mmr_regs[0])) ||
++       !cobalt_gpu_info_v1_decode(identity, sizeof(*identity), &checked_identity))
++      return false;
++
++   if (checked_identity.gfx_target == COBALT_GPU_GFX_TARGET_1200 &&
++       (checked_identity.shader_engines != 2 ||
++        checked_identity.shader_arrays_per_engine != 2 ||
++        checked_identity.wgp_per_array != 4 || checked_identity.cu_per_array != 8 ||
++        checked_identity.max_compute_units != 32 ||
++        checked_identity.render_backends_per_engine != 4 ||
++        checked_identity.max_waves_per_simd != 16))
++      return false;
++   if (checked_identity.gfx_target != COBALT_GPU_GFX_TARGET_1200 &&
++       checked_identity.gfx_target != COBALT_GPU_GFX_TARGET_1201)
++      return false;
++
++   bool has_gb_addr_config = false;
++   for (uint32_t i = 0; i < canned_template->mmr_reg_count; i++)
++      has_gb_addr_config |= canned_template->mmr_regs[i * 3] == 0x263e;
++   if (!has_gb_addr_config)
++      return false;
++
++   reference = *canned_template;
++   if (checked_identity.gfx_target == COBALT_GPU_GFX_TARGET_1200) {
++      reference.name = "gfx1200";
++      reference.radeon_family = CHIP_GFX1200;
++      reference.fw_gfx_me = (struct drm_amdgpu_info_firmware){0};
++      reference.fw_gfx_pfp = (struct drm_amdgpu_info_firmware){0};
++      reference.fw_gfx_mec = (struct drm_amdgpu_info_firmware){0};
++      reference.dev.chip_rev = 1;
++      reference.dev.external_rev = 0x41;
++      reference.dev.family = AMDGPU_FAMILY_GC_12_0_0;
++      reference.dev.gpu_counter_freq = 100000;
++      reference.dev.max_engine_clock = 2780000;
++      reference.dev.max_memory_clock = 1258000;
++      reference.dev.min_engine_clock = 500000;
++      reference.dev.min_memory_clock = 96000;
++      reference.dev.num_shader_engines = 2;
++      reference.dev.num_shader_arrays_per_engine = 2;
++      reference.dev.num_cu_per_sh = 8;
++      reference.dev.num_hw_gfx_contexts = 8;
++      reference.dev.vram_type = 9;
++      reference.dev.vram_bit_width = 128;
++      reference.dev.num_tcc_blocks = 16;
++      reference.dev.tcc_disabled_mask = 0;
++      reference.dev.wave_front_size = 32;
++      reference.dev.num_shader_visible_vgprs = 1536;
++      reference.dev.gc_double_offchip_lds_buf = 64;
++      reference.dev.gs_vgt_table_depth = 32;
++      reference.dev.gs_prim_buffer_depth = 1792;
++      reference.dev.max_gs_waves_per_vgt = 32;
++      reference.dev.tcp_cache_size = 32;
++      reference.dev.num_sqc_per_wgp = 1;
++      reference.dev.sqc_data_cache_size = 16;
++      reference.dev.sqc_inst_cache_size = 32;
++      reference.dev.gl1c_cache_size = 256;
++      reference.dev.gl2c_cache_size = 4096;
++      reference.dev.mall_size = UINT64_C(33554432);
++   }
++
++   reference.dev.device_id = checked_identity.pci_device;
++   reference.dev.pci_rev = checked_identity.pci_revision;
++   *out = reference;
++   return true;
++}
++
+ static inline bool
+ acd_runtime_live_matches(const struct cobalt_gpu_info_v1 *identity,
+                          const struct cobalt_gfx_runtime_v1 *runtime,
+@@ -23,39 +107,35 @@ acd_runtime_overlay(const struct amdgpu_device *canned, const struct cobalt_gpu_
+                     const struct cobalt_gfx_runtime_v1 *runtime, struct amdgpu_device *out)
+ {
+    struct cobalt_gfx_runtime_v1 decoded;
+-   if (!identity || identity->gfx_target != COBALT_GPU_GFX_TARGET_1201 || !runtime ||
+-       !cobalt_gfx_runtime_v1_decode(runtime, sizeof(*runtime), identity, &decoded))
+-      return false;
+-
+-   bool found = false;
+-   for (uint32_t i = 0; i < canned->mmr_reg_count; i++)
+-      found |= canned->mmr_regs[i * 3] == 0x263e;
+-   if (!found)
++   struct cobalt_gpu_info_v1 checked_identity;
++   struct amdgpu_device reference;
++   if (!out || !runtime || !cobalt_gpu_info_v1_decode(identity, sizeof(*identity), &checked_identity) ||
++       !acd_runtime_reference(canned, &checked_identity, &reference) ||
++       !cobalt_gfx_runtime_v1_decode(runtime, sizeof(*runtime), &checked_identity, &decoded))
+       return false;
+ 
+-   *out = *canned;
+-   out->dev.device_id = identity->pci_device;
+-   out->dev.pci_rev = identity->pci_revision;
+-   out->dev.num_shader_engines = decoded.shader_engines;
+-   out->dev.num_shader_arrays_per_engine = decoded.shader_arrays_per_engine;
+-   out->dev.num_cu_per_sh = decoded.cu_per_array;
+-   out->dev.cu_active_number = decoded.active_cu_count;
+-   memset(out->dev.cu_bitmap, 0, sizeof(out->dev.cu_bitmap));
++   struct amdgpu_device result = reference;
++   result.dev.num_shader_engines = decoded.shader_engines;
++   result.dev.num_shader_arrays_per_engine = decoded.shader_arrays_per_engine;
++   result.dev.num_cu_per_sh = decoded.cu_per_array;
++   result.dev.cu_active_number = decoded.active_cu_count;
++   memset(result.dev.cu_bitmap, 0, sizeof(result.dev.cu_bitmap));
+    for (uint32_t se = 0; se < decoded.shader_engines; se++)
+       for (uint32_t sa = 0; sa < decoded.shader_arrays_per_engine; sa++)
+-         out->dev.cu_bitmap[se][sa] = decoded.cu_bitmap[se][sa];
+-   out->dev.enabled_rb_pipes_mask = decoded.active_rb_mask;
+-   out->dev.enabled_rb_pipes_mask_hi = 0;
+-   out->dev.num_rb_pipes = decoded.shader_engines * decoded.render_backends_per_engine;
+-   out->hw_ip_gfx.hw_ip_version_major = decoded.gc_version >> 16;
+-   out->hw_ip_gfx.hw_ip_version_minor = (decoded.gc_version >> 8) & 0xff;
+-   out->hw_ip_gfx.ip_discovery_version = decoded.gc_version;
+-   out->hw_ip_compute.hw_ip_version_major = decoded.gc_version >> 16;
+-   out->hw_ip_compute.hw_ip_version_minor = (decoded.gc_version >> 8) & 0xff;
+-   out->hw_ip_compute.ip_discovery_version = decoded.gc_version;
+-   for (uint32_t i = 0; i < out->mmr_reg_count; i++)
+-      if (out->mmr_regs[i * 3] == 0x263e)
+-         out->mmr_regs[i * 3 + 2] = decoded.gb_addr_config;
++         result.dev.cu_bitmap[se][sa] = decoded.cu_bitmap[se][sa];
++   result.dev.enabled_rb_pipes_mask = decoded.active_rb_mask;
++   result.dev.enabled_rb_pipes_mask_hi = 0;
++   result.dev.num_rb_pipes = decoded.shader_engines * decoded.render_backends_per_engine;
++   result.hw_ip_gfx.hw_ip_version_major = decoded.gc_version >> 16;
++   result.hw_ip_gfx.hw_ip_version_minor = (decoded.gc_version >> 8) & 0xff;
++   result.hw_ip_gfx.ip_discovery_version = decoded.gc_version;
++   result.hw_ip_compute.hw_ip_version_major = decoded.gc_version >> 16;
++   result.hw_ip_compute.hw_ip_version_minor = (decoded.gc_version >> 8) & 0xff;
++   result.hw_ip_compute.ip_discovery_version = decoded.gc_version;
++   for (uint32_t i = 0; i < result.mmr_reg_count; i++)
++      if (result.mmr_regs[i * 3] == 0x263e)
++         result.mmr_regs[i * 3 + 2] = decoded.gb_addr_config;
++   *out = result;
+    return true;
+ }
+ 
+diff --git a/src/amd/common/darwin/test/acd_gpu_info_test.c b/src/amd/common/darwin/test/acd_gpu_info_test.c
+new file mode 100644
+index 0000000..7e5c9b6
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_gpu_info_test.c
+@@ -0,0 +1,116 @@
++#include "ac_darwin_runtime.h"
++#include "ac_darwin_identity.h"
++#include "common/ac_gpu_info.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define CHECK(condition) do { \
++   if (!(condition)) { \
++      fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #condition); \
++      return EXIT_FAILURE; \
++   } \
++} while (0)
++
++static int
++check_gpu_info(const struct amdgpu_device *device, enum radeon_family family,
++               unsigned num_cu, unsigned num_se, unsigned rb_mask,
++               unsigned bus_width, unsigned l2_kib, unsigned l3_mib)
++{
++   struct radeon_info info = {0};
++   info.ip[AMD_IP_GFX].ver_major = device->hw_ip_gfx.hw_ip_version_major;
++   info.ip[AMD_IP_GFX].ver_minor = device->hw_ip_gfx.hw_ip_version_minor;
++   info.ip[AMD_IP_GFX].ver_rev = device->hw_ip_gfx.ip_discovery_version & 0xff;
++   info.has_graphics = true;
++   CHECK(ac_identify_chip(&info, &device->dev));
++   CHECK(info.family == family && info.gfx_level == GFX12);
++   CHECK(info.pci_id == device->dev.device_id && info.pci_rev_id == device->dev.pci_rev);
++   CHECK(info.chip_external_rev == device->dev.external_rev);
++   ac_fill_memory_info(&info, &device->dev, &device->mem);
++   ac_fill_hw_info(&info, &device->dev);
++   CHECK(info.max_se == device->dev.num_shader_engines && info.max_sa_per_se == 2);
++   CHECK(info.num_cu == num_cu && info.num_se == num_se);
++   CHECK(info.enabled_rb_mask == rb_mask);
++   CHECK(info.memory_bus_width == bus_width);
++   CHECK(info.l2_cache_size == l2_kib * 1024 && info.l3_cache_size_mb == l3_mib);
++   CHECK(info.num_tcc_blocks == device->dev.num_tcc_blocks);
++   CHECK(info.clock_crystal_freq == 100000);
++   CHECK(info.max_gpu_freq_mhz == device->dev.max_engine_clock / 1000);
++   CHECK(info.high_va_offset == device->dev.high_va_offset);
++   CHECK(info.virtual_address_max == device->dev.virtual_address_max);
++   return EXIT_SUCCESS;
++}
++
++int
++main(void)
++{
++   const struct amdgpu_device *base = NULL;
++   for (size_t i = 0; i < num_amdgpu_devices; i++)
++      if (!strcmp(amdgpu_devices[i].name, "gfx1201"))
++         base = &amdgpu_devices[i];
++   CHECK(base);
++   const struct amdgpu_device original = *base;
++   struct cobalt_gpu_info_v1 identity = {
++      .version = 1, .size = sizeof(identity), .flags = COBALT_GPU_INFO_CAPACITY_VALID,
++      .pci_vendor = 0x1002, .pci_device = 0x7590, .pci_revision = 0xc0,
++      .gfx_target = 1200, .gc_major = 12,
++      .shader_engines = 2, .shader_arrays_per_engine = 2, .wgp_per_array = 4,
++      .cu_per_array = 8, .max_compute_units = 32,
++      .render_backends_per_engine = 4, .max_waves_per_simd = 16,
++   };
++   struct cobalt_gfx_runtime_v1 runtime = {
++      .version = 1, .size = sizeof(runtime), .flags = COBALT_GFX_RUNTIME_VALID,
++      .gc_version = 0xc0000, .gb_addr_config = 0x08200545,
++      .shader_engines = 2, .shader_arrays_per_engine = 2, .cu_per_array = 8,
++      .render_backends_per_engine = 4, .active_sa_mask = 0xf,
++      .active_rb_mask = 0xff, .active_cu_count = 32,
++      .cu_bitmap = {{0xff, 0xff}, {0xff, 0xff}},
++   };
++   struct amdgpu_device target;
++   CHECK(acd_runtime_overlay(base, &identity, &runtime, &target));
++   CHECK(check_gpu_info(&target, CHIP_GFX1200, 32, 2, 0xff, 128, 4096, 32) == EXIT_SUCCESS);
++   CHECK(target.dev.external_rev == 0x41 && target.radeon_family == CHIP_GFX1200);
++   CHECK(target.fw_gfx_me.ver == 0 && target.fw_gfx_pfp.ver == 0 && target.fw_gfx_mec.ver == 0);
++   CHECK(target.dev.ids_flags == base->dev.ids_flags);
++   CHECK(!memcmp(&target.mem, &base->mem, sizeof(target.mem)));
++   CHECK(target.dev.virtual_address_offset == base->dev.virtual_address_offset);
++   CHECK(target.dev.virtual_address_max == base->dev.virtual_address_max);
++   CHECK(target.dev.high_va_offset == base->dev.high_va_offset);
++   CHECK(target.dev.high_va_max == base->dev.high_va_max);
++   struct cobalt_gpu_info_v1 decoded;
++   CHECK(acd_identity_decode(&identity, sizeof(identity), &decoded) != NULL);
++
++   runtime.active_sa_mask = 0x3;
++   runtime.active_rb_mask = 0xf;
++   runtime.active_cu_count = 16;
++   runtime.cu_bitmap[1][0] = runtime.cu_bitmap[1][1] = 0;
++   CHECK(acd_runtime_overlay(base, &identity, &runtime, &target));
++   CHECK(check_gpu_info(&target, CHIP_GFX1200, 16, 1, 0xf, 128, 4096, 32) == EXIT_SUCCESS);
++   CHECK(target.dev.num_shader_engines == 2 && target.dev.num_rb_pipes == 8);
++
++   identity.flags |= COBALT_GPU_INFO_BRINGUP_ENABLED;
++   identity.pci_device = 0x7550;
++   identity.gfx_target = 1201;
++   identity.gc_revision = 1;
++   identity.shader_engines = runtime.shader_engines = 4;
++   identity.max_compute_units = 64;
++   runtime.gc_version = 0xc0001;
++   runtime.active_sa_mask = 0xff;
++   runtime.active_rb_mask = 0xffff;
++   runtime.active_cu_count = 64;
++   for (unsigned se = 0; se < 4; se++)
++      for (unsigned sa = 0; sa < 2; sa++)
++         runtime.cu_bitmap[se][sa] = 0xff;
++   CHECK(acd_runtime_overlay(base, &identity, &runtime, &target));
++   CHECK(check_gpu_info(&target, CHIP_GFX1201, 64, 4, 0xffff, 256, 8192, 64) == EXIT_SUCCESS);
++   CHECK(!memcmp(base, &original, sizeof(original)));
++
++   struct radeon_info info = {0};
++   info.ip[AMD_IP_GFX].ver_major = 12;
++   target.dev.external_rev = 0x4f;
++   CHECK(ac_identify_chip(&info, &target.dev) && info.family == CHIP_GFX1200);
++   target.dev.external_rev = 0x50;
++   CHECK(ac_identify_chip(&info, &target.dev) && info.family == CHIP_GFX1201);
++   puts("acd_gpu_info_test: passed");
++   return EXIT_SUCCESS;
++}
+diff --git a/src/amd/common/darwin/test/acd_runtime_test.c b/src/amd/common/darwin/test/acd_runtime_test.c
+index 33581f0..90c7659 100644
+--- a/src/amd/common/darwin/test/acd_runtime_test.c
++++ b/src/amd/common/darwin/test/acd_runtime_test.c
+@@ -4,6 +4,9 @@
+ #include <assert.h>
+ #include <stdio.h>
+ 
++#define TEST_GC_1200 0xc0000
++#define TEST_GC_1201 0xc0001
++
+ int main(void)
+ {
+    struct cobalt_gpu_info_v1 identity = {
+@@ -32,10 +35,10 @@ int main(void)
+ 
+    struct amdgpu_device canned = {
+       .name = "gfx1201", .radeon_family = CHIP_GFX1201,
+-      .hw_ip_gfx = {.hw_ip_version_major = 10, .hw_ip_version_minor = 1,
+-                    .available_rings = 1, .ip_discovery_version = 0xa0100},
+-      .hw_ip_compute = {.hw_ip_version_major = 10, .hw_ip_version_minor = 1,
+-                        .available_rings = 15, .ip_discovery_version = 0xa0100},
++      .hw_ip_gfx = {.hw_ip_version_major = 12, .hw_ip_version_minor = 0,
++                    .available_rings = 1, .ip_discovery_version = TEST_GC_1201},
++      .hw_ip_compute = {.hw_ip_version_major = 12, .hw_ip_version_minor = 0,
++                        .available_rings = 15, .ip_discovery_version = TEST_GC_1201},
+       .fw_gfx_me = {.ver = 2590, .feature = 29},
+       .fw_gfx_pfp = {.ver = 2630, .feature = 29},
+       .fw_gfx_mec = {.ver = 2800, .feature = 29},
+@@ -77,7 +80,18 @@ int main(void)
+    assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
+    assert(!memcmp(&out, &expected, sizeof(out)));
+    assert(!memcmp(&out, &expected, sizeof(out)));
+-   runtime.cu_bitmap[0][0] = 0x3f;
++   runtime.cu_bitmap[0][0] = runtime.cu_bitmap[0][1] = 0xff;
++   runtime.cu_bitmap[1][0] = runtime.cu_bitmap[1][1] = 0xff;
++   runtime.cu_bitmap[2][0] = 0xff;
++   runtime.cu_bitmap[2][1] = 0x0f;
++   runtime.cu_bitmap[3][0] = runtime.cu_bitmap[3][1] = 0;
++   runtime.active_sa_mask = 0x3f;
++   runtime.active_rb_mask = 0x0fff;
++   runtime.active_cu_count = 44;
++   assert(cobalt_gfx_runtime_v1_decode(&runtime, sizeof(runtime), &identity, &decoded));
++   assert(acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(out.dev.cu_active_number == 44 && out.dev.enabled_rb_pipes_mask == 0x0fff);
++   assert(out.dev.cu_bitmap[2][1] == 0x0f && out.dev.cu_bitmap[3][0] == 0);
+    assert(!acd_runtime_overlay(&canned, &identity, NULL, &out));
+    canned.mmr_reg_count = 0;
+    assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
+@@ -103,11 +117,99 @@ int main(void)
+    identity.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED;
+    identity.pci_device = 0x7590;
+    identity.gfx_target = 1200;
++   identity.shader_engines = 2;
++   identity.max_compute_units = 32;
++   identity.render_backends_per_engine = 4;
++   identity.max_waves_per_simd = 16;
+    identity.gc_revision = 0;
+-   runtime.gc_version = 0xc0000;
++   runtime.shader_engines = 2;
++   runtime.render_backends_per_engine = 4;
++   runtime.gc_version = TEST_GC_1200;
++   runtime.gb_addr_config = 0x08200545;
++   runtime.active_sa_mask = 0xf;
++   runtime.active_rb_mask = 0xff;
++   runtime.active_cu_count = 32;
++   memset(runtime.cu_bitmap, 0, sizeof(runtime.cu_bitmap));
++   runtime.cu_bitmap[0][0] = runtime.cu_bitmap[0][1] = 0xff;
++   runtime.cu_bitmap[1][0] = runtime.cu_bitmap[1][1] = 0xff;
+    assert(cobalt_gfx_runtime_v1_decode(&runtime, sizeof(runtime), &identity, &decoded));
+    assert(acd_identity_decode(&identity, sizeof(identity), &identity));
++   assert(acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(!strcmp(out.name, "gfx1200") && out.radeon_family == CHIP_GFX1200);
++   assert(out.dev.device_id == 0x7590 && out.dev.pci_rev == 0xc8);
++   assert(out.dev.chip_rev == 1 && out.dev.external_rev == 0x41);
++   assert(out.dev.family == AMDGPU_FAMILY_GC_12_0_0);
++   assert(out.dev.gpu_counter_freq == 100000 && out.dev.max_engine_clock == 2780000);
++   assert(out.dev.max_memory_clock == 1258000 && out.dev.min_engine_clock == 500000);
++   assert(out.dev.min_memory_clock == 96000 && out.dev.num_hw_gfx_contexts == 8);
++   assert(out.dev.vram_type == 9 && out.dev.vram_bit_width == 128);
++   assert(out.dev.num_tcc_blocks == 16 && out.dev.tcc_disabled_mask == 0);
++   assert(out.dev.wave_front_size == 32 && out.dev.num_shader_visible_vgprs == 1536);
++   assert(out.dev.gc_double_offchip_lds_buf == 64 && out.dev.gs_vgt_table_depth == 32);
++   assert(out.dev.gs_prim_buffer_depth == 1792 && out.dev.max_gs_waves_per_vgt == 32);
++   assert(out.dev.tcp_cache_size == 32 && out.dev.num_sqc_per_wgp == 1);
++   assert(out.dev.sqc_data_cache_size == 16 && out.dev.sqc_inst_cache_size == 32);
++   assert(out.dev.gl1c_cache_size == 256 && out.dev.gl2c_cache_size == 4096);
++   assert(out.dev.mall_size == UINT64_C(33554432));
++   assert(out.fw_gfx_me.ver == 0 && out.fw_gfx_pfp.ver == 0 && out.fw_gfx_mec.ver == 0);
++   assert(out.dev.virtual_address_offset == canned.dev.virtual_address_offset);
++   assert(out.dev.virtual_address_max == canned.dev.virtual_address_max);
++   assert(out.mem.vram.total_heap_size == canned.mem.vram.total_heap_size);
++   assert(out.dev.ids_flags == canned.dev.ids_flags && out.dev.pcie_gen == canned.dev.pcie_gen);
++   assert(out.mmr_regs[5] == canned.mmr_regs[5] && out.mmr_regs[2] == 0x08200545);
++   assert(!memcmp(&canned, &original, sizeof(canned)));
++
++   struct amdgpu_device unchanged = out;
++   struct amdgpu_device bad_template = canned;
++   bad_template.radeon_family = CHIP_GFX1200;
++   assert(!acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(!memcmp(&out, &unchanged, sizeof(out)));
++   bad_template = canned;
++   bad_template.name = "gfx1200";
++   assert(!acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(!memcmp(&out, &unchanged, sizeof(out)));
++   bad_template = canned;
++   bad_template.hw_ip_gfx.ip_discovery_version = TEST_GC_1200;
++   assert(!acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(!memcmp(&out, &unchanged, sizeof(out)));
++   bad_template = canned;
++   bad_template.mmr_reg_count = 0;
++   assert(!acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(!memcmp(&out, &unchanged, sizeof(out)));
++   bad_template = canned;
++   bad_template.mmr_reg_count = sizeof(bad_template.mmr_regs) / sizeof(bad_template.mmr_regs[0]);
++   assert(!acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(!memcmp(&out, &unchanged, sizeof(out)));
++   bad_template = canned;
++   bad_template.mmr_regs[0] = 0x1234;
++   assert(!acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(!memcmp(&out, &unchanged, sizeof(out)));
++   bad_template = canned;
++   bad_template.dev.virtual_address_offset = 0x222000;
++   bad_template.mem.vram.total_heap_size = 0x333000;
++   bad_template.dev.ids_flags = 0x55;
++   bad_template.mmr_regs[5] = 0xabcdef01;
++   assert(acd_runtime_overlay(&bad_template, &identity, &runtime, &out));
++   assert(out.dev.virtual_address_offset == 0x222000);
++   assert(out.mem.vram.total_heap_size == 0x333000 && out.dev.ids_flags == 0x55);
++   assert(out.mmr_regs[5] == 0xabcdef01);
++   assert(!acd_runtime_overlay(NULL, &identity, &runtime, &out));
++   assert(!acd_runtime_overlay(&canned, NULL, &runtime, &out));
++   assert(!acd_runtime_overlay(&canned, &identity, &runtime, NULL));
++
++   identity.shader_engines = 4;
++   identity.max_compute_units = 64;
++   struct amdgpu_device before_rejection = out;
++   assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(!memcmp(&out, &before_rejection, sizeof(out)));
++   identity.shader_engines = 2;
++   identity.max_compute_units = 32;
++   identity.flags |= COBALT_GPU_INFO_BRINGUP_ENABLED;
++   struct cobalt_gpu_info_v1 invalid_identity;
++   assert(!cobalt_gpu_info_v1_decode(&identity, sizeof(identity), &invalid_identity));
++   before_rejection = out;
+    assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(!memcmp(&out, &before_rejection, sizeof(out)));
+    puts("acd_runtime_test: passed");
+    return 0;
+ }
+diff --git a/src/amd/common/meson.build b/src/amd/common/meson.build
+index 5c64649..9c90daa 100644
+--- a/src/amd/common/meson.build
++++ b/src/amd/common/meson.build
+@@ -291,6 +291,18 @@ executable(
+   build_by_default: with_tools.contains('amd')
+ )
+ 
++if with_amdgpu_darwin
++  executable(
++    'acd_gpu_info_test',
++    ['darwin/test/acd_gpu_info_test.c'],
++    link_with: [libamd_common],
++    include_directories: [inc_amd, inc_include, inc_src, include_directories('darwin')],
++    dependencies: [idep_amd_generated_headers, idep_mesautil, idep_nir_headers],
++    link_args: ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
++    build_by_default: false,
++  )
++endif
++
+ if with_tests and not with_platform_windows
+   test(
+     'ac_surface_modifier_test',

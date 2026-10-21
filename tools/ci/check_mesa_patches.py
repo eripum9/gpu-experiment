@@ -73,7 +73,8 @@ def build_radv(mesa, output):
          "-Dgles1=disabled", "-Dgles2=disabled", "-Degl=disabled", "-Dglx=disabled",
          "-Dgbm=disabled", "-Dvideo-codecs=[]", "-Dzstd=disabled",
          "-Dlibunwind=disabled", "-Dvalgrind=disabled", "-Dbuild-tests=false"], mesa)
-    run(["meson", "compile", "-C", build, "-j", "3", "vulkan_radeon"], mesa)
+    run(["meson", "compile", "-C", build, "-j", "3", "vulkan_radeon", "acd_gpu_info_test"], mesa)
+    run([build / "src/amd/common/acd_gpu_info_test"], mesa)
     library = build / "src/amd/vulkan/libvulkan_radeon.dylib"
     if not library.is_file():
         raise RuntimeError("Mesa completed without the expected RADV dylib")
@@ -113,8 +114,8 @@ def main():
         run(["git", "fetch", "--filter=blob:none", "--depth=1", "origin", MESA_COMMIT], mesa)
         run(["git", "checkout", "--detach", MESA_COMMIT], mesa)
         patches = sorted((ROOT / "mesa-patches").glob("*.patch"))
-        if len(patches) != 11:
-            raise RuntimeError(f"Expected eleven ordered Mesa patches, found {len(patches)}")
+        if len(patches) != 12:
+            raise RuntimeError(f"Expected twelve ordered Mesa patches, found {len(patches)}")
         for patch in patches:
             run(["git", "-c", "core.whitespace=cr-at-eol", "apply", "--check", patch], mesa)
             run(["git", "apply", "--whitespace=nowarn", patch], mesa)
