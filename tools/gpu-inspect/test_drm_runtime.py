@@ -92,7 +92,7 @@ class RuntimeTests(unittest.TestCase):
 
     def resolver(self, path, *args, **kwargs):
         if path == self.render / "device":
-            return self.device
+            return self.original_resolve(self.device, *args, **kwargs)
         return self.original_resolve(path, *args, **kwargs)
 
     def execute(self, *, ioctl_fn=None, fstat=None, open_fn=None, close_fn=None):
@@ -194,7 +194,7 @@ class RuntimeTests(unittest.TestCase):
             original = self.original_resolve
             def both(path, *args, **kwargs):
                 if path in (self.render / "device", second / "device"):
-                    return self.device
+                    return original(self.device, *args, **kwargs)
                 return original(path, *args, **kwargs)
             with mock.patch.object(Path, "resolve", both):
                 multiple = drm.collect_drm_runtime(self.root, self.device, dev_root=self.dev_root,
@@ -235,6 +235,21 @@ class RuntimeTests(unittest.TestCase):
         failed = next(item for item in report["queries"] if item["name"] == "fw_gfx_ce")
         self.assertFalse(failed["required"])
         self.assertIn("unsupported query", failed["error"])
+
+    def test_selected_device_matches_after_path_canonicalization(self):
+        original = self.original_resolve
+        canonical_device = self.root / "canonical-pci-device"
+
+        def canonicalize(path, *args, **kwargs):
+            if path == self.device:
+                return canonical_device
+            return original(path, *args, **kwargs)
+
+        # Model aliases such as macOS /var -> /private/var on every host.
+        self.original_resolve = canonicalize
+        report = self._query_fixture()
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["decoded"]["dev_info"]["device_id"], 0x7590)
 
     def test_gb_addr_config_is_one_fixed_optional_register_query(self):
         calls = []
