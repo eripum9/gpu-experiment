@@ -219,7 +219,7 @@ uint32_t readMemsize(const volatile uint8_t *bytes) {
 }
 
 bool plausibleMemsize(uint32_t mib) {
-    return mib >= 1024 && mib <= 64 * 1024 && (mib & (mib - 1)) == 0;
+    return mib >= 1024 && mib <= 64 * 1024;
 }
 
 bool criticalIps(const IpDiscovery &d) {

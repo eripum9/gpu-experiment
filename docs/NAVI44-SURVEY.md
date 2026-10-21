@@ -15,6 +15,10 @@ discovery path adds bounded reads of that same register around the snapshot
 to reject a changed size. A disagreement or invalid size stops the memory
 observations.
 
+The reported size is a bounded MiB extent, which need not be a power of two.
+Discovery addressing uses that exact extent without rounding it up to the
+card's nominal installed capacity, following Linux's discovery calculation.
+
 Unique physical subrange mappings can use a newly allocated backing
 descriptor. The survey validates that descriptor's physical interval and
 length against the requested BAR subrange, together with the map's physical

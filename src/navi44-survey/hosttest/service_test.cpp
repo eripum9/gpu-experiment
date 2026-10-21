@@ -223,7 +223,7 @@ static void mappingFailures() {
 }
 
 static void memsizeGuards() {
-    for (uint32_t value : {0u,0xffffffffu,512u,1023u,1025u,12288u,65537u,131072u}) {
+    for (uint32_t value : {0u,0xffffffffu,512u,1023u,65537u,131072u}) {
         Device d; testState.memsizeValues={value,value};
         d.run("memsize-invalid-or-unstable"); CHECK(d.vram.requests==0);
     }
@@ -231,12 +231,21 @@ static void memsizeGuards() {
         Device d; testState.memsizeValues={16384,8192};
         d.run("memsize-invalid-or-unstable"); CHECK(d.vram.requests==0);
     }
-    for (uint32_t value : {1024u,2048u,4096u,8192u,16384u,32768u,65536u}) {
+    for (uint32_t value : {1024u,1025u,1536u,2048u,4096u,8192u,12288u,16384u,32768u,65536u}) {
         Device d; testState.memsizeValues={value,value,value,value};
         d.vram.length=d.vram.contiguous=uint64_t(value)<<20;
         d.vram.expectedOffset=d.vram.length-65536;
         d.run("discovery-snapshot-validated"); CHECK(testState.memsizeReads==4);
         CHECK(d.service.numbers.at("CobaltSurvey,VRAMBytes")==uint64_t(value)<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,DiscoveryOffset")==d.vram.expectedOffset);
+    }
+    {
+        // The device reports 16,304 MiB while its BAR exposes the nominal 16 GiB window.
+        Device d; testState.memsizeValues={16304,16304,16304,16304};
+        d.vram.expectedOffset=(uint64_t(16304)<<20)-65536;
+        d.run("discovery-snapshot-validated"); CHECK(testState.memsizeReads==4);
+        CHECK(d.service.numbers.at("CobaltSurvey,VRAMBytes")==uint64_t(16304)<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,DiscoveryOffset")==d.vram.expectedOffset);
     }
     {
         Device d; testState.memsizeValues={16384,16384,8192}; d.run("memsize-changed");
@@ -248,9 +257,11 @@ static void memsizeGuards() {
 
 static void apertureGuards() {
     {
-        Device d; d.vram.length=d.vram.contiguous=256ULL<<20;
+        Device d; testState.memsizeValues={16304,16304};
+        d.vram.length=d.vram.contiguous=256ULL<<20;
         d.run("discovery-aperture-too-small"); CHECK(d.vram.requests==0);
         CHECK(testState.memsizeReads==2); CHECK(testState.mapReleases==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,VRAMBytes")==uint64_t(16304)<<20);
     }
     for (uint32_t low : {0u,1u,8u,0xffffffffu}) {
         Device d; d.pci.bars[0]=low; d.run("bar0-invalid"); CHECK(d.vram.requests==0);
