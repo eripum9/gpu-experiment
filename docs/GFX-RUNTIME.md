@@ -40,6 +40,8 @@ and link policy. Its CP firmware versions are zero: the captured Linux
 ME/PFP/MEC versions (2930/3010/3250) differ from the pinned macOS blobs
 (3110/3220/3490). Neither Linux firmware versions nor the old gfx1201
 template can describe firmware actually loaded by a future macOS path.
+Patch 0013 separately requires the CP firmware property described in
+`CP-FIRMWARE.md` and overlays its validated versions for native queries.
 gfx1200 remains refused before IOServiceOpen and disabled in the kernel.
 
 The full Mesa CI build runs `acd_gpu_info_test` against Mesa's actual

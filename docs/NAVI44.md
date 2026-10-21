@@ -92,8 +92,9 @@ For a native Ubuntu capture from the target desktop, see [CAPTURE.md](CAPTURE.md
 5. Complete the RADV Darwin hardware description and carry verified target
    information through the Metal bundle. RADV now consumes kernel identity
    and active-layout records for Navi 48. The gfx1200 reference is covered
-   by source tests; a native path still needs actual macOS firmware reporting
-   and staged initialization before the existing refusal can be removed.
+   by source tests, including the separate CP firmware metadata handoff.
+   A native path still needs staged initialization and target validation
+   before the existing refusal can be removed.
 6. Build and test on macOS, then perform staged hardware validation on the
    target desktop before enabling Navi 44 acceleration.
 

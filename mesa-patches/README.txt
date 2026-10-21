@@ -1,7 +1,7 @@
 Mesa patches (RADV Darwin / macOS port for the Navi 48 native kext)
 ===================================================================
 
-These twelve patches add a macOS backend to Mesa's RADV Vulkan driver so that it
+These thirteen patches add a macOS backend to Mesa's RADV Vulkan driver so that it
 talks to the Navi48 bring-up kext (user-client ABI "N48N") instead of a DRM
 node. Only our changes are included, not the Mesa tree.
 
@@ -20,10 +20,10 @@ Apply:
     for patch in /path/to/Navi48-MacOS/mesa-patches/*.patch; do
         git apply "$patch" || exit 1
     done
-Apply in filename order. Patches 0010 through 0012 are plain diffs; earlier patches
+Apply in filename order. Patches 0010 through 0013 are plain diffs; earlier patches
 also contain mail headers with placeholder author/date fields.
 
-Order matters: 0001 .. 0012. The kext ABI header that patches 0002-0004 mirror
+Order matters: 0001 .. 0013. The kext ABI header that patches 0002-0004 mirror
 is src/navi48-bringup/src/Navi48NativeABI.h in this repository; Mesa's copy and
 the kext's copy must be the same ABI version (currently 1.11 or newer).
 
@@ -41,6 +41,10 @@ Patch 0012 adds the verified gfx1200 hardware reference for offline/runtime
 overlay tests. It preserves platform memory policy, leaves CP firmware
 versions unset, and keeps the native gfx1200 refusal. Full Mesa CI runs the
 real chip, memory and hardware-info functions for both families.
+
+Patch 0013 requires the owner's Cobalt,CpFirmware-v1 metadata before native
+open and uses its ME/PFP/MEC version and feature values for firmware queries.
+Explicit mock modes retain synthetic data. See docs/CP-FIRMWARE.md.
 
 Check patch application and shared-header parity without compiling:
     python tools/ci/check_mesa_patches.py --apply-only

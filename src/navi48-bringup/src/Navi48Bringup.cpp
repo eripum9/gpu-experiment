@@ -6,6 +6,7 @@
 #include "gpu_profile.hpp"
 #include "gpu_info_builder.hpp"
 #include "gfx_runtime.h"
+#include "cp_firmware_builder.hpp"
 #include "fw/fw_table.h"
 #include "apple/Navi48Ttl.hpp"
 #include "apple/AppleTtlHook.hpp"
@@ -83,6 +84,71 @@ void publishGfxRuntime(IOService *service, const amdgpu::BringupContext &ctx) {
 	const bool published = data && service->setProperty(COBALT_GFX_RUNTIME_PROPERTY, data);
 	if (data) data->release();
 	if (!published) N48LOG("stages: GFX runtime metadata could not be published");
+}
+
+// These versions describe the exact CP blobs accepted by the completed PSP
+// load sequence. They do not establish that a CP subsequently executed them.
+void publishCpFirmware(IOService *service, IOPCIDevice *pci,
+                       const amdgpu::DeviceContext &owner,
+                       const amdgpu::BringupContext &ctx) {
+	service->removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
+	if (!pci || service->getProvider() != pci || ctx.dev != &owner) return;
+	auto *identityData = OSDynamicCast(OSData, service->getProperty(COBALT_GPU_INFO_PROPERTY));
+	cobalt_gpu_info_v1 identity {};
+	if (!identityData || !cobalt_gpu_info_v1_decode(identityData->getBytesNoCopy(),
+	        identityData->getLength(), &identity)) return;
+	const auto *profile = cobalt::profile_for_pci(static_cast<uint16_t>(identity.pci_vendor),
+	                                             static_cast<uint16_t>(identity.pci_device));
+	const auto gc = owner.ip.getVersion(amdgpu::IPBlock::GC);
+	if (!profile || !profile->bringupEnabled || owner.firmwareFamily != profile->family ||
+	    !cobalt::gc_matches(*profile, {gc.major, gc.minor, gc.rev}) ||
+	    identity.gc_major != gc.major || identity.gc_minor != gc.minor ||
+	    identity.gc_revision != gc.rev) return;
+	cobalt_cp_firmware_v1 snapshot {};
+	if (ctx.adoptProvisioned) {
+		// The boot marker survives unload; this build has not loaded anything.
+		// Restore only the earlier provisioning record, never today's blobs.
+		if (!pci->getProperty("Navi48,ProvisionedThisBoot")) return;
+		auto *saved = OSDynamicCast(OSData, pci->getProperty(COBALT_CP_FIRMWARE_PROPERTY));
+		if (!saved || !cobalt_cp_firmware_v1_decode(saved->getBytesNoCopy(),
+		        saved->getLength(), &identity, &snapshot)) {
+			pci->removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
+			return;
+		}
+	} else {
+		static_assert(static_cast<uint32_t>(amdgpu::BringupStage::PSPFwLoad) == 8u,
+		              "CP firmware metadata requires the completed PSP load barrier");
+		static_assert(amdgpu::PSPGfxFwType::RS64_PFP == 87u && amdgpu::PSPGfxFwType::RS64_PFP_P0 == 90u &&
+		              amdgpu::PSPGfxFwType::RS64_ME == 88u && amdgpu::PSPGfxFwType::RS64_ME_P0 == 92u &&
+		              amdgpu::PSPGfxFwType::RS64_MEC == 89u && amdgpu::PSPGfxFwType::RS64_MEC_P0 == 94u &&
+		              amdgpu::PSPGfxFwType::RS64_MEC_P1 == 95u,
+		              "CP firmware builder and PSP load types must agree");
+		if (!cobalt::cp_firmware_fresh_load_ready(ctx.adoptProvisioned, ctx.tornDown,
+		        static_cast<uint32_t>(ctx.reached)) || ctx.fw.dev != ctx.dev ||
+		    ctx.fw.psp != &ctx.psp || ctx.fw.count > amdgpu::FwLoaderState::kMaxEntries) return;
+		const amdgpu::FwId ids[] = {amdgpu::FwId::GC_ME, amdgpu::FwId::GC_PFP, amdgpu::FwId::GC_MEC};
+		cobalt::CpFirmwareBlob blobs[3] {};
+		for (unsigned i = 0; i < 3; ++i) {
+			const auto *blob = amdgpu::fw_get(owner.firmwareFamily, ids[i]);
+			if (!blob) return;
+			blobs[i] = {blob->data, blob->size};
+		}
+		if (!cobalt::make_cp_firmware(identity, blobs, ctx.fw.entries, ctx.fw.count,
+		        true, snapshot)) {
+			N48LOG("stages: CP firmware metadata rejected; completed CP payload set required");
+			return;
+		}
+	}
+	OSData *data = OSData::withBytes(&snapshot, sizeof(snapshot));
+	const bool published = data &&
+	    (ctx.adoptProvisioned || pci->setProperty(COBALT_CP_FIRMWARE_PROPERTY, data)) &&
+	    service->setProperty(COBALT_CP_FIRMWARE_PROPERTY, data);
+	if (data) data->release();
+	if (!published) {
+		service->removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
+		if (!ctx.adoptProvisioned) pci->removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
+		N48LOG("stages: CP firmware metadata could not be published");
+	}
 }
 
 // Check the map before any PSP/SMU access or interrupt setup. Also validate
@@ -7150,7 +7216,9 @@ void Navi48Bringup::runStages(uint32_t target) {
 	// while the display lives on this card. So: one ladder per boot. Iteration
 	// happens through the user client, which needs no reload.
 	ctx.adoptProvisioned = pciDevice && pciDevice->getProperty("Navi48,ProvisionedThisBoot") != nullptr;
+	removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
 	if (ctx.adoptProvisioned) {
+		publishCpFirmware(this, pciDevice, dev, ctx);
 		N48LOG("stages: REFUSING to re-run — this boot already took the GPU through the ladder. "
 		       "Re-initialising a live GPU (SMU/IMU/RLC) restarts the machine. Reboot to test a "
 		       "new build; use the user client to iterate without one.");
@@ -7160,8 +7228,10 @@ void Navi48Bringup::runStages(uint32_t target) {
 	}
 
 	removeProperty(COBALT_GFX_RUNTIME_PROPERTY);
+	if (pciDevice) pciDevice->removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
 	kern_return_t r = amdgpu::bringup_to(ctx, (amdgpu::BringupStage)target);
 	publishGfxRuntime(this, ctx);
+	publishCpFirmware(this, pciDevice, dev, ctx);
 	if (pciDevice && ctx.reached >= amdgpu::BringupStage::PSPFwLoad)
 		pciDevice->setProperty("Navi48,ProvisionedThisBoot", true);
 	setProperty("Navi48,StageReached", static_cast<uint64_t>(ctx.reached), 32);
@@ -7438,6 +7508,7 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
 bool Navi48Bringup::start(IOService *provider) {
 	removeProperty(COBALT_GPU_INFO_PROPERTY);
 	removeProperty(COBALT_GFX_RUNTIME_PROPERTY);
+	removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
 	auto *candidate = OSDynamicCast(IOPCIDevice, provider);
 	if (!candidate) { N48LOG("start: provider is not PCI; refusing before initialization"); return false; }
 	uint32_t vendorDevice = candidate->configRead32(kIOPCIConfigVendorID);
@@ -7461,6 +7532,7 @@ bool Navi48Bringup::start(IOService *provider) {
 	auto rejectProfile = [this]() -> bool {
 		removeProperty(COBALT_GPU_INFO_PROPERTY);
 		removeProperty(COBALT_GFX_RUNTIME_PROPERTY);
+		removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
 		ipDiscovery.init(nullptr, 0);
 		if (onDieDisc) { IOFree(onDieDisc, n48::kDiscTmrSize); onDieDisc = nullptr; }
 		unmapRegisters();
@@ -9091,6 +9163,8 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 void Navi48Bringup::stop(IOService *provider) {
 	removeProperty(COBALT_GPU_INFO_PROPERTY);
 	removeProperty(COBALT_GFX_RUNTIME_PROPERTY);
+	// Keep the PCI copy: the PSP's boot provisioning survives this unload.
+	removeProperty(COBALT_CP_FIRMWARE_PROPERTY);
 	// : never leave a patched className behind in a kext that is going away.
 	n48fbname::restore_on_unload();
 	// 0.0.603 (native S2a): the console plane back and every scanout watchdog thread finished BEFORE anything is unmapped (both need the registers).

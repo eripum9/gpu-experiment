@@ -72,6 +72,8 @@ runtime overlay. Platform VM policy stays unchanged; runtime memory pools
 and budgets continue to come from QueryInfo. The gfx1200 reference leaves
 CP firmware versions unset and cannot pass the native identity gate.
 See `GFX-RUNTIME.md` for the reference's scope and hardware-info checks.
+The separate `CP-FIRMWARE.md` handoff supplies validated firmware versions
+after a successful Cobalt PSP load sequence; native Mesa requires it.
 
 Mesa remains external at the revision in `mesa-patches/README.txt`; the
 Metal build script also consumes an external RADV dylib. CI now applies

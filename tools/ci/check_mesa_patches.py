@@ -31,7 +31,7 @@ def run(command, cwd):
 
 def check_headers(mesa):
     normalize = lambda path: path.read_bytes().replace(b"\r\n", b"\n")
-    for filename in ("gpu_info.h", "gfx_runtime.h"):
+    for filename in ("gpu_info.h", "gfx_runtime.h", "cp_firmware.h"):
         authoritative = ROOT / "src/navi48-bringup/src" / filename
         mirrored = mesa / "include/darwin" / ("cobalt_" + filename)
         if normalize(authoritative) != normalize(mirrored):
@@ -114,8 +114,8 @@ def main():
         run(["git", "fetch", "--filter=blob:none", "--depth=1", "origin", MESA_COMMIT], mesa)
         run(["git", "checkout", "--detach", MESA_COMMIT], mesa)
         patches = sorted((ROOT / "mesa-patches").glob("*.patch"))
-        if len(patches) != 12:
-            raise RuntimeError(f"Expected twelve ordered Mesa patches, found {len(patches)}")
+        if len(patches) != 13:
+            raise RuntimeError(f"Expected thirteen ordered Mesa patches, found {len(patches)}")
         for patch in patches:
             run(["git", "-c", "core.whitespace=cr-at-eol", "apply", "--check", patch], mesa)
             run(["git", "apply", "--whitespace=nowarn", patch], mesa)

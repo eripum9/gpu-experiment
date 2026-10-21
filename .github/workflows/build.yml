@@ -79,6 +79,8 @@ jobs:
             build/gpu-inspect/gpu-info-c-test
             build/gpu-inspect/gfx-runtime-test
             build/gpu-inspect/gfx-runtime-c-test
+            build/gpu-inspect/cp-firmware-test
+            build/gpu-inspect/cp-firmware-c-test
           if-no-files-found: error
           retention-days: 7
 

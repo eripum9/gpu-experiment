@@ -1,0 +1,662 @@
+diff --git a/include/darwin/cobalt_cp_firmware.h b/include/darwin/cobalt_cp_firmware.h
+new file mode 100644
+index 0000000..fa234bd
+--- /dev/null
++++ b/include/darwin/cobalt_cp_firmware.h
+@@ -0,0 +1,63 @@
++#ifndef COBALT_CP_FIRMWARE_H
++#define COBALT_CP_FIRMWARE_H
++
++#include "gpu_info.h"
++
++#define COBALT_CP_FIRMWARE_VERSION 1u
++#define COBALT_CP_FIRMWARE_PROPERTY "Cobalt,CpFirmware-v1"
++#define COBALT_CP_FIRMWARE_PSP_LOAD_COMPLETED 1u
++
++struct cobalt_cp_firmware_v1 {
++    uint32_t version;
++    uint32_t size;
++    uint32_t flags;
++    uint32_t gc_version;
++    uint32_t me_version;
++    uint32_t me_feature;
++    uint32_t pfp_version;
++    uint32_t pfp_feature;
++    uint32_t mec_version;
++    uint32_t mec_feature;
++    uint32_t reserved[6];
++};
++
++#if defined(__cplusplus)
++static_assert(sizeof(struct cobalt_cp_firmware_v1) == 64, "CP firmware v1 wire size");
++static_assert(offsetof(struct cobalt_cp_firmware_v1, me_version) == 16, "CP firmware version offset");
++static_assert(offsetof(struct cobalt_cp_firmware_v1, reserved) == 40, "CP firmware reserved offset");
++#else
++_Static_assert(sizeof(struct cobalt_cp_firmware_v1) == 64, "CP firmware v1 wire size");
++_Static_assert(offsetof(struct cobalt_cp_firmware_v1, me_version) == 16, "CP firmware version offset");
++_Static_assert(offsetof(struct cobalt_cp_firmware_v1, reserved) == 40, "CP firmware reserved offset");
++#endif
++
++static inline int
++cobalt_cp_firmware_v1_decode(const void *bytes, size_t length,
++                            const struct cobalt_gpu_info_v1 *identity,
++                            struct cobalt_cp_firmware_v1 *out)
++{
++    struct cobalt_cp_firmware_v1 record;
++    struct cobalt_gpu_info_v1 checked_identity;
++    unsigned i;
++    if (!out) return 0;
++    if (!bytes || length != sizeof(record)) goto invalid;
++    memcpy(&record, bytes, sizeof(record));
++    if (!cobalt_gpu_info_v1_decode(identity, sizeof(checked_identity), &checked_identity)) goto invalid;
++    if (record.version != COBALT_CP_FIRMWARE_VERSION || record.size != sizeof(record) ||
++        record.flags != COBALT_CP_FIRMWARE_PSP_LOAD_COMPLETED ||
++        record.gc_version != ((checked_identity.gc_major << 16) |
++                              (checked_identity.gc_minor << 8) | checked_identity.gc_revision)) goto invalid;
++    if (!record.me_version || record.me_version == UINT32_MAX ||
++        !record.pfp_version || record.pfp_version == UINT32_MAX ||
++        !record.mec_version || record.mec_version == UINT32_MAX ||
++        record.me_feature == UINT32_MAX || record.pfp_feature == UINT32_MAX ||
++        record.mec_feature == UINT32_MAX) goto invalid;
++    for (i = 0; i < 6; ++i) if (record.reserved[i]) goto invalid;
++    *out = record;
++    return 1;
++invalid:
++    memset(out, 0, sizeof(*out));
++    return 0;
++}
++
++#endif
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 2d1b929..141a250 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -145,10 +145,15 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+ 
+    const struct cobalt_gpu_info_v1 *identity = acd_kext_identity(kext);
+    const struct cobalt_gfx_runtime_v1 *runtime = acd_kext_runtime(kext);
++   const struct cobalt_cp_firmware_v1 *firmware = acd_kext_firmware(kext);
+    if (identity && !runtime) {
+       fprintf(stderr, "radv-darwin: native GFX runtime snapshot is missing\n");
+       return -ENODEV;
+    }
++   if (identity && !firmware) {
++      fprintf(stderr, "radv-darwin: native CP firmware snapshot is missing\n");
++      return -ENODEV;
++   }
+    if (identity && !acd_identity_gc_matches(identity, info.gc_version)) {
+       fprintf(stderr, "radv-darwin: live QueryInfo GC 0x%06x disagrees with "
+                       "Cobalt,GpuInfo-v1 GC %u.%u.%u\n", info.gc_version,
+@@ -233,6 +238,9 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+       if (r == 0 && acd_kext_identity(c->kext) &&
+           !acd_runtime_overlay(canned, acd_kext_identity(c->kext), acd_kext_runtime(c->kext), &c->device))
+          r = -ENODEV;
++      if (r == 0 && acd_kext_identity(c->kext) &&
++          !acd_runtime_firmware_overlay(acd_kext_identity(c->kext), acd_kext_firmware(c->kext), &c->device))
++         r = -ENODEV;
+       if (r == 0)
+          r = acd_native_handshake(c->kext, &c->device, &c->minor);
+       if (r) {
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+index f77b2a4..c0fec9a 100644
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -69,7 +69,8 @@ iokit_close(void *ctx)
+ 
+ static int
+ iokit_read_snapshot(io_service_t svc, struct cobalt_gpu_info_v1 *identity,
+-                    struct cobalt_gfx_runtime_v1 *runtime)
++                    struct cobalt_gfx_runtime_v1 *runtime,
++                    struct cobalt_cp_firmware_v1 *firmware)
+ {
+    io_registry_entry_t owner = svc;
+    bool release_owner = false;
+@@ -119,6 +120,19 @@ iokit_read_snapshot(io_service_t svc, struct cobalt_gpu_info_v1 *identity,
+       if (property)
+          CFRelease(property);
+    }
++   if (!reason) {
++      property = IORegistryEntryCreateCFProperty(owner, CFSTR(COBALT_CP_FIRMWARE_PROPERTY),
++                                                 kCFAllocatorDefault, 0);
++      if (!property)
++         reason = "missing Cobalt,CpFirmware-v1; update the Cobalt kernel driver";
++      else if (CFGetTypeID(property) != CFDataGetTypeID())
++         reason = "Cobalt,CpFirmware-v1 must be CFData";
++      else if (!cobalt_cp_firmware_v1_decode(CFDataGetBytePtr((CFDataRef)property),
++                                              CFDataGetLength((CFDataRef)property), identity, firmware))
++         reason = "malformed Cobalt,CpFirmware-v1";
++      if (property)
++         CFRelease(property);
++   }
+    if (release_owner)
+       IOObjectRelease(owner);
+    if (!reason)
+@@ -146,7 +160,8 @@ acd_kext_open_iokit(struct acd_kext **out)
+ 
+    struct cobalt_gpu_info_v1 identity = {0};
+    struct cobalt_gfx_runtime_v1 runtime = {0};
+-   int r = iokit_read_snapshot(svc, &identity, &runtime);
++   struct cobalt_cp_firmware_v1 firmware = {0};
++   int r = iokit_read_snapshot(svc, &identity, &runtime, &firmware);
+    if (r) {
+       IOObjectRelease(svc);
+       return r;
+@@ -185,6 +200,6 @@ acd_kext_open_iokit(struct acd_kext **out)
+       .unmap = iokit_unmap,
+       .close = iokit_close,
+    };
+-   *out = acd_kext_create_with_runtime(&ops, c, &identity, &runtime);
++   *out = acd_kext_create_with_firmware(&ops, c, &identity, &runtime, &firmware);
+    return *out ? 0 : -ENOMEM;
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index bb8642f..456e0d1 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -76,6 +76,8 @@ struct acd_kext {
+    struct cobalt_gpu_info_v1 identity;
+    bool has_runtime;
+    struct cobalt_gfx_runtime_v1 runtime;
++   bool has_firmware;
++   struct cobalt_cp_firmware_v1 firmware;
+ };
+ 
+ /* G6: the service class of the N48N open. A pointer to one of the two string literals below (never to the caller's buffer). */
+@@ -118,6 +120,15 @@ struct acd_kext *
+ acd_kext_create_with_runtime(const struct acd_kext_ops *ops, void *ctx,
+                              const struct cobalt_gpu_info_v1 *identity,
+                              const struct cobalt_gfx_runtime_v1 *runtime)
++{
++   return acd_kext_create_with_firmware(ops, ctx, identity, runtime, NULL);
++}
++
++struct acd_kext *
++acd_kext_create_with_firmware(const struct acd_kext_ops *ops, void *ctx,
++                              const struct cobalt_gpu_info_v1 *identity,
++                              const struct cobalt_gfx_runtime_v1 *runtime,
++                              const struct cobalt_cp_firmware_v1 *firmware)
+ {
+    struct acd_kext *k = calloc(1, sizeof(*k));
+    if (!k) {
+@@ -135,6 +146,10 @@ acd_kext_create_with_runtime(const struct acd_kext_ops *ops, void *ctx,
+       k->runtime = *runtime;
+       k->has_runtime = true;
+    }
++   if (firmware) {
++      k->firmware = *firmware;
++      k->has_firmware = true;
++   }
+    return k;
+ }
+ 
+@@ -150,6 +165,12 @@ acd_kext_runtime(const struct acd_kext *k)
+    return k && k->has_runtime ? &k->runtime : NULL;
+ }
+ 
++const struct cobalt_cp_firmware_v1 *
++acd_kext_firmware(const struct acd_kext *k)
++{
++   return k && k->has_firmware ? &k->firmware : NULL;
++}
++
+ void
+ acd_kext_destroy(struct acd_kext *k)
+ {
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index ef87534..c0ac4c7 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -19,6 +19,7 @@
+ #include "navi48_native_abi.h"
+ #include "cobalt_gpu_info.h"
+ #include "cobalt_gfx_runtime.h"
++#include "cobalt_cp_firmware.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -100,8 +101,13 @@ struct acd_kext *acd_kext_create_with_identity(const struct acd_kext_ops *ops, v
+ struct acd_kext *acd_kext_create_with_runtime(const struct acd_kext_ops *ops, void *ctx,
+                                             const struct cobalt_gpu_info_v1 *identity,
+                                             const struct cobalt_gfx_runtime_v1 *runtime);
++struct acd_kext *acd_kext_create_with_firmware(const struct acd_kext_ops *ops, void *ctx,
++                                              const struct cobalt_gpu_info_v1 *identity,
++                                              const struct cobalt_gfx_runtime_v1 *runtime,
++                                              const struct cobalt_cp_firmware_v1 *firmware);
+ const struct cobalt_gpu_info_v1 *acd_kext_identity(const struct acd_kext *k);
+ const struct cobalt_gfx_runtime_v1 *acd_kext_runtime(const struct acd_kext *k);
++const struct cobalt_cp_firmware_v1 *acd_kext_firmware(const struct acd_kext *k);
+ void acd_kext_destroy(struct acd_kext *k);
+ 
+ /* Backend selection: RADV_DARWIN_MOCK=1 gives the in-process mock, otherwise the
+diff --git a/src/amd/common/darwin/ac_darwin_runtime.h b/src/amd/common/darwin/ac_darwin_runtime.h
+index 8156f7a..aceef4b 100644
+--- a/src/amd/common/darwin/ac_darwin_runtime.h
++++ b/src/amd/common/darwin/ac_darwin_runtime.h
+@@ -6,6 +6,7 @@
+ 
+ #include "common/amdgpu_devices.h"
+ #include "cobalt_gfx_runtime.h"
++#include "cobalt_cp_firmware.h"
+ 
+ static inline bool
+ acd_runtime_reference(const struct amdgpu_device *canned_template,
+@@ -139,4 +140,54 @@ acd_runtime_overlay(const struct amdgpu_device *canned, const struct cobalt_gpu_
+    return true;
+ }
+ 
++static inline bool
++acd_runtime_firmware_overlay(const struct cobalt_gpu_info_v1 *identity,
++                             const struct cobalt_cp_firmware_v1 *firmware,
++                             struct amdgpu_device *device)
++{
++   struct cobalt_gpu_info_v1 checked_identity;
++   struct cobalt_cp_firmware_v1 decoded;
++   uint32_t gc_version;
++   enum radeon_family family;
++   const char *name;
++
++   if (!identity || !firmware || !device ||
++       !cobalt_gpu_info_v1_decode(identity, sizeof(*identity), &checked_identity) ||
++       !cobalt_cp_firmware_v1_decode(firmware, sizeof(*firmware), &checked_identity, &decoded))
++      return false;
++
++   gc_version = (checked_identity.gc_major << 16) | (checked_identity.gc_minor << 8) |
++                checked_identity.gc_revision;
++   if (checked_identity.gfx_target == COBALT_GPU_GFX_TARGET_1200 &&
++       checked_identity.pci_device == 0x7590u) {
++      family = CHIP_GFX1200;
++      name = "gfx1200";
++   } else if (checked_identity.gfx_target == COBALT_GPU_GFX_TARGET_1201 &&
++              (checked_identity.pci_device == 0x7550u || checked_identity.pci_device == 0x7551u)) {
++      family = CHIP_GFX1201;
++      name = "gfx1201";
++   } else {
++      return false;
++   }
++
++   if (!device->name || strcmp(device->name, name) || device->radeon_family != family ||
++       device->dev.device_id != checked_identity.pci_device ||
++       device->dev.pci_rev != checked_identity.pci_revision ||
++       device->hw_ip_gfx.hw_ip_version_major != checked_identity.gc_major ||
++       device->hw_ip_gfx.hw_ip_version_minor != checked_identity.gc_minor ||
++       device->hw_ip_gfx.ip_discovery_version != gc_version ||
++       device->hw_ip_compute.hw_ip_version_major != checked_identity.gc_major ||
++       device->hw_ip_compute.hw_ip_version_minor != checked_identity.gc_minor ||
++       device->hw_ip_compute.ip_discovery_version != gc_version)
++      return false;
++
++   device->fw_gfx_me.ver = decoded.me_version;
++   device->fw_gfx_me.feature = decoded.me_feature;
++   device->fw_gfx_pfp.ver = decoded.pfp_version;
++   device->fw_gfx_pfp.feature = decoded.pfp_feature;
++   device->fw_gfx_mec.ver = decoded.mec_version;
++   device->fw_gfx_mec.feature = decoded.mec_feature;
++   return true;
++}
++
+ #endif
+diff --git a/src/amd/common/darwin/test/acd_gpu_info_test.c b/src/amd/common/darwin/test/acd_gpu_info_test.c
+index 7e5c9b6..4081361 100644
+--- a/src/amd/common/darwin/test/acd_gpu_info_test.c
++++ b/src/amd/common/darwin/test/acd_gpu_info_test.c
+@@ -71,6 +71,17 @@ main(void)
+    CHECK(check_gpu_info(&target, CHIP_GFX1200, 32, 2, 0xff, 128, 4096, 32) == EXIT_SUCCESS);
+    CHECK(target.dev.external_rev == 0x41 && target.radeon_family == CHIP_GFX1200);
+    CHECK(target.fw_gfx_me.ver == 0 && target.fw_gfx_pfp.ver == 0 && target.fw_gfx_mec.ver == 0);
++   struct cobalt_cp_firmware_v1 firmware = {
++      .version = 1, .size = sizeof(firmware),
++      .flags = COBALT_CP_FIRMWARE_PSP_LOAD_COMPLETED, .gc_version = 0xc0000,
++      .me_version = 3110, .me_feature = 29,
++      .pfp_version = 3220, .pfp_feature = 29,
++      .mec_version = 3490, .mec_feature = 29,
++   };
++   CHECK(acd_runtime_firmware_overlay(&identity, &firmware, &target));
++   CHECK(target.fw_gfx_me.ver == 3110 && target.fw_gfx_me.feature == 29);
++   CHECK(target.fw_gfx_pfp.ver == 3220 && target.fw_gfx_pfp.feature == 29);
++   CHECK(target.fw_gfx_mec.ver == 3490 && target.fw_gfx_mec.feature == 29);
+    CHECK(target.dev.ids_flags == base->dev.ids_flags);
+    CHECK(!memcmp(&target.mem, &base->mem, sizeof(target.mem)));
+    CHECK(target.dev.virtual_address_offset == base->dev.virtual_address_offset);
+@@ -103,6 +114,9 @@ main(void)
+          runtime.cu_bitmap[se][sa] = 0xff;
+    CHECK(acd_runtime_overlay(base, &identity, &runtime, &target));
+    CHECK(check_gpu_info(&target, CHIP_GFX1201, 64, 4, 0xffff, 256, 8192, 64) == EXIT_SUCCESS);
++   firmware.gc_version = 0xc0001;
++   CHECK(acd_runtime_firmware_overlay(&identity, &firmware, &target));
++   CHECK(target.fw_gfx_me.ver == 3110 && target.fw_gfx_pfp.ver == 3220 && target.fw_gfx_mec.ver == 3490);
+    CHECK(!memcmp(base, &original, sizeof(original)));
+ 
+    struct radeon_info info = {0};
+diff --git a/src/amd/common/darwin/test/acd_iokit_test.c b/src/amd/common/darwin/test/acd_iokit_test.c
+index ed02cd7..914307a 100644
+--- a/src/amd/common/darwin/test/acd_iokit_test.c
++++ b/src/amd/common/darwin/test/acd_iokit_test.c
+@@ -20,14 +20,18 @@ void *acd_test_calloc(size_t count, size_t size)
+ enum { BRINGUP = 1, ACCELERATOR, NUB, WRONG };
+ static struct cobalt_gpu_info_v1 wire;
+ static struct cobalt_gfx_runtime_v1 runtime_wire;
++static struct cobalt_cp_firmware_v1 firmware_wire;
+ static unsigned refs[5], matches, opens, closes, property_refs, reads;
+ static unsigned runtime_refs, runtime_reads;
++static unsigned firmware_refs, firmware_reads;
+ static io_service_t selected;
+ static io_registry_entry_t nub_parent, accelerator_parent;
+ static int property_kind, parent_failure, open_error;
+ static CFIndex wire_length;
+ static CFIndex runtime_length;
+ static int runtime_kind;
++static CFIndex firmware_length;
++static int firmware_kind;
+ 
+ static void reset(void)
+ {
+@@ -35,16 +39,19 @@ static void reset(void)
+       assert(refs[i] == 0);
+    assert(property_refs == 0);
+    assert(runtime_refs == 0);
++   assert(firmware_refs == 0);
+ #ifdef ACD_TEST_ALLOCATOR
+    alloc_calls = fail_alloc_call = 0;
+ #endif
+    matches = opens = closes = reads = 0;
+    runtime_reads = 0;
++   firmware_reads = 0;
+    selected = BRINGUP;
+    nub_parent = BRINGUP;
+    accelerator_parent = NUB;
+    property_kind = 1;
+    runtime_kind = 1;
++   firmware_kind = 1;
+    parent_failure = open_error = 0;
+    wire_length = sizeof(wire);
+    wire = (struct cobalt_gpu_info_v1){
+@@ -65,6 +72,14 @@ static void reset(void)
+       .active_rb_mask = 0xfff3, .active_cu_count = 60,
+       .cu_bitmap = {{0x3f, 0x3f}, {0xff, 0xff}, {0xff, 0xff}, {0xff, 0xff}},
+    };
++   firmware_length = sizeof(firmware_wire);
++   firmware_wire = (struct cobalt_cp_firmware_v1){
++      .version = 1, .size = sizeof(firmware_wire),
++      .flags = COBALT_CP_FIRMWARE_PSP_LOAD_COMPLETED, .gc_version = 0x0c0001,
++      .me_version = 3100, .me_feature = 31,
++      .pfp_version = 3200, .pfp_feature = 32,
++      .mec_version = 3300, .mec_feature = 33,
++   };
+ }
+ 
+ CFMutableDictionaryRef IOServiceMatching(const char *name)
+@@ -114,13 +129,21 @@ CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, const char
+       property_refs++;
+       return &wire;
+    }
+-   assert(!strcmp(key, COBALT_GFX_RUNTIME_PROPERTY));
+-   assert(reads == 1 && property_refs == 0);
+-   runtime_reads++;
+-   if (!runtime_kind)
++   if (!strcmp(key, COBALT_GFX_RUNTIME_PROPERTY)) {
++      assert(reads == 1 && property_refs == 0);
++      runtime_reads++;
++      if (!runtime_kind)
++         return NULL;
++      runtime_refs++;
++      return &runtime_wire;
++   }
++   assert(!strcmp(key, COBALT_CP_FIRMWARE_PROPERTY));
++   assert(reads == 1 && runtime_reads == 1 && property_refs == 0 && runtime_refs == 0);
++   firmware_reads++;
++   if (!firmware_kind)
+       return NULL;
+-   runtime_refs++;
+-   return &runtime_wire;
++   firmware_refs++;
++   return &firmware_wire;
+ }
+ CFTypeID CFGetTypeID(CFTypeRef property)
+ {
+@@ -128,13 +151,18 @@ CFTypeID CFGetTypeID(CFTypeRef property)
+       assert(property_refs);
+       return property_kind;
+    }
+-   assert(property == &runtime_wire && runtime_refs);
+-   return runtime_kind;
++   if (property == &runtime_wire) {
++      assert(runtime_refs);
++      return runtime_kind;
++   }
++   assert(property == &firmware_wire && firmware_refs);
++   return firmware_kind;
+ }
+ CFTypeID CFDataGetTypeID(void) { return 1; }
+ const uint8_t *CFDataGetBytePtr(CFDataRef property)
+ {
+-   assert((property == &wire && property_refs) || (property == &runtime_wire && runtime_refs));
++   assert((property == &wire && property_refs) || (property == &runtime_wire && runtime_refs) ||
++          (property == &firmware_wire && firmware_refs));
+    return (const uint8_t *)property;
+ }
+ CFIndex CFDataGetLength(CFDataRef property)
+@@ -143,8 +171,12 @@ CFIndex CFDataGetLength(CFDataRef property)
+       assert(property_refs);
+       return wire_length;
+    }
+-   assert(property == &runtime_wire && runtime_refs);
+-   return runtime_length;
++   if (property == &runtime_wire) {
++      assert(runtime_refs);
++      return runtime_length;
++   }
++   assert(property == &firmware_wire && firmware_refs);
++   return firmware_length;
+ }
+ void CFRelease(CFTypeRef property)
+ {
+@@ -152,15 +184,21 @@ void CFRelease(CFTypeRef property)
+       assert(property_refs);
+       property_refs--;
+    } else {
+-      assert(property == &runtime_wire && runtime_refs);
+-      runtime_refs--;
++      if (property == &runtime_wire) {
++         assert(runtime_refs);
++         runtime_refs--;
++      } else {
++         assert(property == &firmware_wire && firmware_refs);
++         firmware_refs--;
++      }
+    }
+ }
+ kern_return_t IOServiceOpen(io_service_t service, mach_port_t task, uint32_t type, io_connect_t *conn)
+ {
+    (void)task;
+    assert(service == selected && refs[service] && type == N48N_UC_TYPE);
+-   assert(reads == 1 && runtime_reads == 1 && property_refs == 0 && runtime_refs == 0);
++   assert(reads == 1 && runtime_reads == 1 && firmware_reads == 1 && property_refs == 0 &&
++          runtime_refs == 0 && firmware_refs == 0);
+    opens++;
+    if (open_error)
+       return open_error;
+@@ -207,6 +245,7 @@ static void rejected(void)
+       assert(refs[i] == 0);
+    assert(property_refs == 0);
+    assert(runtime_refs == 0);
++   assert(firmware_refs == 0);
+ }
+ 
+ int main(void)
+@@ -221,16 +260,23 @@ int main(void)
+    assert(runtime_snapshot && runtime_snapshot != &runtime_wire);
+    assert(runtime_snapshot->active_cu_count == 60 && runtime_snapshot->active_rb_mask == 0xfff3);
+    assert(runtime_snapshot->cu_bitmap[0][0] == 0x3f && runtime_snapshot->gb_addr_config == 0x08200544);
++   const struct cobalt_cp_firmware_v1 *firmware_snapshot = acd_kext_firmware(k);
++   assert(firmware_snapshot && firmware_snapshot != &firmware_wire);
++   assert(firmware_snapshot->me_version == 3100 && firmware_snapshot->me_feature == 31);
++   assert(firmware_snapshot->pfp_version == 3200 && firmware_snapshot->pfp_feature == 32);
++   assert(firmware_snapshot->mec_version == 3300 && firmware_snapshot->mec_feature == 33);
+    wire.pci_device = 0x7550;
+    runtime_wire.active_cu_count = 64;
+    runtime_wire.gb_addr_config = 0x08200545;
++   firmware_wire.me_version = 9999;
+    selected = ACCELERATOR;
+    for (unsigned i = 0; i < 10; i++) {
+       assert(acd_kext_identity(k) == snapshot && snapshot->pci_device == 0x7551);
+       assert(acd_kext_runtime(k) == runtime_snapshot && runtime_snapshot->active_cu_count == 60);
+       assert(runtime_snapshot->gb_addr_config == 0x08200544);
++      assert(acd_kext_firmware(k) == firmware_snapshot && firmware_snapshot->me_version == 3100);
+    }
+-   assert(matches == 1 && reads == 1 && runtime_reads == 1 && opens == 1 && closes == 0);
++   assert(matches == 1 && reads == 1 && runtime_reads == 1 && firmware_reads == 1 && opens == 1 && closes == 0);
+    acd_kext_destroy(k);
+    assert(closes == 1);
+ 
+@@ -240,6 +286,7 @@ int main(void)
+    assert(acd_kext_open_iokit(&k) == 0);
+    assert(acd_kext_identity(k)->pci_device == 0x7551);
+    assert(acd_kext_runtime(k)->active_cu_count == 60);
++   assert(acd_kext_firmware(k)->mec_version == 3300);
+    acd_kext_destroy(k);
+    assert(closes == 1);
+ 
+@@ -265,6 +312,19 @@ int main(void)
+    reset(); runtime_wire.active_rb_mask |= 0x10000; rejected();
+    reset(); runtime_wire.active_sa_mask = 0xfe; rejected();
+    reset(); runtime_wire.gb_addr_config = 0; rejected();
++   reset(); firmware_kind = 0; rejected();
++   reset(); firmware_kind = 2; rejected();
++   reset(); firmware_length--; rejected();
++   reset(); firmware_length++; rejected();
++   reset(); firmware_length = -1; rejected();
++   reset(); firmware_wire.version++; rejected();
++   reset(); firmware_wire.flags = 0; rejected();
++   reset(); firmware_wire.gc_version = 0x0c0000; rejected();
++   reset(); firmware_wire.me_version = 0; rejected();
++   reset(); firmware_wire.pfp_version = UINT32_MAX; rejected();
++   reset(); firmware_wire.mec_version = 0; rejected();
++   reset(); firmware_wire.me_feature = UINT32_MAX; rejected();
++   reset(); firmware_wire.reserved[0] = 1; rejected();
+    reset(); wire.pci_device = 0x7590; wire.gfx_target = 1200; wire.gc_revision = 0;
+    wire.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED; rejected();
+    reset(); selected = ACCELERATOR; parent_failure = ACCELERATOR; rejected();
+@@ -291,10 +351,11 @@ int main(void)
+ 
+    const struct acd_kext_ops ops = {0};
+    k = acd_kext_create(&ops, NULL);
+-   assert(k && acd_kext_identity(k) == NULL && acd_kext_runtime(k) == NULL);
++   assert(k && acd_kext_identity(k) == NULL && acd_kext_runtime(k) == NULL && acd_kext_firmware(k) == NULL);
+    acd_kext_destroy(k);
+    assert(acd_kext_identity(NULL) == NULL);
+    assert(acd_kext_runtime(NULL) == NULL);
++   assert(acd_kext_firmware(NULL) == NULL);
+    puts("acd_iokit_test: passed");
+    return 0;
+ }
+diff --git a/src/amd/common/darwin/test/acd_kext_test.c b/src/amd/common/darwin/test/acd_kext_test.c
+index f779934..45c5cca 100644
+--- a/src/amd/common/darwin/test/acd_kext_test.c
++++ b/src/amd/common/darwin/test/acd_kext_test.c
+@@ -464,6 +464,33 @@ test_service_class(void)
+    CHECK(strcmp(ACD_SERVICE_BRINGUP, "Navi48Bringup") == 0 && strcmp(ACD_SERVICE_ACCELERATOR, "Navi48Accelerator") == 0);
+ }
+ 
++static void
++test_firmware_snapshot(void)
++{
++   const struct acd_kext_ops ops = {0};
++   struct cobalt_gpu_info_v1 identity = {.pci_device = 0x7551};
++   struct cobalt_gfx_runtime_v1 runtime = {.active_cu_count = 42};
++   struct cobalt_cp_firmware_v1 firmware = {.me_version = 3100, .me_feature = 7};
++   struct acd_kext *k = acd_kext_create_with_firmware(&ops, NULL, &identity, &runtime, &firmware);
++   CHECK(k != NULL);
++   CHECK(acd_kext_identity(k) != &identity && acd_kext_identity(k)->pci_device == 0x7551);
++   CHECK(acd_kext_runtime(k) != &runtime && acd_kext_runtime(k)->active_cu_count == 42);
++   CHECK(acd_kext_firmware(k) != &firmware && acd_kext_firmware(k)->me_version == 3100 &&
++         acd_kext_firmware(k)->me_feature == 7);
++   identity.pci_device = 0;
++   runtime.active_cu_count = 0;
++   firmware.me_version = 0;
++   CHECK(acd_kext_identity(k)->pci_device == 0x7551);
++   CHECK(acd_kext_runtime(k)->active_cu_count == 42);
++   CHECK(acd_kext_firmware(k)->me_version == 3100);
++   acd_kext_destroy(k);
++
++   k = acd_kext_create_with_runtime(&ops, NULL, NULL, NULL);
++   CHECK(k != NULL && acd_kext_firmware(k) == NULL);
++   acd_kext_destroy(k);
++   CHECK(acd_kext_firmware(NULL) == NULL);
++}
++
+ int
+ main(void)
+ {
+@@ -476,6 +503,7 @@ main(void)
+    test_import_host();
+    test_scanx_call();
+    test_service_class();
++   test_firmware_snapshot();
+    printf("acd_kext_test: %d checks, %d failures\n", checks, failures);
+    return failures != 0;
+ }
+diff --git a/src/amd/common/darwin/test/acd_runtime_test.c b/src/amd/common/darwin/test/acd_runtime_test.c
+index 90c7659..f94c5c6 100644
+--- a/src/amd/common/darwin/test/acd_runtime_test.c
++++ b/src/amd/common/darwin/test/acd_runtime_test.c
+@@ -80,6 +80,47 @@ int main(void)
+    assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
+    assert(!memcmp(&out, &expected, sizeof(out)));
+    assert(!memcmp(&out, &expected, sizeof(out)));
++   struct cobalt_cp_firmware_v1 firmware = {
++      .version = 1, .size = sizeof(firmware),
++      .flags = COBALT_CP_FIRMWARE_PSP_LOAD_COMPLETED, .gc_version = TEST_GC_1201,
++      .me_version = 3101, .me_feature = 17,
++      .pfp_version = 3202, .pfp_feature = 23,
++      .mec_version = 3303, .mec_feature = 31,
++   };
++   struct amdgpu_device firmware_out = out;
++   assert(acd_runtime_firmware_overlay(&identity, &firmware, &firmware_out));
++   assert(firmware_out.fw_gfx_me.ver == 3101 && firmware_out.fw_gfx_me.feature == 17);
++   assert(firmware_out.fw_gfx_pfp.ver == 3202 && firmware_out.fw_gfx_pfp.feature == 23);
++   assert(firmware_out.fw_gfx_mec.ver == 3303 && firmware_out.fw_gfx_mec.feature == 31);
++   firmware.me_feature = firmware.pfp_feature = firmware.mec_feature = 0;
++   assert(acd_runtime_firmware_overlay(&identity, &firmware, &firmware_out));
++   assert(firmware_out.fw_gfx_me.feature == 0 && firmware_out.fw_gfx_pfp.feature == 0 &&
++          firmware_out.fw_gfx_mec.feature == 0);
++   struct amdgpu_device firmware_unchanged = firmware_out;
++   firmware.flags = 0;
++   assert(!acd_runtime_firmware_overlay(&identity, &firmware, &firmware_out));
++   assert(!memcmp(&firmware_out, &firmware_unchanged, sizeof(firmware_out)));
++   firmware.flags = COBALT_CP_FIRMWARE_PSP_LOAD_COMPLETED;
++   firmware.gc_version = TEST_GC_1200;
++   assert(!acd_runtime_firmware_overlay(&identity, &firmware, &firmware_out));
++   assert(!memcmp(&firmware_out, &firmware_unchanged, sizeof(firmware_out)));
++   firmware.gc_version = TEST_GC_1201;
++   firmware.reserved[0] = 1;
++   assert(!acd_runtime_firmware_overlay(&identity, &firmware, &firmware_out));
++   assert(!memcmp(&firmware_out, &firmware_unchanged, sizeof(firmware_out)));
++   firmware.reserved[0] = 0;
++   firmware.me_version = 0;
++   assert(!acd_runtime_firmware_overlay(&identity, &firmware, &firmware_out));
++   assert(!memcmp(&firmware_out, &firmware_unchanged, sizeof(firmware_out)));
++   firmware.me_version = 3101;
++   struct amdgpu_device mismatched_device = firmware_out;
++   mismatched_device.dev.device_id = 0x7550;
++   struct amdgpu_device mismatched_unchanged = mismatched_device;
++   assert(!acd_runtime_firmware_overlay(&identity, &firmware, &mismatched_device));
++   assert(!memcmp(&mismatched_device, &mismatched_unchanged, sizeof(mismatched_device)));
++   assert(!acd_runtime_firmware_overlay(&identity, NULL, &firmware_out));
++   assert(!acd_runtime_firmware_overlay(&identity, &firmware, NULL));
++   assert(!acd_runtime_firmware_overlay(NULL, &firmware, &firmware_out));
+    runtime.cu_bitmap[0][0] = runtime.cu_bitmap[0][1] = 0xff;
+    runtime.cu_bitmap[1][0] = runtime.cu_bitmap[1][1] = 0xff;
+    runtime.cu_bitmap[2][0] = 0xff;
+@@ -152,6 +193,12 @@ int main(void)
+    assert(out.dev.gl1c_cache_size == 256 && out.dev.gl2c_cache_size == 4096);
+    assert(out.dev.mall_size == UINT64_C(33554432));
+    assert(out.fw_gfx_me.ver == 0 && out.fw_gfx_pfp.ver == 0 && out.fw_gfx_mec.ver == 0);
++   firmware.gc_version = TEST_GC_1200;
++   firmware.me_version = 4101;
++   firmware.pfp_version = 4202;
++   firmware.mec_version = 4303;
++   assert(acd_runtime_firmware_overlay(&identity, &firmware, &out));
++   assert(out.fw_gfx_me.ver == 4101 && out.fw_gfx_pfp.ver == 4202 && out.fw_gfx_mec.ver == 4303);
+    assert(out.dev.virtual_address_offset == canned.dev.virtual_address_offset);
+    assert(out.dev.virtual_address_max == canned.dev.virtual_address_max);
+    assert(out.mem.vram.total_heap_size == canned.mem.vram.total_heap_size);
