@@ -61,13 +61,16 @@ IOServiceOpen. Older kernels without the property must be updated together
 with the backend. Explicit MOCK and HOST_BO modes retain synthetic data;
 they do not establish hardware compatibility.
 
+Mesa patch 0011 separately requires the post-GFXInit active-layout property
+described in `GFX-RUNTIME.md`. It replaces canned CU/RB masks and tiling
+configuration with validated runtime values and cross-checks live QueryInfo.
+Maximum CU capacity is never substituted for the active-unit count.
+
 The pinned Mesa base has a canned gfx1201 device record and no gfx1200
-record. The backend still uses that record for active CU masks, other
-hardware properties and clocks; this change does not make those fields
-live. In particular it does not turn maximum CU capacity into active units.
-Runtime memory pools and budgets continue to come from QueryInfo. A future
-gfx1200 path needs verified runtime hardware information before it can
-replace the existing template and address-configuration assumptions.
+record. Other hardware properties, cache information and clocks still use
+that template. Runtime memory pools and budgets continue to come from
+QueryInfo. A future gfx1200 path needs verified values for the remaining
+parameters before it can replace the template.
 
 Mesa remains external at the revision in `mesa-patches/README.txt`; the
 Metal build script also consumes an external RADV dylib. CI now applies

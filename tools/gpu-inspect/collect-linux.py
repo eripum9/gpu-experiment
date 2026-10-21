@@ -6,6 +6,10 @@ Discovery tree, target DRM connector metadata/EDIDs, and only the driver's
 cached amdgpu_discovery snapshot associated with that DRM device. It never
 mounts debugfs, accesses ROM or PCI configuration, installs software, or
 uploads the report.
+
+With --drm-info it also queries bounded driver metadata through the selected
+render node, including the driver's allowlisted GB_ADDR_CONFIG read. It does
+not map GPU registers or expose arbitrary register/query arguments.
 """
 
 from __future__ import annotations
@@ -338,7 +342,7 @@ def _cached_discovery_blob(sys_root: Path, device: Path, errors: list[dict[str, 
     return {"cards": captures} if captures else None
 
 
-def collect(sys_root: Path = Path("/sys"), bdf: str | None = None) -> dict[str, Any]:
+def collect(sys_root: Path = Path("/sys"), bdf: str | None = None, *, drm_info: bool = False) -> dict[str, Any]:
     """Collect a report from an injectable sysfs root, for offline testing."""
     sys_root = Path(sys_root)
     selected_bdf, device = _select_device(sys_root, bdf)
@@ -361,6 +365,17 @@ def collect(sys_root: Path = Path("/sys"), bdf: str | None = None) -> dict[str, 
     ip_discovery = _collect_ip_discovery(device, errors, warnings)
     connectors = _drm_connectors(sys_root, device, errors)
     raw_discovery = _cached_discovery_blob(sys_root, device, errors, warnings) if driver == "amdgpu" else None
+    if drm_info:
+        # Imported only on demand so the default collector and its Windows-hosted
+        # offline tests do not depend on the Linux-only fcntl module.
+        try:
+            from drm_runtime import collect_drm_runtime
+            drm_runtime = collect_drm_runtime(sys_root, device)
+        except Exception as exc:
+            # Keep this optional capture's failures separate from the established
+            # sysfs completeness/errors contract.
+            drm_runtime = {"complete": False, "errors": [{"error": f"runtime capture unavailable: {exc}"}],
+                           "queries": [], "render_nodes": [], "decoded": {}}
 
     seen_required: dict[int, bool] = {hw_id: False for hw_id in REQUIRED_IPS}
     for ip in (ip for die in ip_discovery["dies"] if die["die"] == 0 for ip in die["ips"] if ip["instance_path"] == 0):
@@ -383,6 +398,17 @@ def collect(sys_root: Path = Path("/sys"), bdf: str | None = None) -> dict[str, 
     except Exception:
         kernel = None
         machine = None
+    gpu = {
+        "bdf": selected_bdf,
+        "pci": fields,
+        "driver": driver,
+        "amdgpu_module_version": module_version,
+        "ip_discovery": ip_discovery,
+        "cached_ip_discovery_blob": raw_discovery,
+        "drm_connectors": connectors,
+    }
+    if drm_info:
+        gpu["drm_runtime"] = drm_runtime
     return {
         "schema_version": 1,
         "captured_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -390,15 +416,7 @@ def collect(sys_root: Path = Path("/sys"), bdf: str | None = None) -> dict[str, 
         "capture_level": "raw-and-sysfs" if raw_discovery else "sysfs-only",
         "complete": complete,
         "system": {"kernel_release": kernel, "machine": machine},
-        "gpu": {
-            "bdf": selected_bdf,
-            "pci": fields,
-            "driver": driver,
-            "amdgpu_module_version": module_version,
-            "ip_discovery": ip_discovery,
-            "cached_ip_discovery_blob": raw_discovery,
-            "drm_connectors": connectors,
-        },
+        "gpu": gpu,
         "warnings": warnings,
         "errors": errors,
     }
@@ -407,13 +425,14 @@ def collect(sys_root: Path = Path("/sys"), bdf: str | None = None) -> dict[str, 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bdf", help="exact target PCI address if more than one RX 9060 XT is installed")
+    parser.add_argument("--drm-info", action="store_true", help="query bounded AMDGPU_INFO runtime metadata through the selected GPU render node")
     parser.add_argument("--output", default="gpu-capture.json", help="new JSON report path (will never overwrite; default: gpu-capture.json)")
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux"):
         print("This collector must run on native Linux; WSL does not expose the physical GPU's sysfs data.", file=sys.stderr)
         return 2
     try:
-        report = collect(Path("/sys"), args.bdf)
+        report = collect(Path("/sys"), args.bdf, drm_info=args.drm_info)
     except CollectionError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -429,11 +448,20 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"Cannot create report {output}: {exc}", file=sys.stderr)
         return 2
-    state = "complete" if report["complete"] else "partial"
+    runtime_complete = (
+        not args.drm_info
+        or report.get("gpu", {}).get("drm_runtime", {}).get("complete", False)
+    )
+    overall_complete = report["complete"] and runtime_complete
+    state = "complete" if overall_complete else "partial"
     count = report["gpu"]["ip_discovery"]["enumerated_num_ips"]
-    print(f"Saved {state} RX 9060 XT sysfs capture ({report['gpu']['bdf']}, {count} IP blocks) to {output}")
+    level = "sysfs + DRM runtime" if args.drm_info else "sysfs"
+    print(f"Saved {state} RX 9060 XT {level} capture ({report['gpu']['bdf']}, {count} IP blocks) to {output}")
     if not report["complete"]:
         print("Capture is partial; inspect warnings/errors in the JSON report.", file=sys.stderr)
+    if not runtime_complete:
+        print("DRM runtime capture is partial; inspect gpu.drm_runtime.errors in the JSON report.", file=sys.stderr)
+    if not overall_complete:
         return 1
     return 0
 

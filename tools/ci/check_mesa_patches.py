@@ -30,15 +30,16 @@ def run(command, cwd):
 
 
 def check_headers(mesa):
-    authoritative = ROOT / "src/navi48-bringup/src/gpu_info.h"
-    mirrored = mesa / "include/darwin/cobalt_gpu_info.h"
     normalize = lambda path: path.read_bytes().replace(b"\r\n", b"\n")
-    if normalize(authoritative) != normalize(mirrored):
-        raise RuntimeError("Mesa's GPU identity decoder differs from the kernel's shared header")
+    for filename in ("gpu_info.h", "gfx_runtime.h"):
+        authoritative = ROOT / "src/navi48-bringup/src" / filename
+        mirrored = mesa / "include/darwin" / ("cobalt_" + filename)
+        if normalize(authoritative) != normalize(mirrored):
+            raise RuntimeError(f"Mesa's {filename} differs from the kernel's shared header")
 
 
 def host_checks(mesa, cc):
-    includes = ["-Iinclude", "-Iinclude/darwin", "-Isrc/amd/common/darwin"]
+    includes = ["-Iinclude", "-Iinclude/darwin", "-Isrc/amd", "-Isrc/amd/common/darwin"]
     common = [cc, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter"]
     tests = mesa / "host-checks"
     tests.mkdir()
@@ -47,6 +48,7 @@ def host_checks(mesa, cc):
         ("acd_budget_test", [darwin / "test/acd_budget_test.c"], []),
         ("acd_kext_test", [darwin / "test/acd_kext_test.c", darwin / "ac_darwin_kext.c"], []),
         ("acd_identity_test", [darwin / "test/acd_identity_test.c"], []),
+        ("acd_runtime_test", [darwin / "test/acd_runtime_test.c"], []),
         ("acd_iokit_test", [darwin / "test/acd_iokit_test.c", darwin / "ac_darwin_iokit.c",
                             darwin / "ac_darwin_kext.c"],
          ["-Isrc/amd/common/darwin/test/iokit-stubs", "-include",
@@ -111,8 +113,8 @@ def main():
         run(["git", "fetch", "--filter=blob:none", "--depth=1", "origin", MESA_COMMIT], mesa)
         run(["git", "checkout", "--detach", MESA_COMMIT], mesa)
         patches = sorted((ROOT / "mesa-patches").glob("*.patch"))
-        if len(patches) != 10:
-            raise RuntimeError(f"Expected ten ordered Mesa patches, found {len(patches)}")
+        if len(patches) != 11:
+            raise RuntimeError(f"Expected eleven ordered Mesa patches, found {len(patches)}")
         for patch in patches:
             run(["git", "-c", "core.whitespace=cr-at-eol", "apply", "--check", patch], mesa)
             run(["git", "apply", "--whitespace=nowarn", patch], mesa)

@@ -1,0 +1,828 @@
+diff --git a/include/darwin/cobalt_gfx_runtime.h b/include/darwin/cobalt_gfx_runtime.h
+new file mode 100644
+index 0000000..d6c836c
+--- /dev/null
++++ b/include/darwin/cobalt_gfx_runtime.h
+@@ -0,0 +1,140 @@
++#ifndef COBALT_GFX_RUNTIME_H
++#define COBALT_GFX_RUNTIME_H
++
++#include "gpu_info.h"
++
++#define COBALT_GFX_RUNTIME_VERSION 1u
++#define COBALT_GFX_RUNTIME_PROPERTY "Cobalt,GfxRuntime-v1"
++#define COBALT_GFX_RUNTIME_VALID 1u
++
++struct cobalt_gfx_runtime_v1 {
++	uint32_t version;
++	uint32_t size;
++	uint32_t flags;
++	uint32_t gc_version;
++	uint32_t gb_addr_config;
++	uint32_t shader_engines;
++	uint32_t shader_arrays_per_engine;
++	uint32_t cu_per_array;
++	uint32_t render_backends_per_engine;
++	uint32_t active_sa_mask;
++	uint32_t active_rb_mask;
++	uint32_t active_cu_count;
++	uint32_t cu_bitmap[4][2];
++	uint32_t reserved[4];
++};
++
++#if defined(__cplusplus)
++static_assert(sizeof(struct cobalt_gfx_runtime_v1) == 96, "gfx runtime v1 wire size");
++static_assert(offsetof(struct cobalt_gfx_runtime_v1, cu_bitmap) == 48, "gfx runtime CU bitmap offset");
++static_assert(offsetof(struct cobalt_gfx_runtime_v1, reserved) == 80, "gfx runtime reserved offset");
++#else
++_Static_assert(sizeof(struct cobalt_gfx_runtime_v1) == 96, "gfx runtime v1 wire size");
++_Static_assert(offsetof(struct cobalt_gfx_runtime_v1, cu_bitmap) == 48, "gfx runtime CU bitmap offset");
++_Static_assert(offsetof(struct cobalt_gfx_runtime_v1, reserved) == 80, "gfx runtime reserved offset");
++#endif
++
++static inline uint32_t cobalt_gfx_runtime_v1_low_mask(uint32_t width)
++{
++	return width >= 32u ? UINT32_MAX : ((1u << width) - 1u);
++}
++
++static inline unsigned cobalt_gfx_runtime_v1_popcount(uint32_t bits)
++{
++	unsigned count = 0;
++	while (bits != 0) {
++		bits &= bits - 1u;
++		++count;
++	}
++	return count;
++}
++
++static inline int cobalt_gfx_runtime_v1_decode(
++	const void *bytes, size_t length,
++	const struct cobalt_gpu_info_v1 *identity,
++	struct cobalt_gfx_runtime_v1 *out)
++{
++	struct cobalt_gfx_runtime_v1 record;
++	struct cobalt_gpu_info_v1 checked_identity;
++	uint32_t total_sa, total_rb, rb_per_sa, cu_total = 0;
++	uint32_t valid_sa_mask, valid_rb_mask;
++	unsigned se, sa, i;
++
++	if (out == NULL) return 0;
++	if (bytes == NULL || length != sizeof(record)) {
++		memset(out, 0, sizeof(*out));
++		return 0;
++	}
++	memcpy(&record, bytes, sizeof(record));
++	memset(out, 0, sizeof(*out));
++	if (identity == NULL ||
++	    !cobalt_gpu_info_v1_decode(identity, sizeof(*identity), &checked_identity)) goto invalid;
++
++	if (record.version != COBALT_GFX_RUNTIME_VERSION || record.size != sizeof(record) ||
++	    record.flags != COBALT_GFX_RUNTIME_VALID) goto invalid;
++	if (checked_identity.gc_major > 0xffffu || checked_identity.gc_minor > 0xffu ||
++	    checked_identity.gc_revision > 0xffu ||
++	    record.gc_version != ((checked_identity.gc_major << 16) |
++	                          (checked_identity.gc_minor << 8) |
++	                          checked_identity.gc_revision)) goto invalid;
++	if (record.gb_addr_config == 0 || record.gb_addr_config == UINT32_MAX) goto invalid;
++	if (record.shader_engines != checked_identity.shader_engines ||
++	    record.shader_arrays_per_engine != checked_identity.shader_arrays_per_engine ||
++	    record.cu_per_array != checked_identity.cu_per_array ||
++	    record.render_backends_per_engine != checked_identity.render_backends_per_engine) goto invalid;
++
++	total_sa = checked_identity.shader_engines * checked_identity.shader_arrays_per_engine;
++	total_rb = checked_identity.shader_engines * checked_identity.render_backends_per_engine;
++	rb_per_sa = checked_identity.render_backends_per_engine /
++	            checked_identity.shader_arrays_per_engine;
++	valid_sa_mask = cobalt_gfx_runtime_v1_low_mask(total_sa);
++	valid_rb_mask = cobalt_gfx_runtime_v1_low_mask(total_rb);
++	if ((record.active_sa_mask & ~valid_sa_mask) != 0 ||
++	    record.active_sa_mask == 0 || (record.active_rb_mask & ~valid_rb_mask) != 0 ||
++	    record.active_rb_mask == 0) goto invalid;
++
++	for (se = 0; se < checked_identity.shader_engines; ++se) {
++		int se_has_cu = 0;
++		for (sa = 0; sa < checked_identity.shader_arrays_per_engine; ++sa) {
++			uint32_t sa_index = se * checked_identity.shader_arrays_per_engine + sa;
++			uint32_t bits = record.cu_bitmap[se][sa];
++			uint32_t valid_cu_mask = cobalt_gfx_runtime_v1_low_mask(checked_identity.cu_per_array);
++			if ((record.active_sa_mask & (1u << sa_index)) == 0) {
++				if (bits != 0) goto invalid;
++			} else if ((bits & ~valid_cu_mask) != 0) {
++				goto invalid;
++			}
++			for (i = 0; i < checked_identity.cu_per_array; i += 2u) {
++				uint32_t pair = (bits >> i) & 3u;
++				if (pair != 0 && pair != 3u) goto invalid;
++			}
++			cu_total += cobalt_gfx_runtime_v1_popcount(bits);
++			if (bits != 0) se_has_cu = 1;
++		}
++		for (sa = 0; sa < checked_identity.shader_arrays_per_engine; ++sa) {
++			uint32_t sa_index = se * checked_identity.shader_arrays_per_engine + sa;
++			uint32_t rb_start = se * checked_identity.render_backends_per_engine + sa * rb_per_sa;
++			uint32_t rb_mask = cobalt_gfx_runtime_v1_low_mask(rb_per_sa) << rb_start;
++			if ((record.active_rb_mask & rb_mask) != 0 &&
++			    ((record.active_sa_mask & (1u << sa_index)) == 0 || !se_has_cu)) goto invalid;
++		}
++	}
++	for (se = 0; se < checked_identity.shader_engines; ++se)
++		for (sa = checked_identity.shader_arrays_per_engine; sa < 2u; ++sa)
++			if (record.cu_bitmap[se][sa] != 0) goto invalid;
++	for (se = checked_identity.shader_engines; se < 4u; ++se)
++		for (sa = 0; sa < 2u; ++sa)
++			if (record.cu_bitmap[se][sa] != 0) goto invalid;
++	for (i = 0; i < 4u; ++i) if (record.reserved[i] != 0) goto invalid;
++	if (cu_total == 0 || cu_total != record.active_cu_count ||
++	    cu_total > checked_identity.max_compute_units) goto invalid;
++
++	*out = record;
++	return 1;
++
++invalid:
++	memset(out, 0, sizeof(*out));
++	return 0;
++}
++
++#endif
+diff --git a/include/darwin/gpu_info.h b/include/darwin/gpu_info.h
+new file mode 100644
+index 0000000..76d5a37
+--- /dev/null
++++ b/include/darwin/gpu_info.h
+@@ -0,0 +1 @@
++#include "cobalt_gpu_info.h"
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index dfdf475..2d1b929 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -8,6 +8,7 @@
+ #include "ac_darwin_kext.h"
+ #include "ac_darwin_budget.h"
+ #include "ac_darwin_identity.h"
++#include "ac_darwin_runtime.h"
+ 
+ #include <errno.h>
+ #include <pthread.h>
+@@ -16,7 +17,6 @@
+ #include <string.h>
+ 
+ #include "common/amd_family.h"
+-#include "common/amdgpu_devices.h"
+ #include "util/macros.h"
+ #include "util/u_math.h"
+ #include "util/u_sync_provider.h"
+@@ -59,6 +59,7 @@ struct amdgpu_bo {
+  * share one core, so the kext's one-client rule (contract D4) never trips inside a process.  The last
+  * device to go closes the connection. */
+ struct acd_core {
++   struct amdgpu_device device;
+    int refcount;
+    uint32_t minor; /* ABI minor the kernel reported */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
+@@ -72,7 +73,6 @@ struct acd_core {
+ struct acd_device {
+    bool host_bo; /* S1a stand-in */
+    uint32_t next_bo_handle;
+-   const struct amdgpu_device *canned;
+    struct acd_core *core;
+    struct util_sync_provider *sync; /* this device's clone of core->sync */
+    uint32_t next_ctx_id;
+@@ -144,6 +144,11 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+    }
+ 
+    const struct cobalt_gpu_info_v1 *identity = acd_kext_identity(kext);
++   const struct cobalt_gfx_runtime_v1 *runtime = acd_kext_runtime(kext);
++   if (identity && !runtime) {
++      fprintf(stderr, "radv-darwin: native GFX runtime snapshot is missing\n");
++      return -ENODEV;
++   }
+    if (identity && !acd_identity_gc_matches(identity, info.gc_version)) {
+       fprintf(stderr, "radv-darwin: live QueryInfo GC 0x%06x disagrees with "
+                       "Cobalt,GpuInfo-v1 GC %u.%u.%u\n", info.gc_version,
+@@ -162,7 +167,11 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+          return r;
+       }
+    }
+-   if (gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
++   if (runtime && !acd_runtime_live_matches(identity, runtime, info.gc_version, gb)) {
++      fprintf(stderr, "radv-darwin: live GC/GB_ADDR_CONFIG disagrees with Cobalt,GfxRuntime-v1\n");
++      return -ENODEV;
++   }
++   if (!runtime && gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
+       fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned gfx1201 0x%08x (set "
+                       "RADV_DARWIN_ALLOW_ADDRCFG=1 to override)\n",
+               gb, ACD_GB_ADDR_CONFIG_GFX1201);
+@@ -217,11 +226,15 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+       return -ENOMEM;
+    pthread_mutex_init(&c->bo_lock, NULL);
+    c->refcount = 1;
++   c->device = *canned;
+ 
+    if (!host_bo) {
+       int r = acd_kext_open(&c->kext);
++      if (r == 0 && acd_kext_identity(c->kext) &&
++          !acd_runtime_overlay(canned, acd_kext_identity(c->kext), acd_kext_runtime(c->kext), &c->device))
++         r = -ENODEV;
+       if (r == 0)
+-         r = acd_native_handshake(c->kext, canned, &c->minor);
++         r = acd_native_handshake(c->kext, &c->device, &c->minor);
+       if (r) {
+          acd_kext_destroy(c->kext);
+          pthread_mutex_destroy(&c->bo_lock);
+@@ -243,7 +256,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+       return -ENOMEM;
+    }
+ 
+-   const struct drm_amdgpu_info_device *di = &canned->dev;
++   const struct drm_amdgpu_info_device *di = &c->device.dev;
+    /* gfx12: RADV needs half of the VA range reserved for PRT, as on Linux. */
+    amdgpu_va_manager_init2(c->va_mgr, di->virtual_address_offset, di->virtual_address_max, di->high_va_offset,
+                            di->high_va_max, di->virtual_address_alignment, AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
+@@ -272,8 +285,8 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+    if (!dev)
+       return -ENOMEM;
+ 
+-   dev->canned = find_canned("gfx1201");
+-   if (!dev->canned) {
++   const struct amdgpu_device *canned = find_canned("gfx1201");
++   if (!canned) {
+       free(dev);
+       return -ENODEV;
+    }
+@@ -283,7 +296,7 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+ 
+    int r = 0;
+    if (dev->host_bo) {
+-      r = acd_core_create(dev->canned, true, &dev->core); /* private, no kext */
++      r = acd_core_create(canned, true, &dev->core); /* private, no kext */
+    } else {
+       pthread_mutex_lock(&g_core_lock);
+       if (g_core) {
+@@ -295,7 +308,7 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+             dev->core = g_core;
+          }
+       } else {
+-         r = acd_core_create(dev->canned, false, &g_core);
++         r = acd_core_create(canned, false, &g_core);
+          if (r == 0) {
+             g_core->shared = true;
+             dev->core = g_core;
+@@ -359,8 +372,8 @@ acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value)
+ {
+    switch (info) {
+    case amdgpu_sw_info_address32_hi:
+-      *(uint32_t *)value = (dev->canned->dev.high_va_offset ? dev->canned->dev.high_va_offset
+-                                                             : dev->canned->dev.virtual_address_offset) >> 32;
++      *(uint32_t *)value = (dev->core->device.dev.high_va_offset ? dev->core->device.dev.high_va_offset
++                                                               : dev->core->device.dev.virtual_address_offset) >> 32;
+       return 0;
+    case amdgpu_sw_info_address_prt_wa_control_bit:
+       return amdgpu_va_manager_query_sw_info(dev->core->va_mgr, amdgpu_va_manager_sw_info_address_prt_wa_control_bit,
+@@ -383,8 +396,8 @@ acd_va_range_query(acd_device_handle dev, enum amdgpu_gpu_va_range type, uint64_
+ {
+    if (type != amdgpu_gpu_va_range_general)
+       return -EINVAL;
+-   *start = dev->canned->dev.virtual_address_offset;
+-   *end = dev->canned->dev.virtual_address_max;
++   *start = dev->core->device.dev.virtual_address_offset;
++   *end = dev->core->device.dev.virtual_address_max;
+    return 0;
+ }
+ 
+@@ -459,7 +472,7 @@ acd_info_memory(struct acd_device *dev, const struct drm_amdgpu_info *info, void
+ static int
+ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+ {
+-   const struct amdgpu_device *d = dev->canned;
++   const struct amdgpu_device *d = &dev->core->device;
+    void *out = (void *)(uintptr_t)info->return_pointer;
+ 
+    switch (info->query) {
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+index 94e4191..f77b2a4 100644
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -68,7 +68,8 @@ iokit_close(void *ctx)
+ }
+ 
+ static int
+-iokit_read_identity(io_service_t svc, struct cobalt_gpu_info_v1 *identity)
++iokit_read_snapshot(io_service_t svc, struct cobalt_gpu_info_v1 *identity,
++                    struct cobalt_gfx_runtime_v1 *runtime)
+ {
+    io_registry_entry_t owner = svc;
+    bool release_owner = false;
+@@ -94,8 +95,6 @@ iokit_read_identity(io_service_t svc, struct cobalt_gpu_info_v1 *identity)
+ 
+    CFTypeRef property = IORegistryEntryCreateCFProperty(owner, CFSTR(COBALT_GPU_INFO_PROPERTY),
+                                                        kCFAllocatorDefault, 0);
+-   if (release_owner)
+-      IOObjectRelease(owner);
+    const char *reason;
+    if (!property) {
+       reason = acd_identity_decode(NULL, 0, identity);
+@@ -107,6 +106,21 @@ iokit_read_identity(io_service_t svc, struct cobalt_gpu_info_v1 *identity)
+    }
+    if (property)
+       CFRelease(property);
++   if (!reason) {
++      property = IORegistryEntryCreateCFProperty(owner, CFSTR(COBALT_GFX_RUNTIME_PROPERTY),
++                                                 kCFAllocatorDefault, 0);
++      if (!property)
++         reason = "missing Cobalt,GfxRuntime-v1; update the Cobalt kernel driver";
++      else if (CFGetTypeID(property) != CFDataGetTypeID())
++         reason = "Cobalt,GfxRuntime-v1 must be CFData";
++      else if (!cobalt_gfx_runtime_v1_decode(CFDataGetBytePtr((CFDataRef)property),
++                                              CFDataGetLength((CFDataRef)property), identity, runtime))
++         reason = "malformed Cobalt,GfxRuntime-v1";
++      if (property)
++         CFRelease(property);
++   }
++   if (release_owner)
++      IOObjectRelease(owner);
+    if (!reason)
+       return 0;
+    fprintf(stderr, "radv-darwin: native identity refused before IOServiceOpen: %s\n", reason);
+@@ -131,7 +145,8 @@ acd_kext_open_iokit(struct acd_kext **out)
+    }
+ 
+    struct cobalt_gpu_info_v1 identity = {0};
+-   int r = iokit_read_identity(svc, &identity);
++   struct cobalt_gfx_runtime_v1 runtime = {0};
++   int r = iokit_read_snapshot(svc, &identity, &runtime);
+    if (r) {
+       IOObjectRelease(svc);
+       return r;
+@@ -170,6 +185,6 @@ acd_kext_open_iokit(struct acd_kext **out)
+       .unmap = iokit_unmap,
+       .close = iokit_close,
+    };
+-   *out = acd_kext_create_with_identity(&ops, c, &identity);
++   *out = acd_kext_create_with_runtime(&ops, c, &identity, &runtime);
+    return *out ? 0 : -ENOMEM;
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index 6dbbd6e..bb8642f 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -74,6 +74,8 @@ struct acd_kext {
+    void *ctx;
+    bool has_identity;
+    struct cobalt_gpu_info_v1 identity;
++   bool has_runtime;
++   struct cobalt_gfx_runtime_v1 runtime;
+ };
+ 
+ /* G6: the service class of the N48N open. A pointer to one of the two string literals below (never to the caller's buffer). */
+@@ -108,6 +110,14 @@ acd_kext_create(const struct acd_kext_ops *ops, void *ctx)
+ struct acd_kext *
+ acd_kext_create_with_identity(const struct acd_kext_ops *ops, void *ctx,
+                               const struct cobalt_gpu_info_v1 *identity)
++{
++   return acd_kext_create_with_runtime(ops, ctx, identity, NULL);
++}
++
++struct acd_kext *
++acd_kext_create_with_runtime(const struct acd_kext_ops *ops, void *ctx,
++                             const struct cobalt_gpu_info_v1 *identity,
++                             const struct cobalt_gfx_runtime_v1 *runtime)
+ {
+    struct acd_kext *k = calloc(1, sizeof(*k));
+    if (!k) {
+@@ -121,6 +131,10 @@ acd_kext_create_with_identity(const struct acd_kext_ops *ops, void *ctx,
+       k->identity = *identity;
+       k->has_identity = true;
+    }
++   if (runtime) {
++      k->runtime = *runtime;
++      k->has_runtime = true;
++   }
+    return k;
+ }
+ 
+@@ -130,6 +144,12 @@ acd_kext_identity(const struct acd_kext *k)
+    return k && k->has_identity ? &k->identity : NULL;
+ }
+ 
++const struct cobalt_gfx_runtime_v1 *
++acd_kext_runtime(const struct acd_kext *k)
++{
++   return k && k->has_runtime ? &k->runtime : NULL;
++}
++
+ void
+ acd_kext_destroy(struct acd_kext *k)
+ {
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index 545c97b..ef87534 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -18,6 +18,7 @@
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "navi48_native_abi.h"
+ #include "cobalt_gpu_info.h"
++#include "cobalt_gfx_runtime.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -96,7 +97,11 @@ struct acd_kext;
+ struct acd_kext *acd_kext_create(const struct acd_kext_ops *ops, void *ctx);
+ struct acd_kext *acd_kext_create_with_identity(const struct acd_kext_ops *ops, void *ctx,
+                                              const struct cobalt_gpu_info_v1 *identity);
++struct acd_kext *acd_kext_create_with_runtime(const struct acd_kext_ops *ops, void *ctx,
++                                            const struct cobalt_gpu_info_v1 *identity,
++                                            const struct cobalt_gfx_runtime_v1 *runtime);
+ const struct cobalt_gpu_info_v1 *acd_kext_identity(const struct acd_kext *k);
++const struct cobalt_gfx_runtime_v1 *acd_kext_runtime(const struct acd_kext *k);
+ void acd_kext_destroy(struct acd_kext *k);
+ 
+ /* Backend selection: RADV_DARWIN_MOCK=1 gives the in-process mock, otherwise the
+diff --git a/src/amd/common/darwin/ac_darwin_runtime.h b/src/amd/common/darwin/ac_darwin_runtime.h
+new file mode 100644
+index 0000000..457b4b9
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_runtime.h
+@@ -0,0 +1,62 @@
++#ifndef AC_DARWIN_RUNTIME_H
++#define AC_DARWIN_RUNTIME_H
++
++#include <stdbool.h>
++#include <string.h>
++
++#include "common/amdgpu_devices.h"
++#include "cobalt_gfx_runtime.h"
++
++static inline bool
++acd_runtime_live_matches(const struct cobalt_gpu_info_v1 *identity,
++                         const struct cobalt_gfx_runtime_v1 *runtime,
++                         uint32_t gc_version, uint32_t gb_addr_config)
++{
++   return identity && runtime &&
++          runtime->gc_version == ((identity->gc_major << 16) | (identity->gc_minor << 8) |
++                                  identity->gc_revision) &&
++          runtime->gc_version == gc_version && runtime->gb_addr_config == gb_addr_config;
++}
++
++static inline bool
++acd_runtime_overlay(const struct amdgpu_device *canned, const struct cobalt_gpu_info_v1 *identity,
++                    const struct cobalt_gfx_runtime_v1 *runtime, struct amdgpu_device *out)
++{
++   struct cobalt_gfx_runtime_v1 decoded;
++   if (!identity || identity->gfx_target != COBALT_GPU_GFX_TARGET_1201 || !runtime ||
++       !cobalt_gfx_runtime_v1_decode(runtime, sizeof(*runtime), identity, &decoded))
++      return false;
++
++   bool found = false;
++   for (uint32_t i = 0; i < canned->mmr_reg_count; i++)
++      found |= canned->mmr_regs[i * 3] == 0x263e;
++   if (!found)
++      return false;
++
++   *out = *canned;
++   out->dev.device_id = identity->pci_device;
++   out->dev.pci_rev = identity->pci_revision;
++   out->dev.num_shader_engines = decoded.shader_engines;
++   out->dev.num_shader_arrays_per_engine = decoded.shader_arrays_per_engine;
++   out->dev.num_cu_per_sh = decoded.cu_per_array;
++   out->dev.cu_active_number = decoded.active_cu_count;
++   memset(out->dev.cu_bitmap, 0, sizeof(out->dev.cu_bitmap));
++   for (uint32_t se = 0; se < decoded.shader_engines; se++)
++      for (uint32_t sa = 0; sa < decoded.shader_arrays_per_engine; sa++)
++         out->dev.cu_bitmap[se][sa] = decoded.cu_bitmap[se][sa];
++   out->dev.enabled_rb_pipes_mask = decoded.active_rb_mask;
++   out->dev.enabled_rb_pipes_mask_hi = 0;
++   out->dev.num_rb_pipes = decoded.shader_engines * decoded.render_backends_per_engine;
++   out->hw_ip_gfx.hw_ip_version_major = decoded.gc_version >> 16;
++   out->hw_ip_gfx.hw_ip_version_minor = (decoded.gc_version >> 8) & 0xff;
++   out->hw_ip_gfx.ip_discovery_version = decoded.gc_version;
++   out->hw_ip_compute.hw_ip_version_major = decoded.gc_version >> 16;
++   out->hw_ip_compute.hw_ip_version_minor = (decoded.gc_version >> 8) & 0xff;
++   out->hw_ip_compute.ip_discovery_version = decoded.gc_version;
++   for (uint32_t i = 0; i < out->mmr_reg_count; i++)
++      if (out->mmr_regs[i * 3] == 0x263e)
++         out->mmr_regs[i * 3 + 2] = decoded.gb_addr_config;
++   return true;
++}
++
++#endif
+diff --git a/src/amd/common/darwin/test/acd_iokit_test.c b/src/amd/common/darwin/test/acd_iokit_test.c
+index 59d328a..ed02cd7 100644
+--- a/src/amd/common/darwin/test/acd_iokit_test.c
++++ b/src/amd/common/darwin/test/acd_iokit_test.c
+@@ -19,25 +19,32 @@ void *acd_test_calloc(size_t count, size_t size)
+ 
+ enum { BRINGUP = 1, ACCELERATOR, NUB, WRONG };
+ static struct cobalt_gpu_info_v1 wire;
++static struct cobalt_gfx_runtime_v1 runtime_wire;
+ static unsigned refs[5], matches, opens, closes, property_refs, reads;
++static unsigned runtime_refs, runtime_reads;
+ static io_service_t selected;
+ static io_registry_entry_t nub_parent, accelerator_parent;
+ static int property_kind, parent_failure, open_error;
+ static CFIndex wire_length;
++static CFIndex runtime_length;
++static int runtime_kind;
+ 
+ static void reset(void)
+ {
+    for (unsigned i = 0; i < 5; i++)
+       assert(refs[i] == 0);
+    assert(property_refs == 0);
++   assert(runtime_refs == 0);
+ #ifdef ACD_TEST_ALLOCATOR
+    alloc_calls = fail_alloc_call = 0;
+ #endif
+    matches = opens = closes = reads = 0;
++   runtime_reads = 0;
+    selected = BRINGUP;
+    nub_parent = BRINGUP;
+    accelerator_parent = NUB;
+    property_kind = 1;
++   runtime_kind = 1;
+    parent_failure = open_error = 0;
+    wire_length = sizeof(wire);
+    wire = (struct cobalt_gpu_info_v1){
+@@ -49,6 +56,15 @@ static void reset(void)
+       .cu_per_array = 8, .max_compute_units = 64,
+       .render_backends_per_engine = 4, .max_waves_per_simd = 16,
+    };
++   runtime_length = sizeof(runtime_wire);
++   runtime_wire = (struct cobalt_gfx_runtime_v1){
++      .version = 1, .size = sizeof(runtime_wire), .flags = COBALT_GFX_RUNTIME_VALID,
++      .gc_version = 0x0c0001, .gb_addr_config = 0x08200544,
++      .shader_engines = 4, .shader_arrays_per_engine = 2, .cu_per_array = 8,
++      .render_backends_per_engine = 4, .active_sa_mask = 0xff,
++      .active_rb_mask = 0xfff3, .active_cu_count = 60,
++      .cu_bitmap = {{0x3f, 0x3f}, {0xff, 0xff}, {0xff, 0xff}, {0xff, 0xff}},
++   };
+ }
+ 
+ CFMutableDictionaryRef IOServiceMatching(const char *name)
+@@ -91,39 +107,60 @@ CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, const char
+ {
+    (void)allocator; (void)options;
+    assert(refs[entry] && entry == BRINGUP);
+-   assert(!strcmp(key, COBALT_GPU_INFO_PROPERTY));
+-   reads++;
+-   if (!property_kind)
++   if (!strcmp(key, COBALT_GPU_INFO_PROPERTY)) {
++      reads++;
++      if (!property_kind)
++         return NULL;
++      property_refs++;
++      return &wire;
++   }
++   assert(!strcmp(key, COBALT_GFX_RUNTIME_PROPERTY));
++   assert(reads == 1 && property_refs == 0);
++   runtime_reads++;
++   if (!runtime_kind)
+       return NULL;
+-   property_refs++;
+-   return &wire;
++   runtime_refs++;
++   return &runtime_wire;
+ }
+ CFTypeID CFGetTypeID(CFTypeRef property)
+ {
+-   assert(property == &wire && property_refs);
+-   return property_kind;
++   if (property == &wire) {
++      assert(property_refs);
++      return property_kind;
++   }
++   assert(property == &runtime_wire && runtime_refs);
++   return runtime_kind;
+ }
+ CFTypeID CFDataGetTypeID(void) { return 1; }
+ const uint8_t *CFDataGetBytePtr(CFDataRef property)
+ {
+-   assert(property == &wire && property_refs);
+-   return (const uint8_t *)&wire;
++   assert((property == &wire && property_refs) || (property == &runtime_wire && runtime_refs));
++   return (const uint8_t *)property;
+ }
+ CFIndex CFDataGetLength(CFDataRef property)
+ {
+-   assert(property == &wire && property_refs);
+-   return wire_length;
++   if (property == &wire) {
++      assert(property_refs);
++      return wire_length;
++   }
++   assert(property == &runtime_wire && runtime_refs);
++   return runtime_length;
+ }
+ void CFRelease(CFTypeRef property)
+ {
+-   assert(property == &wire && property_refs);
+-   property_refs--;
++   if (property == &wire) {
++      assert(property_refs);
++      property_refs--;
++   } else {
++      assert(property == &runtime_wire && runtime_refs);
++      runtime_refs--;
++   }
+ }
+ kern_return_t IOServiceOpen(io_service_t service, mach_port_t task, uint32_t type, io_connect_t *conn)
+ {
+    (void)task;
+    assert(service == selected && refs[service] && type == N48N_UC_TYPE);
+-   assert(reads == 1 && property_refs == 0);
++   assert(reads == 1 && runtime_reads == 1 && property_refs == 0 && runtime_refs == 0);
+    opens++;
+    if (open_error)
+       return open_error;
+@@ -169,6 +206,7 @@ static void rejected(void)
+    for (unsigned i = 0; i < 5; i++)
+       assert(refs[i] == 0);
+    assert(property_refs == 0);
++   assert(runtime_refs == 0);
+ }
+ 
+ int main(void)
+@@ -179,11 +217,20 @@ int main(void)
+    const struct cobalt_gpu_info_v1 *snapshot = acd_kext_identity(k);
+    assert(snapshot && snapshot != &wire && snapshot->pci_device == 0x7551);
+    assert(snapshot->pci_revision == 0xc8 && snapshot->pci_subsystem_device == 0xe499);
++   const struct cobalt_gfx_runtime_v1 *runtime_snapshot = acd_kext_runtime(k);
++   assert(runtime_snapshot && runtime_snapshot != &runtime_wire);
++   assert(runtime_snapshot->active_cu_count == 60 && runtime_snapshot->active_rb_mask == 0xfff3);
++   assert(runtime_snapshot->cu_bitmap[0][0] == 0x3f && runtime_snapshot->gb_addr_config == 0x08200544);
+    wire.pci_device = 0x7550;
++   runtime_wire.active_cu_count = 64;
++   runtime_wire.gb_addr_config = 0x08200545;
+    selected = ACCELERATOR;
+-   for (unsigned i = 0; i < 10; i++)
++   for (unsigned i = 0; i < 10; i++) {
+       assert(acd_kext_identity(k) == snapshot && snapshot->pci_device == 0x7551);
+-   assert(matches == 1 && reads == 1 && opens == 1 && closes == 0);
++      assert(acd_kext_runtime(k) == runtime_snapshot && runtime_snapshot->active_cu_count == 60);
++      assert(runtime_snapshot->gb_addr_config == 0x08200544);
++   }
++   assert(matches == 1 && reads == 1 && runtime_reads == 1 && opens == 1 && closes == 0);
+    acd_kext_destroy(k);
+    assert(closes == 1);
+ 
+@@ -192,6 +239,7 @@ int main(void)
+    assert(acd_kext_set_service_class(ACD_SERVICE_ACCELERATOR) == 0);
+    assert(acd_kext_open_iokit(&k) == 0);
+    assert(acd_kext_identity(k)->pci_device == 0x7551);
++   assert(acd_kext_runtime(k)->active_cu_count == 60);
+    acd_kext_destroy(k);
+    assert(closes == 1);
+ 
+@@ -201,6 +249,22 @@ int main(void)
+    reset(); wire.version++; rejected();
+    reset(); wire.reserved[0] = 1; rejected();
+    reset(); wire.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED; rejected();
++   reset(); runtime_kind = 0; rejected();
++   reset(); runtime_kind = 2; rejected();
++   reset(); runtime_length--; rejected();
++   reset(); runtime_length++; rejected();
++   reset(); runtime_length = -1; rejected();
++   reset(); runtime_wire.version++; rejected();
++   reset(); runtime_wire.size--; rejected();
++   reset(); runtime_wire.flags = 0; rejected();
++   reset(); runtime_wire.reserved[0] = 1; rejected();
++   reset(); runtime_wire.gc_version = 0x0c0000; rejected();
++   reset(); runtime_wire.cu_per_array = 16; rejected();
++   reset(); runtime_wire.active_cu_count++; rejected();
++   reset(); runtime_wire.cu_bitmap[0][0] = 0x3e; rejected();
++   reset(); runtime_wire.active_rb_mask |= 0x10000; rejected();
++   reset(); runtime_wire.active_sa_mask = 0xfe; rejected();
++   reset(); runtime_wire.gb_addr_config = 0; rejected();
+    reset(); wire.pci_device = 0x7590; wire.gfx_target = 1200; wire.gc_revision = 0;
+    wire.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED; rejected();
+    reset(); selected = ACCELERATOR; parent_failure = ACCELERATOR; rejected();
+@@ -227,9 +291,10 @@ int main(void)
+ 
+    const struct acd_kext_ops ops = {0};
+    k = acd_kext_create(&ops, NULL);
+-   assert(k && acd_kext_identity(k) == NULL);
++   assert(k && acd_kext_identity(k) == NULL && acd_kext_runtime(k) == NULL);
+    acd_kext_destroy(k);
+    assert(acd_kext_identity(NULL) == NULL);
++   assert(acd_kext_runtime(NULL) == NULL);
+    puts("acd_iokit_test: passed");
+    return 0;
+ }
+diff --git a/src/amd/common/darwin/test/acd_runtime_test.c b/src/amd/common/darwin/test/acd_runtime_test.c
+new file mode 100644
+index 0000000..33581f0
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_runtime_test.c
+@@ -0,0 +1,113 @@
++#include "ac_darwin_runtime.h"
++#include "ac_darwin_identity.h"
++
++#include <assert.h>
++#include <stdio.h>
++
++int main(void)
++{
++   struct cobalt_gpu_info_v1 identity = {
++      .version = 1, .size = sizeof(identity), .flags = 3,
++      .pci_vendor = 0x1002, .pci_device = 0x7551, .pci_revision = 0xc8,
++      .gfx_target = 1201, .gc_major = 12, .gc_revision = 1,
++      .shader_engines = 4, .shader_arrays_per_engine = 2, .wgp_per_array = 4,
++      .cu_per_array = 8, .max_compute_units = 64,
++      .render_backends_per_engine = 4, .max_waves_per_simd = 16,
++   };
++   struct cobalt_gfx_runtime_v1 runtime = {
++      .version = 1, .size = sizeof(runtime), .flags = COBALT_GFX_RUNTIME_VALID,
++      .gc_version = 0xc0001, .gb_addr_config = 0x08200544,
++      .shader_engines = 4, .shader_arrays_per_engine = 2, .cu_per_array = 8,
++      .render_backends_per_engine = 4, .active_sa_mask = 0x7f,
++      .active_rb_mask = 0x3ff3, .active_cu_count = 38,
++      .cu_bitmap = {{0x3f, 0xcf}, {0xff, 0xf}, {0xf0, 0x3}, {0xff, 0}},
++   };
++   struct cobalt_gfx_runtime_v1 decoded;
++   assert(cobalt_gfx_runtime_v1_decode(&runtime, sizeof(runtime), &identity, &decoded));
++   assert(acd_runtime_live_matches(&identity, &runtime, 0xc0001, 0x08200544));
++   assert(!acd_runtime_live_matches(&identity, &runtime, 0xc0000, 0x08200544));
++   assert(!acd_runtime_live_matches(&identity, &runtime, 0xc0001, 0x08200545));
++   assert(!acd_runtime_live_matches(NULL, &runtime, 0xc0001, 0x08200544));
++   assert(!acd_runtime_live_matches(&identity, NULL, 0xc0001, 0x08200544));
++
++   struct amdgpu_device canned = {
++      .name = "gfx1201", .radeon_family = CHIP_GFX1201,
++      .hw_ip_gfx = {.hw_ip_version_major = 10, .hw_ip_version_minor = 1,
++                    .available_rings = 1, .ip_discovery_version = 0xa0100},
++      .hw_ip_compute = {.hw_ip_version_major = 10, .hw_ip_version_minor = 1,
++                        .available_rings = 15, .ip_discovery_version = 0xa0100},
++      .fw_gfx_me = {.ver = 2590, .feature = 29},
++      .fw_gfx_pfp = {.ver = 2630, .feature = 29},
++      .fw_gfx_mec = {.ver = 2800, .feature = 29},
++      .mmr_regs = {0x263e, UINT32_MAX, 0x08200545, 0x1000, UINT32_MAX, 0x12345678},
++      .mmr_reg_count = 2,
++      .dev = {
++         .device_id = 0x7550, .pci_rev = 0xc0,
++         .num_shader_engines = 4, .num_shader_arrays_per_engine = 2,
++         .num_cu_per_sh = 8, .cu_active_number = 64,
++         .cu_bitmap = {{0xff, 0xff, 0xff, 0xff}, {0xff, 0xff, 0xff, 0xff},
++                       {0xff, 0xff, 0xff, 0xff}, {0xff, 0xff, 0xff, 0xff}},
++         .enabled_rb_pipes_mask = 0xffff, .num_rb_pipes = 16,
++         .gpu_counter_freq = 100000, .max_engine_clock = 2460000,
++         .max_memory_clock = 1258000, .gl2c_cache_size = 8192,
++         .virtual_address_offset = 0x10000, .virtual_address_max = UINT64_C(0x800000000000),
++      },
++      .mem = {.vram = {.total_heap_size = UINT64_C(17095983104)}},
++   };
++   struct amdgpu_device original = canned, expected = canned, out;
++   expected.dev.device_id = 0x7551;
++   expected.dev.pci_rev = 0xc8;
++   expected.dev.cu_active_number = 38;
++   memset(expected.dev.cu_bitmap, 0, sizeof(expected.dev.cu_bitmap));
++   for (unsigned se = 0; se < 4; se++)
++      for (unsigned sa = 0; sa < 2; sa++)
++         expected.dev.cu_bitmap[se][sa] = runtime.cu_bitmap[se][sa];
++   expected.dev.enabled_rb_pipes_mask = 0x3ff3;
++   expected.mmr_regs[2] = 0x08200544;
++   expected.hw_ip_gfx.hw_ip_version_major = expected.hw_ip_compute.hw_ip_version_major = 12;
++   expected.hw_ip_gfx.hw_ip_version_minor = expected.hw_ip_compute.hw_ip_version_minor = 0;
++   expected.hw_ip_gfx.ip_discovery_version = expected.hw_ip_compute.ip_discovery_version = 0xc0001;
++   assert(acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(!memcmp(&out, &expected, sizeof(out)));
++   assert(!memcmp(&canned, &original, sizeof(canned)));
++   assert(out.dev.num_rb_pipes == 16 && out.dev.cu_active_number == 38);
++   assert(out.dev.enabled_rb_pipes_mask != 0xffff && out.dev.cu_bitmap[3][1] == 0);
++   runtime.cu_bitmap[0][0] = 0xff;
++   assert(out.dev.cu_bitmap[0][0] == 0x3f);
++   assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(!memcmp(&out, &expected, sizeof(out)));
++   assert(!memcmp(&out, &expected, sizeof(out)));
++   runtime.cu_bitmap[0][0] = 0x3f;
++   assert(!acd_runtime_overlay(&canned, &identity, NULL, &out));
++   canned.mmr_reg_count = 0;
++   assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   canned = original;
++
++   identity.shader_engines = runtime.shader_engines = 2;
++   identity.max_compute_units = 32;
++   identity.render_backends_per_engine = runtime.render_backends_per_engine = 2;
++   runtime.active_sa_mask = 0xf;
++   runtime.active_rb_mask = 0x7;
++   runtime.active_cu_count = 24;
++   memset(runtime.cu_bitmap, 0, sizeof(runtime.cu_bitmap));
++   runtime.cu_bitmap[0][0] = runtime.cu_bitmap[0][1] = 0xff;
++   runtime.cu_bitmap[1][0] = runtime.cu_bitmap[1][1] = 0xf;
++   assert(acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   assert(out.dev.num_shader_engines == 2 && out.dev.num_shader_arrays_per_engine == 2);
++   assert(out.dev.num_cu_per_sh == 8 && out.dev.cu_active_number == 24);
++   assert(out.dev.num_rb_pipes == 4 && out.dev.enabled_rb_pipes_mask == 0x7);
++   assert(out.dev.cu_bitmap[2][0] == 0 && out.dev.cu_bitmap[3][1] == 0);
++   assert(out.hw_ip_gfx.ip_discovery_version == 0xc0001);
++   assert(out.hw_ip_compute.ip_discovery_version == 0xc0001);
++
++   identity.flags &= ~COBALT_GPU_INFO_BRINGUP_ENABLED;
++   identity.pci_device = 0x7590;
++   identity.gfx_target = 1200;
++   identity.gc_revision = 0;
++   runtime.gc_version = 0xc0000;
++   assert(cobalt_gfx_runtime_v1_decode(&runtime, sizeof(runtime), &identity, &decoded));
++   assert(acd_identity_decode(&identity, sizeof(identity), &identity));
++   assert(!acd_runtime_overlay(&canned, &identity, &runtime, &out));
++   puts("acd_runtime_test: passed");
++   return 0;
++}

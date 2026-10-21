@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
@@ -243,6 +244,37 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
                 self.assertEqual(collector.main(["--output", str(output)]), 2)
                 self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
+
+    def test_drm_runtime_partial_writes_report_and_returns_partial_status(self):
+        report = {
+            "complete": True,
+            "gpu": {"bdf": "0000:09:00.0", "ip_discovery": {"enumerated_num_ips": 5},
+                    "drm_runtime": {"complete": False, "errors": [{"query": "fw_vpe", "error": "unsupported"}]}},
+        }
+        with tempfile.TemporaryDirectory(prefix="capture-drm-partial-") as tmp:
+            output = Path(tmp) / "capture.json"
+            stderr = io.StringIO()
+            with mock.patch.object(collector.sys, "platform", "linux"), \
+                    mock.patch.object(collector, "collect", return_value=report), \
+                    mock.patch.object(collector.sys, "stderr", stderr):
+                result = collector.main(["--drm-info", "--output", str(output)])
+            self.assertEqual(result, 1)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
+            self.assertIn("gpu.drm_runtime.errors", stderr.getvalue())
+
+    def test_drm_runtime_and_sysfs_complete_returns_success(self):
+        report = {
+            "complete": True,
+            "gpu": {"bdf": "0000:09:00.0", "ip_discovery": {"enumerated_num_ips": 5},
+                    "drm_runtime": {"complete": True, "errors": []}},
+        }
+        with tempfile.TemporaryDirectory(prefix="capture-drm-complete-") as tmp:
+            output = Path(tmp) / "capture.json"
+            with mock.patch.object(collector.sys, "platform", "linux"), \
+                    mock.patch.object(collector, "collect", return_value=report):
+                result = collector.main(["--drm-info", "--output", str(output)])
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
 
     def test_non_linux_refuses_to_collect(self):
         with mock.patch.object(collector.sys, "platform", "win32"), mock.patch.object(collector, "collect") as collect_mock:
