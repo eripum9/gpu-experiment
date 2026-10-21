@@ -58,6 +58,7 @@
 
 #include "amdgpu_psp.h"
 #include "amdgpu_ucode_psp.h"
+#include "../psp_container.hpp"
 #include "amdgpu_log.h"
 
 // bzero comes from the kernel's string.h via IOKit/IOLib.h (amdgpu_regs.h
@@ -1361,10 +1362,36 @@ psp_parse_sos_microcode(PSPContext &psp,
         psp.ipkeymgr_drv = psp.spdm_drv = psp.sys_drv_aux =
         psp.sos_aux = PSPContext::PSPSubBin{};
 
+    psp.sos_fw_blob = nullptr;
+    psp.sos_fw_blob_size = 0;
+
     if (fw_data == nullptr || fw_size < sizeof(common_firmware_header)) {
         PSP_LOG("parse_sos: fw_data null or too small (%llu)",
                 (unsigned long long)fw_size);
         return kIOReturnBadArgument;
+    }
+
+    if (cobalt::psp::le16(fw_data + 8) == 2) {
+        cobalt::psp::Package package{};
+        if (!cobalt::psp::parse(fw_data, fw_size, package)) {
+            PSP_LOG("parse_sos: invalid or unsupported PSP v2 container");
+            return kIOReturnBadArgument;
+        }
+        psp.sos = {package.part[cobalt::psp::Sos].data, package.part[cobalt::psp::Sos].size, package.part[cobalt::psp::Sos].version};
+        psp.sys = {package.part[cobalt::psp::SysDrv].data, package.part[cobalt::psp::SysDrv].size, package.part[cobalt::psp::SysDrv].version};
+        psp.kdb = {package.part[cobalt::psp::Kdb].data, package.part[cobalt::psp::Kdb].size, package.part[cobalt::psp::Kdb].version};
+        psp.toc = {package.part[cobalt::psp::Toc].data, package.part[cobalt::psp::Toc].size, package.part[cobalt::psp::Toc].version};
+        psp.spl = {package.part[cobalt::psp::Spl].data, package.part[cobalt::psp::Spl].size, package.part[cobalt::psp::Spl].version};
+        psp.rl = {package.part[cobalt::psp::Rl].data, package.part[cobalt::psp::Rl].size, package.part[cobalt::psp::Rl].version};
+        psp.soc_drv = {package.part[cobalt::psp::SocDrv].data, package.part[cobalt::psp::SocDrv].size, package.part[cobalt::psp::SocDrv].version};
+        psp.intf_drv = {package.part[cobalt::psp::IntfDrv].data, package.part[cobalt::psp::IntfDrv].size, package.part[cobalt::psp::IntfDrv].version};
+        psp.dbg_drv = {package.part[cobalt::psp::DbgDrv].data, package.part[cobalt::psp::DbgDrv].size, package.part[cobalt::psp::DbgDrv].version};
+        psp.ras_drv = {package.part[cobalt::psp::RasDrv].data, package.part[cobalt::psp::RasDrv].size, package.part[cobalt::psp::RasDrv].version};
+        psp.ipkeymgr_drv = {package.part[cobalt::psp::IpKeyMgrDrv].data, package.part[cobalt::psp::IpKeyMgrDrv].size, package.part[cobalt::psp::IpKeyMgrDrv].version};
+        psp.spdm_drv = {package.part[cobalt::psp::SpdmDrv].data, package.part[cobalt::psp::SpdmDrv].size, package.part[cobalt::psp::SpdmDrv].version};
+        psp.sos_fw_blob = fw_data;
+        psp.sos_fw_blob_size = fw_size;
+        return kIOReturnSuccess;
     }
 
     auto *hdr = reinterpret_cast<const common_firmware_header *>(fw_data);
@@ -1381,9 +1408,6 @@ psp_parse_sos_microcode(PSPContext &psp,
             hdr->header_version_major, hdr->header_version_minor,
             hdr->ip_version_major, hdr->ip_version_minor,
             hdr->ucode_size_bytes, ucode_off, hdr->size_bytes);
-
-    psp.sos_fw_blob      = fw_data;
-    psp.sos_fw_blob_size = fw_size;
 
     switch (hdr->header_version_major) {
     case 1: {
@@ -1437,78 +1461,8 @@ psp_parse_sos_microcode(PSPContext &psp,
                         h13->sos_aux.size_bytes,
                         h13->sos_aux.fw_version);
         }
-        return kIOReturnSuccess;
-    }
-    case 2: {
-        // v2.0/v2.1: flexible array of psp_fw_bin_desc tagged by fw_type.
-        // v2.1 has an extra `psp_aux_fw_bin_index` field we don't need (only
-        // relevant for chips with auxiliary SOS variants we don't support).
-        auto *h20 = reinterpret_cast<const psp_firmware_header_v2_0 *>(fw_data);
-        const psp_fw_bin_desc *bin = h20->psp_fw_bin;
-        uint32_t count = h20->psp_fw_bin_count;
-        if (hdr->header_version_minor == 1) {
-            auto *h21 = reinterpret_cast<const psp_firmware_header_v2_1 *>(fw_data);
-            bin = h21->psp_fw_bin;
-        }
-        if (count > 64) {
-            PSP_LOG("parse_sos: implausible bin_count=%u", count);
-            return kIOReturnBadArgument;
-        }
-        for (uint32_t i = 0; i < count; i++) {
-            const auto &d = bin[i];
-            switch (d.fw_type) {
-            case PSP_FW_TYPE_PSP_SOS:
-                set_sub_bin(psp.sos, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_SYS_DRV:
-                set_sub_bin(psp.sys, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_KDB:
-                set_sub_bin(psp.kdb, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_TOC:
-                set_sub_bin(psp.toc, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_SPL:
-                set_sub_bin(psp.spl, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_RL:
-                set_sub_bin(psp.rl, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_SOC_DRV:
-                set_sub_bin(psp.soc_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_INTF_DRV:
-                set_sub_bin(psp.intf_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_DBG_DRV:
-                set_sub_bin(psp.dbg_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_RAS_DRV:
-                set_sub_bin(psp.ras_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_IPKEYMGR_DRV:
-                set_sub_bin(psp.ipkeymgr_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            case PSP_FW_TYPE_PSP_SPDM_DRV:
-                set_sub_bin(psp.spdm_drv, ucode_base, d.offset_bytes, d.size_bytes, d.fw_version);
-                break;
-            default:
-                PSP_LOG("parse_sos: ignoring unknown fw_type=%u "
-                        "(offset=%#x size=%u)",
-                        d.fw_type, d.offset_bytes, d.size_bytes);
-                break;
-            }
-        }
-        PSP_LOG("parse_sos: %u sub-images — SOS %llu (ver %#x) TOC %llu "
-                "(ver %#x) RL %llu (ver %#x) KDB %llu SPL %llu SYS %llu",
-                count,
-                (unsigned long long)psp.sos.size_bytes, psp.sos.fw_version,
-                (unsigned long long)psp.toc.size_bytes, psp.toc.fw_version,
-                (unsigned long long)psp.rl.size_bytes,  psp.rl.fw_version,
-                (unsigned long long)psp.kdb.size_bytes,
-                (unsigned long long)psp.spl.size_bytes,
-                (unsigned long long)psp.sys.size_bytes);
+        psp.sos_fw_blob = fw_data;
+        psp.sos_fw_blob_size = fw_size;
         return kIOReturnSuccess;
     }
     default:

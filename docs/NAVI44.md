@@ -11,6 +11,10 @@ the bring-up refusal described below.
 
 ## Implemented
 
+- Both v2 PSP loader paths share a bounded firmware-container parser adapted
+  from the newer RX4Darwin code. They require a complete primary SOS/SYS_DRV
+  package and discard partial parsing state. This does not enable firmware
+  loading on Navi 44. See [PSP container validation](PSP-CONTAINER.md).
 - Shared, freestanding GPU profiles distinguish Navi 48 / gfx1201 from
   Navi 44 / gfx1200. Navi 44 is recognized but driver bring-up remains disabled.
 - Both probe and start reject disabled or unknown devices before hardware

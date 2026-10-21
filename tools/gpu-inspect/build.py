@@ -70,6 +70,39 @@ def test_smu_transport(cxx):
     run([output, ROOT])
 
 
+def test_psp_containers(cxx):
+    parser_test = compile_host(cxx, "psp-container-test", [TESTS / "psp_container_test.cpp"])
+    # Firmware is optional in host-only checkouts. CI repeats these executables
+    # with both SHA-pinned packages after the dependency-fetch step.
+    firmware = [ROOT / "src/navi48-bringup/firmware" / f"psp_14_0_{minor}_sos.bin"
+                for minor in (2, 3)]
+    firmware = [path for path in firmware if path.is_file()]
+    run([parser_test, *firmware])
+    output = BUILD / ("psp-adapter-test.exe" if os.name == "nt" else "psp-adapter-test")
+    sources = [TESTS / "psp_container_test.cpp", SRC / "psp.cpp", SRC / "amd/psp_v14_0.cpp"]
+    if Path(cxx).stem.lower() in ("cl", "clang-cl"):
+        objects = []
+        for source in sources:
+            obj = BUILD / f"psp-adapter_{source.stem}.obj"
+            # Existing GNU flexible-array ABI headers are parsed by MSVC with
+            # the host shim removing attributes/assembly; SDK compilation still
+            # checks the real kernel declarations and instruction syntax.
+            run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/wd4200",
+                 "/DPSP_ADAPTER_TEST", f"/I{TESTS / 'pspshim'}", f"/I{SRC}",
+                 "/c", source, f"/Fo{obj}"])
+            objects.append(obj)
+        run([cxx, "/nologo", *objects, f"/Fe{output}"])
+    else:
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O1",
+             "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+             # The complete real TUs include x86 fence helpers. Parser tests
+             # never call hardware paths; omit their assembly on ARM hosts.
+             "-D__asm__=", "-D__volatile__(...)=",
+             "-DPSP_ADAPTER_TEST", "-I", TESTS / "pspshim", "-I", SRC,
+             *sources, "-o", output])
+    run([output, *firmware])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("build", "test", "all"), nargs="?", default="all")
@@ -83,6 +116,7 @@ def main():
     inspector = compile_host(cxx, "gpu-inspect", [ROOT / "tools/gpu-inspect/main.cpp", SRC / "ipdiscovery.cpp"])
     if args.action == "build":
         return
+    test_psp_containers(cxx)
     profile_test = compile_host(cxx, "gpu-profile-test", [TESTS / "gpu_profile_test.cpp"])
     discovery_test = compile_host(cxx, "ipdiscovery-test", [TESTS / "ipdiscovery_test.cpp", SRC / "ipdiscovery.cpp"])
     firmware_test = compile_host(cxx, "fw-profile-test", [TESTS / "fw_profile_test.cpp",

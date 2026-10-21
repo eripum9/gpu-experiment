@@ -62,6 +62,15 @@ jobs:
       - name: Fetch pinned compile dependencies
         run: python3 tools/ci/fetch_deps.py
 
+      - name: Validate both pinned PSP firmware containers
+        run: |
+          build/gpu-inspect/psp-container-test \
+            src/navi48-bringup/firmware/psp_14_0_2_sos.bin \
+            src/navi48-bringup/firmware/psp_14_0_3_sos.bin
+          build/gpu-inspect/psp-adapter-test \
+            src/navi48-bringup/firmware/psp_14_0_2_sos.bin \
+            src/navi48-bringup/firmware/psp_14_0_3_sos.bin
+
       - name: Compile x86_64 bring-up kext
         run: make -C src/navi48-bringup MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
 
@@ -100,6 +109,8 @@ jobs:
             build/gpu-inspect/gfx-runtime-c-test
             build/gpu-inspect/cp-firmware-test
             build/gpu-inspect/cp-firmware-c-test
+            build/gpu-inspect/psp-container-test
+            build/gpu-inspect/psp-adapter-test
           if-no-files-found: error
           retention-days: 7
 

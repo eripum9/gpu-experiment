@@ -6,6 +6,10 @@ RDNA4FB (BSD 3-Clause)  https://github.com/somestupidgirl/RDNA4FB
 src/navi48-bringup/src/ipdiscovery.{hpp,cpp} are used from it with their
 headers retained; the kext reuses its approach to BAR5 mapping, indirect
 VRAM access and on-die IP discovery.
+src/navi48-bringup/src/psp_container.hpp also adapts the freestanding
+PSP package parser from the successor RX4Darwin/AMDRadeonRDNA4.kext,
+revision 49f7f20c00dd154384418078f8a09e79c400a06a, src/amdfw.cpp.
+It retains the same author's BSD 3-Clause notice below and in the source.
 ==========================================================================
 BSD 3-Clause License
 

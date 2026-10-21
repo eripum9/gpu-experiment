@@ -4,6 +4,7 @@
 //  mp_14_0_2 / mmhub_4_1_0 headers, resolved at runtime through IP discovery.
 //
 #include "psp.hpp"
+#include "psp_container.hpp"
 #include "regs.hpp"
 #include "ipdiscovery.hpp"
 #include <IOKit/IOLib.h>
@@ -11,35 +12,6 @@
 #define PSPLOG(fmt, ...) IOLog("Navi48Bringup: psp: " fmt "\n", ##__VA_ARGS__)
 
 namespace n48 {
-
-// ---- firmware container layout (1:1 with Linux amdgpu_ucode.h) --------------
-struct __attribute__((packed)) CommonFwHeader {
-	uint32_t size_bytes;
-	uint32_t header_size_bytes;
-	uint16_t header_version_major;
-	uint16_t header_version_minor;
-	uint16_t ip_version_major;
-	uint16_t ip_version_minor;
-	uint32_t ucode_version;
-	uint32_t ucode_size_bytes;
-	uint32_t ucode_array_offset_bytes;
-	uint32_t crc32;
-};
-static_assert(sizeof(CommonFwHeader) == 32, "CommonFwHeader must be 32 bytes");
-
-struct __attribute__((packed)) PspFwBinDesc {
-	uint32_t fw_type;
-	uint32_t fw_version;
-	uint32_t offset_bytes;    // relative to ucode_array_offset_bytes
-	uint32_t size_bytes;
-};
-static_assert(sizeof(PspFwBinDesc) == 16, "PspFwBinDesc must be 16 bytes");
-
-enum PspFwType : uint32_t {
-	kFwSOS = 1, kFwSYS_DRV = 2, kFwKDB = 3, kFwTOC = 4, kFwSPL = 5, kFwRL = 6,
-	kFwSOC_DRV = 7, kFwINTF_DRV = 8, kFwDBG_DRV = 9, kFwRAS_DRV = 10,
-	kFwIPKEYMGR_DRV = 11, kFwSPDM_DRV = 12,
-};
 
 // ---- PSP bootloader commands (psp_v14_0.c PSP_BL__*) --------------------------
 namespace BlCmd {
@@ -73,62 +45,23 @@ static constexpr uint32_t kFbShift = 24;                    // 16 MiB units
 // ---- container parse ----------------------------------------------------------
 bool PspLoader::parseContainer(const uint8_t *fw, size_t fwSize) {
 	kdb = spl = sys = sos = soc = intf = dbg = ras = ipkey = toc = rl = spdm = SubBin{};
-	if (!fw || fwSize < sizeof(CommonFwHeader)) {
-		PSPLOG("parse: container missing or too small (%zu)", fwSize);
+	cobalt::psp::Package package{};
+	if (!cobalt::psp::parse(fw, fwSize, package)) {
+		PSPLOG("parse: invalid or unsupported PSP v2 container (%zu bytes)", fwSize);
 		return false;
 	}
-	const auto *h = reinterpret_cast<const CommonFwHeader *>(fw);
-	if (h->header_version_major != 2) {
-		PSPLOG("parse: unsupported header v%u.%u (need v2.x for psp_v14)",
-		       h->header_version_major, h->header_version_minor);
-		return false;
-	}
-	const uint32_t ucodeOff = h->ucode_array_offset_bytes;
-	if (ucodeOff > fwSize) {
-		PSPLOG("parse: ucode_array_offset %u > size %zu", ucodeOff, fwSize);
-		return false;
-	}
-	// v2.0: count at +32, descriptors at +36. v2.1 adds an aux index at +36,
-	// descriptors at +40.
-	size_t countOff = sizeof(CommonFwHeader);
-	size_t descOff  = countOff + 4 + (h->header_version_minor >= 1 ? 4 : 0);
-	if (descOff > fwSize) return false;
-	uint32_t count;
-	__builtin_memcpy(&count, fw + countOff, 4);
-	if (count == 0 || count > 32 || descOff + (size_t)count * sizeof(PspFwBinDesc) > fwSize) {
-		PSPLOG("parse: implausible bin count %u", count);
-		return false;
-	}
-	PSPLOG("parse: header v%u.%u ip v%u.%u ucode 0x%08x, %u sub-images",
-	       h->header_version_major, h->header_version_minor,
-	       h->ip_version_major, h->ip_version_minor, h->ucode_version, count);
-
-	const uint8_t *base = fw + ucodeOff;
-	for (uint32_t i = 0; i < count; i++) {
-		PspFwBinDesc d;
-		__builtin_memcpy(&d, fw + descOff + (size_t)i * sizeof(d), sizeof(d));
-		if ((uint64_t)ucodeOff + d.offset_bytes + d.size_bytes > fwSize) {
-			PSPLOG("parse: sub-image %u (type %u) out of bounds", i, d.fw_type);
-			return false;
-		}
-		SubBin b; b.data = base + d.offset_bytes; b.size = d.size_bytes; b.version = d.fw_version;
-		switch (d.fw_type) {
-		case kFwSOS:          sos   = b; break;
-		case kFwSYS_DRV:      sys   = b; break;
-		case kFwKDB:          kdb   = b; break;
-		case kFwTOC:          toc   = b; break;
-		case kFwSPL:          spl   = b; break;
-		case kFwRL:           rl    = b; break;
-		case kFwSOC_DRV:      soc   = b; break;
-		case kFwINTF_DRV:     intf  = b; break;
-		case kFwDBG_DRV:      dbg   = b; break;
-		case kFwRAS_DRV:      ras   = b; break;
-		case kFwIPKEYMGR_DRV: ipkey = b; break;
-		case kFwSPDM_DRV:     spdm  = b; break;
-		default: PSPLOG("parse: ignoring unknown fw_type %u", d.fw_type); break;
-		}
-	}
-	if (!sos.present()) { PSPLOG("parse: no SOS image in container"); return false; }
+	sos = {package.part[cobalt::psp::Sos].data, package.part[cobalt::psp::Sos].size, package.part[cobalt::psp::Sos].version};
+	sys = {package.part[cobalt::psp::SysDrv].data, package.part[cobalt::psp::SysDrv].size, package.part[cobalt::psp::SysDrv].version};
+	kdb = {package.part[cobalt::psp::Kdb].data, package.part[cobalt::psp::Kdb].size, package.part[cobalt::psp::Kdb].version};
+	toc = {package.part[cobalt::psp::Toc].data, package.part[cobalt::psp::Toc].size, package.part[cobalt::psp::Toc].version};
+	spl = {package.part[cobalt::psp::Spl].data, package.part[cobalt::psp::Spl].size, package.part[cobalt::psp::Spl].version};
+	rl = {package.part[cobalt::psp::Rl].data, package.part[cobalt::psp::Rl].size, package.part[cobalt::psp::Rl].version};
+	soc = {package.part[cobalt::psp::SocDrv].data, package.part[cobalt::psp::SocDrv].size, package.part[cobalt::psp::SocDrv].version};
+	intf = {package.part[cobalt::psp::IntfDrv].data, package.part[cobalt::psp::IntfDrv].size, package.part[cobalt::psp::IntfDrv].version};
+	dbg = {package.part[cobalt::psp::DbgDrv].data, package.part[cobalt::psp::DbgDrv].size, package.part[cobalt::psp::DbgDrv].version};
+	ras = {package.part[cobalt::psp::RasDrv].data, package.part[cobalt::psp::RasDrv].size, package.part[cobalt::psp::RasDrv].version};
+	ipkey = {package.part[cobalt::psp::IpKeyMgrDrv].data, package.part[cobalt::psp::IpKeyMgrDrv].size, package.part[cobalt::psp::IpKeyMgrDrv].version};
+	spdm = {package.part[cobalt::psp::SpdmDrv].data, package.part[cobalt::psp::SpdmDrv].size, package.part[cobalt::psp::SpdmDrv].version};
 	PSPLOG("parse: KDB %u SPL %u SYS %u SOC %u INTF %u DBG %u RAS %u IPKEY %u SOS %u bytes (SOS ver 0x%08x)",
 	       kdb.size, spl.size, sys.size, soc.size, intf.size, dbg.size, ras.size, ipkey.size,
 	       sos.size, sos.version);

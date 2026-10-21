@@ -38,7 +38,8 @@ def main() -> None:
         "Validation: compiled and ad-hoc signed by the Makefile; not loaded or installed\n"
         "Hardware status: RX 9060 XT / Navi 44 support remains disabled and unvalidated\n"
     ).encode("utf-8")
-    notices = [ROOT / "src" / "navi48-bringup" / "LICENSE", ROOT / "src" / "navi48-bringup" / "NOTICE"]
+    notices = [ROOT / "src" / "navi48-bringup" / "LICENSE", ROOT / "src" / "navi48-bringup" / "NOTICE",
+               ROOT / "third-party" / "THIRD-PARTY-LICENSES.txt"]
     firmware_license = ROOT / "src" / "navi48-bringup" / "firmware" / "LICENSE.amdgpu"
     if not firmware_license.is_file():
         parser.error("AMD firmware redistribution license is missing")

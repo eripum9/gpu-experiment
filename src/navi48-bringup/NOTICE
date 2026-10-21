@@ -7,6 +7,12 @@ This work reuses and adapts code from two upstream projects, with thanks:
   - src/ipdiscovery.{hpp,cpp} are used verbatim (their BSD-3 headers retained).
   - The BAR5 register-mapping, indirect-VRAM (MM_INDEX/MM_DATA), on-die IP
     discovery, and read-only PSP/SMU survey techniques are ported from it.
+  - src/psp_container.hpp adapts the freestanding package parser from its
+    successor RX4Darwin/AMDRadeonRDNA4.kext (same author, BSD 3-Clause):
+    https://github.com/RX4Darwin/AMDRadeonRDNA4.kext
+    revision 49f7f20c00dd154384418078f8a09e79c400a06a, src/amdfw.cpp.
+    The source retains the complete notice; the binary package also includes
+    THIRD-PARTY-LICENSES.txt with that author's copyright and licence text.
 
 * mac-amdgpu  (MIT, lemonade-sdk)
   https://github.com/lemonade-sdk/mac-amdgpu

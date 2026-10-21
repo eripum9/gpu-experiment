@@ -38,9 +38,15 @@ The workflow also runs `python3 tools/gpu-inspect/build.py all` on every job.
 That compiles and runs the host-side inspector tests. It does not establish
 graphics acceleration or compatibility with the RX 9060 XT.
 
+The PSP container corpus also exercises both actual loader adapters against
+host shims that abort on hardware access. After fetching the pinned inputs,
+CI repeats the shared-parser and adapter checks with both PSP 14.0.2 and
+14.0.3 SOS packages. Their accepted component views must retain the original
+descriptor offsets, sizes and versions. See [PSP validation](PSP-CONTAINER.md).
+
 ## Artifacts
 
-The job uploads the thirteen macOS x86_64 host executables and a tar archive
+The job uploads the macOS x86_64 host executables and a tar archive
 containing the compiled, ad-hoc-signed kext, build provenance, the project
 license/notices, and the AMD firmware license. The archive is for inspection
 and download only. Do not treat it as a tested driver or install it on a
