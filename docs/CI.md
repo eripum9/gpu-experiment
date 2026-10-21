@@ -62,3 +62,12 @@ source, runs native transport simulations, and builds the full x86_64 RADV
 library. It also builds and runs `acd_gpu_info_test` against Mesa's real chip,
 memory and hardware-info code, including the disabled gfx1200 reference.
 The library artifact includes source/patch hashes and remains compile-only.
+
+The host/kext job also tests and compiles the separate
+`CobaltNavi44Survey.kext` target. Its `CobaltNavi44Survey-hardware-test`
+artifact contains only that diagnostic bundle, a collection script, notices,
+source revision, and SHA-256 manifest. This is an opt-in hardware-test
+candidate; CI has not loaded it on the target. It contains no firmware and
+does not enable Navi 44 acceleration. See [the survey test](NAVI44-SURVEY.md)
+for its observation limits and collection procedure. The existing
+`Navi48Bringup` and RADV artifacts retain their compile-only status.

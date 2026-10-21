@@ -51,6 +51,11 @@ jobs:
       - name: Run offline host tests
         run: python3 tools/gpu-inspect/build.py all
 
+      - name: Test standalone Navi 44 survey and collector
+        run: |
+          python3 tools/navi44-survey/build.py
+          python3 -m unittest discover -s tools/navi44-survey -p 'test_*.py' -v
+
       - name: Test Linux hardware collector with synthetic sysfs
         run: python3 -m unittest discover -s tools/gpu-inspect -p 'test_*.py' -v
 
@@ -60,8 +65,22 @@ jobs:
       - name: Compile x86_64 bring-up kext
         run: make -C src/navi48-bringup MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
 
+      - name: Compile standalone x86_64 Navi 44 survey
+        run: make -C src/navi44-survey MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
+
       - name: Package compile-only artifacts
         run: python3 tools/ci/package_compile_artifact.py --output "$RUNNER_TEMP/Navi48Bringup-compile-check.tar.gz"
+
+      - name: Package standalone survey hardware-test candidate
+        run: python3 tools/ci/package_survey_artifact.py --output "$RUNNER_TEMP/CobaltNavi44Survey-hardware-test.tar.gz"
+
+      - name: Upload standalone survey hardware-test candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CobaltNavi44Survey-hardware-test
+          path: ${{ runner.temp }}/CobaltNavi44Survey-hardware-test.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload offline inspector binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

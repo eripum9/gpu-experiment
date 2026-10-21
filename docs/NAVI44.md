@@ -4,6 +4,10 @@ Baseline: Almosst-DEV/Cobalt64 `d1f7bad8408a0a2c016b067c477422975a59de44`.
 This branch starts an RX 9060 XT (`1002:7590`, Navi 44 / gfx1200) investigation.
 It does not implement an accelerated Navi 44 driver.
 
+The first macOS hardware-test candidate is a separate, opt-in
+[read-only survey](NAVI44-SURVEY.md). It does not lift the bring-up refusal
+described below.
+
 ## Implemented
 
 - Shared, freestanding GPU profiles distinguish Navi 48 / gfx1201 from
