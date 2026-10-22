@@ -45,18 +45,21 @@ struct TestState {
     bool stateBootPresent = false;
     std::string apertureBoot = "1";
     bool apertureBootPresent = false, apertureClaimFail = false, apertureClaimed = false;
+    std::string stagingBoot = "1";
+    bool stagingBootPresent = false, stagingEnabled = false, stagingClaimFail = false, stagingClaimed = false;
     uint64_t apertureOffset = 64ULL << 20;
     uint32_t apertureRemap = 0x7f000, apertureMemsize = 16304;
     uint32_t apertureNbifSegmentBase = 0xd20;
     bool apertureNativeRoute = false, apertureNbifReadLive = false;
+    unsigned allocationCalls = 0, failAllocationCall = 0;
     unsigned apertureRegisterReads = 0, apertureDataReads = 0, apertureCpuReads = 0;
     unsigned apertureCpuWrites = 0, apertureFlushWrites = 0, apertureFences = 0;
     bool probeMapLive = false, flushMapLive = false;
     volatile uint32_t *probePage = nullptr, *flushPage = nullptr;
     const volatile uint32_t *nbifPage = nullptr;
     std::function<void()> onApertureNbifRelease;
-    std::vector<uint32_t> apertureCpu = std::vector<uint32_t>(1024, 0xabc01234);
-    std::vector<uint32_t> apertureGpu = std::vector<uint32_t>(4, 0xabc01234);
+    std::vector<uint32_t> apertureCpu = std::vector<uint32_t>(262144, 0xabc01234);
+    std::vector<uint32_t> apertureGpu = std::vector<uint32_t>(262144, 0xabc01234);
     std::vector<uint32_t> apertureFlush = std::vector<uint32_t>(1024);
     std::vector<MmioEvent> apertureEvents;
     std::function<void(const MmioEvent &)> onAperture;
@@ -99,9 +102,15 @@ inline TestState testState;
 inline bool aperturePhase() {
     return testState.apertureBootPresent && testState.openCalls >= 2 && testState.openLive == 1;
 }
+inline bool stagingPhase() {
+    return testState.stagingEnabled && testState.openCalls >= 2 && testState.openLive == 1;
+}
 inline void apertureEvent(char operation, uint32_t offset, uint32_t value) {
     const MmioEvent event {operation, offset, value};
-    testState.apertureEvents.push_back(event);
+    // Staging performs millions of dword accesses. Keep the legacy event
+    // transcript for the 16-byte experiment, while still delivering callbacks
+    // so tests can inject context changes at transaction boundaries.
+    if (!stagingPhase()) testState.apertureEvents.push_back(event);
     if (testState.onAperture) testState.onAperture(event);
 }
 
@@ -158,11 +167,13 @@ public:
     virtual void stop(IOService *) { ++stopCalls; }
     static IOPlatformExpert *getPlatform();
     void consolePublication(const char *key) {
-        if (std::string(key).find("CobaltSurvey,Aperture") == 0 &&
-            std::string(key) != "CobaltSurvey,ApertureAttempt-v1") {
+        if ((std::string(key).find("CobaltSurvey,Aperture") == 0 ||
+             std::string(key).find("CobaltSurvey,Staging") == 0) &&
+            std::string(key) != "CobaltSurvey,ApertureAttempt-v1" &&
+            std::string(key) != "CobaltSurvey,StagingAttempt-v1") {
             if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
                 testState.openLive || testState.iteratorsLive)
-                throw std::runtime_error("GPU resources retained at aperture publication");
+                throw std::runtime_error("GPU resources retained at aperture/staging publication");
             if (testState.onAperturePublication) testState.onAperturePublication(key);
         }
         if (std::string(key).find("CobaltSurvey,Console") != 0) return;
@@ -189,6 +200,8 @@ public:
         if (std::string(key) == "CobaltSurvey,IndexedAttempt-v1" && testState.claimFail) return false;
         if (std::string(key) == "CobaltSurvey,ApertureAttempt-v1" && testState.apertureClaimFail) return false;
         if (std::string(key) == "CobaltSurvey,ApertureAttempt-v1") testState.apertureClaimed = true;
+        if (std::string(key) == "CobaltSurvey,StagingAttempt-v1" && testState.stagingClaimFail) return false;
+        if (std::string(key) == "CobaltSurvey,StagingAttempt-v1") testState.stagingClaimed = true;
         numbers[key] = value ? 1 : 0; return true;
     }
     OSObject *getProperty(const char *key) {
@@ -291,6 +304,9 @@ public:
         ++testState.mapRequests; ++requests;
         const bool indexed = offset == 0 && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const bool staging = stagingPhase() && physical == 0x1000000000ULL &&
+            offset == testState.apertureOffset && n == (1ULL << 20) &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const bool probe = aperturePhase() && physical == 0x1000000000ULL &&
             offset == testState.apertureOffset && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
@@ -309,7 +325,7 @@ public:
         }
         if (nativeFlush && testState.apertureNbifReadLive)
             throw std::runtime_error("native flush RW map aliases a live read-only NBIF map");
-        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !probe && !flush && !nbifRead && !nativeFlush &&
+        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !probe && !staging && !flush && !nbifRead && !nativeFlush &&
             (offset != expectedOffset || n != expectedLength ||
              options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
@@ -348,7 +364,7 @@ public:
             }
         }
         map->address = mapNullAddress ? 0 : reinterpret_cast<uintptr_t>(
-            indexed ? selectorStorage.data() : probe ? testState.apertureCpu.data() :
+            indexed ? selectorStorage.data() : (probe || staging) ? testState.apertureCpu.data() :
                 (flush || nbifRead || nativeFlush) ? testState.apertureFlush.data() : storage.data());
         if (mapMisalignedAddress && map->address) ++map->address;
         if (indexed) {
@@ -356,7 +372,7 @@ public:
             testState.indexedMapLive = true;
             testState.indexedPage = selectorStorage.data();
         }
-        if (probe) {
+        if (probe || staging) {
             map->probeMapping = true; testState.probeMapLive = true;
             testState.probePage = testState.apertureCpu.data();
         }
@@ -478,9 +494,10 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
         const uint32_t low = testState.indexedPage[0], high = testState.indexedPage[6];
         const uint64_t pos = (uint64_t(high) << 31) | (low & 0x7fffffffu);
         if (aperturePhase()) {
+            const uint64_t windowBytes = stagingPhase() ? (1ULL << 20) : 16;
             if (!testState.probeMapLive || !(low & 0x80000000u) || (pos & 3) ||
-                pos < testState.apertureOffset || pos >= testState.apertureOffset + 16)
-                throw std::runtime_error("aperture MM_DATA outside fixed sixteen bytes");
+                pos < testState.apertureOffset || pos >= testState.apertureOffset + windowBytes)
+                throw std::runtime_error("aperture MM_DATA outside fixed survey window");
             value = testState.apertureGpu[static_cast<size_t>((pos-testState.apertureOffset)/4)];
             if (testState.apertureDataRead) value = testState.apertureDataRead(testState.apertureDataReads, value);
             ++testState.apertureDataReads;
@@ -499,7 +516,9 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
     return value;
 }
 inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t offset) {
-    if (!testState.stateBootPresent || (testState.mapsLive != 2 && testState.mapsLive != 4) ||
+    const bool expectedMaps = testState.mapsLive == 2 || testState.mapsLive == 4 ||
+        (stagingPhase() && testState.mapsLive >= 4 && testState.mapsLive <= 8);
+    if (!testState.stateBootPresent || !expectedMaps ||
         std::find(testState.stateAllowedOffsets.begin(), testState.stateAllowedOffsets.end(), offset) ==
             testState.stateAllowedOffsets.end())
         throw std::runtime_error("state MMIO outside fixed passive allowlist");
@@ -526,16 +545,17 @@ inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t
     *address = value; ++testState.selectorWrites;
     const MmioEvent event {'w', offset, value}; testState.mmioEvents.push_back(event);
     if (aperturePhase()) {
-        if (!testState.apertureClaimed)
+        if (!testState.apertureClaimed && !testState.stagingClaimed)
             throw std::runtime_error("aperture selector write before persistent claim");
         apertureEvent('s', offset, value);
     }
     if (testState.onMmio) testState.onMmio(event);
 }
 
-inline void apertureIoOwnership() {
+inline void apertureIoOwnership(bool permitStagingBackupRead = false) {
     if (!aperturePhase() || !testState.indexedOwner ||
-        !testState.apertureClaimed ||
+        (!testState.apertureClaimed && !testState.stagingClaimed &&
+         !(permitStagingBackupRead && stagingPhase())) ||
         testState.indexedOwner->numbers.at("CobaltSurvey,ReadOnly") != 0 ||
         testState.indexedOwner->numbers.at("CobaltSurvey,Ready") != 0)
         throw std::runtime_error("aperture access without owned explicit attempt");
@@ -554,9 +574,10 @@ inline uint32_t cobaltSurveyTestApertureRegisterRead(const volatile uint32_t *ad
     return value;
 }
 inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
-    apertureIoOwnership();
-    if (!testState.probeMapLive || address < testState.probePage || address >= testState.probePage+4)
-        throw std::runtime_error("CPU read outside fixed sixteen bytes");
+    apertureIoOwnership(true);
+    const size_t maxWords = stagingPhase() ? 262144 : 4;
+    if (!testState.probeMapLive || address < testState.probePage || address >= testState.probePage+maxWords)
+        throw std::runtime_error("CPU read outside fixed survey window");
     uint32_t value = *address;
     if (testState.apertureCpuRead) value = testState.apertureCpuRead(testState.apertureCpuReads, value);
     ++testState.apertureCpuReads;
@@ -565,8 +586,9 @@ inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
 }
 inline void cobaltSurveyTestApertureCpuWrite(volatile uint32_t *address, uint32_t value) {
     apertureIoOwnership();
-    if (!testState.probeMapLive || address < testState.probePage || address >= testState.probePage+4)
-        throw std::runtime_error("CPU write outside fixed sixteen bytes");
+    const size_t maxWords = stagingPhase() ? 262144 : 4;
+    if (!testState.probeMapLive || address < testState.probePage || address >= testState.probePage+maxWords)
+        throw std::runtime_error("CPU write outside fixed survey window");
     *address = value; ++testState.apertureCpuWrites;
     apertureEvent('v', static_cast<uint32_t>(address-testState.probePage)*4, value);
 }
@@ -585,7 +607,8 @@ inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
         testState.apertureFences != testState.apertureFlushWrites+1)
         throw std::runtime_error("HDP flush outside fixed page or without fence");
     *address = 0;
-    for (unsigned i=0; i<4; ++i) testState.apertureGpu[i] = testState.apertureCpu[i];
+    const size_t words = stagingPhase() ? 262144 : 4;
+    std::copy_n(testState.apertureCpu.data(), words, testState.apertureGpu.data());
     ++testState.apertureFlushWrites;
     apertureEvent('h', 0, 0);
 }
@@ -594,33 +617,39 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool indexed = std::string(key) == "cobalt-survey-indexed";
     const bool state = std::string(key) == "cobalt-survey-state";
     const bool aperture = std::string(key) == "cobalt-survey-aperture";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture) throw std::runtime_error("unexpected boot argument");
+    const bool staging = std::string(key) == "cobalt-survey-staging";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging) throw std::runtime_error("unexpected boot argument");
     if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
-        aperture ? !testState.apertureBootPresent : !testState.bootPresent) return false;
+        aperture ? !testState.apertureBootPresent : staging ? !testState.stagingBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
     const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot :
-        aperture ? testState.apertureBoot : testState.boot;
+        aperture ? testState.apertureBoot : staging ? testState.stagingBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
     const auto numeric = std::strtoll(token.c_str(), &end, 0);
     if (!token.empty() && end && *end == '\0') {
         const uint32_t integer = static_cast<uint32_t>(numeric);
+        if (staging) testState.stagingEnabled = integer == 1;
         std::memcpy(out, &integer, static_cast<size_t>(n) < sizeof(integer) ? static_cast<size_t>(n) : sizeof(integer));
     } else {
+        if (staging) testState.stagingEnabled = false;
         std::memset(out, 0, static_cast<size_t>(n));
         std::memcpy(out, token.data(), token.size() < static_cast<size_t>(n) ? token.size() : static_cast<size_t>(n));
     }
     return true;
 }
 inline void *IOMalloc(uint64_t n) {
-    if (n != 10240 && n != 20480) throw std::runtime_error("unbounded allocation");
-    if (testState.allocFail) return nullptr;
+    if (n != 10240 && n != 20480 && n != (1ULL << 20) && n != 125472)
+        throw std::runtime_error("unbounded allocation");
+    const unsigned call = ++testState.allocationCalls;
+    if (testState.allocFail || (testState.failAllocationCall && call == testState.failAllocationCall)) return nullptr;
     ++testState.allocations; return std::malloc(static_cast<size_t>(n));
 }
 inline void IOFree(void *p, uint64_t n) {
-    if (!p || (n != 10240 && n != 20480)) throw std::runtime_error("invalid IOFree");
+    if (!p || (n != 10240 && n != 20480 && n != (1ULL << 20) && n != 125472))
+        throw std::runtime_error("invalid IOFree");
     --testState.allocations; std::free(p);
 }
 inline void IOLog(const char *, ...) {}

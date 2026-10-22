@@ -3,9 +3,9 @@
 
 Windows: run in a VS developer shell and pass --cxx cl.
 macOS/Linux: defaults to CXX or clang++/g++/c++.
-The fake API instruments provider ownership and the fixed-purpose selector,
-aperture-pattern and HDP-flush accesses. It deliberately has no PCI/config
-writes, MM_DATA writes, DMA, IRQ, or GPU activation APIs.
+The fake API instruments provider ownership, fixed-purpose selector and HDP
+flush accesses, and bounded synthetic staging-window transfers. It deliberately
+has no PCI/config writes, MM_DATA writes, DMA, IRQ, or GPU activation APIs.
 """
 import argparse
 import os

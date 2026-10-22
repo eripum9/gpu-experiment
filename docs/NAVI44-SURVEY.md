@@ -5,7 +5,8 @@ It does not enable Navi 44 in `Navi48Bringup`, run that driver's startup
 ladder, upload firmware, or provide graphics acceleration. A successful boot
 with this survey will still have the current basic display performance.
 Its default mode is read-only. Separately gated experiments permit bounded
-address-selector writes and a 16-byte VRAM transport test, described below.
+address-selector writes, a 16-byte VRAM transport test, and a full 1 MiB
+synthetic staging test, described below.
 
 ## What the test measures
 
@@ -242,6 +243,51 @@ the independently valid discovery/state/console observations. `Ready` stays
 false even when the roundtrip succeeds. Hardware success would establish a
 small transport checkpoint, not PSP startup or graphics acceleration.
 
+### Full staging-window experiment
+
+`cobalt-survey-staging=1` selects a separate synthetic transfer experiment
+instead of the 16-byte test. It also requires all four existing survey,
+indexed, state and aperture flags to equal numeric `1`. Removing this extra
+flag preserves the smaller aperture experiment. The service never interprets
+a missing prerequisite as permission to proceed with the larger transfer.
+
+This test uses the same board, IP, console, memory-window, ownership and
+existing HDP-route checks. It additionally retains read-only PSP and MMHUB
+state mappings and pins the four observed state values throughout the longer
+transfer and cleanup. A changed or unreadable value latches context loss.
+It maps the complete planned 1 MiB VRAM interval
+with validated physical bounds and uncached permissions. Heap allocation and
+mapping failures stop before any VRAM write. Two complete CPU reads must
+agree on the original contents; indexed reads cross-check the first and last
+dword of each 4 KiB page. These observations and the provider-open contract
+do not establish exclusive ownership against firmware or drivers that bypass
+IOKit coordination.
+
+The test exercises the actual bounded `StagingWindow` helper: clear the full
+1 MiB, flush, then copy a deterministic 125472-byte synthetic prefix and
+flush again. The prefix size exercises the largest selected image extent in
+the pinned PSP 14.0.2 package; the bytes contain no firmware. CPU readbacks
+check the entire zeroed window and the complete copied prefix plus zero
+padding. Indexed samples cross-check each page at both stages. Transfers and
+full-window reads use chunks of at most 4 KiB with context guards around
+each chunk. No PSP mailbox is written and no GPU work is submitted.
+
+Cleanup uses the saved original contents through a separate bounded path.
+It restores the entire window, flushes, checks the complete CPU readback and
+indexed samples, then restores and checks the saved selectors. A comparison
+failure with a still-valid context permits this restoration attempt. A
+latched device-context failure prevents further writes, including cleanup;
+an incomplete restoration is reported. The failed staging helper is never
+retried to perform cleanup.
+
+The experiment has its own persistent provider attempt marker and separate
+`Staging*` properties. Counters describe issued operations, including failing
+calls; they are not a claim that every byte completed. No original VRAM bytes
+or source buffers are published. Maps are released before provider close and
+result publication. A complete successful result uses schema 6 and keeps
+`Ready=false`. It establishes an observed synthetic CPU/indexed transfer and
+restoration, not GPU-side MC translation, PSP authentication or acceleration.
+
 ### Installing the selected diagnostic mode
 
 The CI artifact is a hardware-test candidate. Keep the known working EFI
@@ -266,6 +312,11 @@ An aperture test additionally adds `cobalt-survey-state=1` and
 `cobalt-survey-aperture=1` after source review, host fault tests and the native
 build pass. Keep the same working EFI backup and BAR settings. Inspect its
 reported result in Windows before progressing to a firmware-load test.
+
+After the smaller aperture result has been reviewed, a separately reviewed
+and natively built staging candidate can add `cobalt-survey-staging=1` to
+those same four arguments. Inspect its transfer and restoration results in
+Windows before another experiment. This mode still loads no GPU firmware.
 
 Copy the packaged `collect-gpu-survey.sh` to the root of a writable FAT32
 USB volume named TAHOE. In the installed macOS environment, open Terminal:

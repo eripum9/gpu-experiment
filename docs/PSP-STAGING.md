@@ -2,8 +2,9 @@
 
 `src/navi48-bringup/src/psp_staging.hpp` provides the bounds and ordering part
 of a future firmware staging backend. It is tested on the host alongside the
-production `PspLoader`, and is not wired into either kext. It adds no boot
-argument, hardware enablement, embedded firmware or deployment change.
+production `PspLoader`. The standalone survey's separately armed synthetic
+staging experiment also exercises it with bounded mapped I/O and saved-original
+restoration. It is not connected to a hardware PSP loader and embeds no firmware.
 
 The helper accepts an explicit, 1 MiB-aligned VRAM offset whose full 1 MiB
 extent cannot overflow. Explicit offset zero is structurally valid; the
@@ -46,7 +47,7 @@ a PSP mailbox command. The future register backend must validate its own
 accesses. A host simulation likewise cannot validate BAR-to-MC translation,
 actual HDP behavior, PSP firmware authentication or graphics acceleration.
 
-The deployed Navi 44 aperture diagnostic remains a separate hardware
-checkpoint. Its captured result must be reviewed before this helper is
-connected to a hardware-writing PSP adapter. The current Navi 44 bring-up
-and acceleration gates remain disabled.
+The Navi 44 aperture and synthetic staging diagnostics remain separate
+hardware checkpoints. Their captured results must be reviewed before this
+helper is connected to a hardware-writing PSP adapter. The current Navi 44
+bring-up and acceleration gates remain disabled.

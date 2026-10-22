@@ -1477,6 +1477,335 @@ static void nativeApertureTests() {
     }
 }
 
+static uint32_t stagingOriginal(size_t word) {
+    return uint32_t(word * 0x9e3779b9u) ^ uint32_t(word >> 3) ^ 0x6a09e667u;
+}
+static uint8_t stagingPayloadByte(size_t offset) {
+    return uint8_t(((offset * 37u) ^ (offset >> 8) ^ (offset >> 16) ^ 0xa7u) & 0xffu);
+}
+static uint32_t stagingPayloadWord(size_t word) {
+    uint32_t result=0;
+    for(size_t j=0;j<4;++j) result |= uint32_t(stagingPayloadByte(word*4+j)) << (8*j);
+    return result;
+}
+static const std::string &stagingStatus(const Device &d) {
+    return d.service.strings.at("CobaltSurvey,StagingStatus");
+}
+static void stagingDevice(Device &d, bool nativeRoute=true) {
+    apertureDevice(d, nativeRoute);
+    testState.stagingBootPresent = true;
+    testState.stagingBoot = "1";
+    for (size_t i=0; i<testState.apertureCpu.size(); ++i) {
+        const uint32_t value = stagingOriginal(i);
+        testState.apertureCpu[i] = value;
+        testState.apertureGpu[i] = value;
+    }
+}
+static void stagingTests() {
+    {
+        Device d; stagingDevice(d);
+        bool firstCpuWrite = true;
+        testState.onAperture=[&](const MmioEvent &event) {
+            if (event.operation=='v' && firstCpuWrite) {
+                firstCpuWrite=false;
+                for(size_t i : {size_t(0),size_t(1),size_t(1023),size_t(65535),size_t(262143)})
+                    CHECK(testState.apertureGpu[i]==stagingOriginal(i));
+            }
+            if(event.operation=='h') {
+                CHECK(testState.apertureGpu==testState.apertureCpu);
+                const unsigned flush=testState.apertureFlushWrites;
+                if(flush==1) {
+                    for(uint32_t word:testState.apertureGpu) CHECK(word==0);
+                } else if(flush==2) {
+                    for(size_t i=0;i<testState.apertureGpu.size();++i)
+                        CHECK(testState.apertureGpu[i]==(i<125472/4 ? stagingPayloadWord(i) : 0));
+                } else if(flush==3) {
+                    for(size_t i=0;i<testState.apertureGpu.size();++i)
+                        CHECK(testState.apertureGpu[i]==stagingOriginal(i));
+                }
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(stagingStatus(d)=="synthetic-zero-copy-and-restore-verified");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==6);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingWindowOffset")==64ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingWindowBytes")==1ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingPayloadBytes")==125472);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingZeroBytesIssued")==1ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingCopyBytesIssued")==125472);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingZeroChunksIssued")==256);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingCopyChunksIssued")==31);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingHelperFlushesIssued")==2);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingRestoreBytesIssued")==1ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingRestoreChunksIssued")==256);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingCpuReadBytes")==5ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingCpuReadChunks")==1280);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingOriginalStable")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingZeroVerified")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingCopyVerified")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingRestoreVerified")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingContextLost")==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingSelectorWritesIssued")==4098);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingDataReads")==2048);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingVramWritesIssued")==555656);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingFlushWritesIssued")==3);
+        CHECK(d.service.strings.at("CobaltSurvey,StagingFlushRoute")=="native-nbif");
+        CHECK(d.service.strings.at("CobaltSurvey,StagingGuardMapping")=="shared-native-rw");
+        CHECK(testState.apertureCpuWrites==555656);
+        CHECK(testState.apertureFlushWrites==3);
+        CHECK(testState.apertureCpuReads==1310720);
+        CHECK(testState.apertureDataReads==2048);
+        CHECK(testState.selectorWrites==9222);
+        CHECK(testState.selectorWrites-5124==4098);
+        CHECK(d.mmio.selectorStorage[0]==0x12345678);
+        CHECK(d.mmio.selectorStorage[6]==2);
+        CHECK(d.service.strings.at("CobaltSurvey,StagingVramCleanup")=="restored-observed");
+        CHECK(d.service.strings.at("CobaltSurvey,StagingSelectorCleanup")=="restored-observed");
+        CHECK(testState.apertureEvents.empty());
+        for(size_t i=0; i<testState.apertureCpu.size(); ++i) {
+            CHECK(testState.apertureCpu[i]==stagingOriginal(i));
+            CHECK(testState.apertureGpu[i]==stagingOriginal(i));
+        }
+        CHECK(d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.mapsLive==0 && testState.backingDescriptorsLive==0);
+    }
+    {
+        Device d; stagingDevice(d);
+        testState.propertyFailKey="CobaltSurvey,StagingZeroVerified";
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready")==0);
+        CHECK(d.service.strings.at("CobaltSurvey,StagingStatus")=="metadata-publication-failed");
+        CHECK(!d.service.numbers.count("CobaltSurvey,StagingZeroVerified"));
+        CHECK(d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.apertureCpu==testState.apertureGpu);
+    }
+    {
+        Device d; stagingDevice(d); bool changed=false; unsigned statusPublications=0;
+        testState.onAperturePublication=[&](const std::string &key) {
+            if (key=="CobaltSurvey,StagingStatus" && ++statusPublications==1) {
+                changed=true; d.pci.command=0;
+            }
+            if (changed && key=="CobaltSurvey,StagingAttempted")
+                testState.propertyFailKey="CobaltSurvey,Schema";
+        };
+        d.run("discovery-snapshot-validated");
+        if (!changed || statusPublications<2)
+            throw std::runtime_error("staging publication hook changed=" + std::to_string(changed) +
+                " status-count=" + std::to_string(statusPublications));
+        CHECK(!d.service.numbers.count("CobaltSurvey,Schema"));
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready")==0);
+        CHECK(d.service.strings.at("CobaltSurvey,StagingStatus")=="metadata-publication-failed");
+        CHECK(d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.apertureCpu==testState.apertureGpu);
+    }
+    {
+        Device d; stagingDevice(d);
+        d.pci.numbers["CobaltSurvey,StagingAttempt-v1"]=1;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.selectorWrites==5124);
+        CHECK(testState.apertureCpuWrites==0 && testState.apertureFlushWrites==0);
+    }
+    for (const char *argument : {"", "0", "2", "-1", "1x", "true"}) {
+        Device d; stagingDevice(d); testState.stagingBoot=argument;
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,StagingStatus"));
+        CHECK(testState.apertureCpuWrites==8);
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+    }
+    {
+        Device d; stagingDevice(d, false);
+        d.run("discovery-snapshot-validated");
+        CHECK(stagingStatus(d)=="synthetic-zero-copy-and-restore-verified");
+        CHECK(d.service.strings.at("CobaltSurvey,StagingFlushRoute")=="isolated-remap");
+        CHECK(d.service.strings.at("CobaltSurvey,StagingGuardMapping")=="read-only-nbif");
+        CHECK(testState.apertureCpuWrites==555656 && testState.apertureFlushWrites==3);
+        CHECK(testState.apertureCpu==testState.apertureGpu);
+        for(size_t i=0;i<testState.apertureCpu.size();++i)
+            CHECK(testState.apertureCpu[i]==stagingOriginal(i));
+    }
+    {
+        Device d; stagingDevice(d); testState.apertureBootPresent=false;
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,StagingStatus"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+    }
+    for (unsigned missing=0;missing<3;++missing) {
+        Device d; stagingDevice(d);
+        if (missing==0) testState.indexedBootPresent=false;
+        if (missing==1) testState.stateBootPresent=false;
+        if (missing==2) testState.apertureBootPresent=false;
+        CHECK(d.service.start(&d.pci)); CHECK(d.service.registered);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready")==0);
+        CHECK(!d.service.strings.count("CobaltSurvey,StagingStatus"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.apertureCpuWrites==0 && testState.apertureFlushWrites==0);
+    }
+    {
+        Device d; stagingDevice(d);
+        d.vram.onMap=[&d] { if(testState.openCalls>=2) d.vram.mapFail=true; };
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.apertureCpuWrites==0);
+        CHECK(testState.apertureFlushWrites==0);
+        CHECK(testState.mapsLive==0 && testState.backingDescriptorsLive==0);
+    }
+    {
+        Device d; stagingDevice(d); testState.stagingClaimFail=true;
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.selectorWrites==5124);
+        CHECK(testState.apertureCpuWrites==0 && testState.apertureFlushWrites==0);
+        CHECK(testState.apertureDataReads==0);
+    }
+    {
+        Device d; stagingDevice(d); testState.failAllocationCall=2;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.selectorWrites==5124);
+        CHECK(testState.apertureCpuWrites==0 && testState.apertureFlushWrites==0);
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.allocations==0);
+    }
+    {
+        Device d; stagingDevice(d); testState.failAllocationCall=3;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.selectorWrites==5124);
+        CHECK(testState.apertureCpuWrites==0 && testState.apertureFlushWrites==0);
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+        CHECK(testState.allocations==0);
+    }
+    {
+        Device d; stagingDevice(d); testState.apertureCpuRead=[](unsigned read,uint32_t value) {
+            return read==262144 ? value^1 : value;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.selectorWrites==5124);
+        CHECK(testState.apertureCpuWrites==0 && testState.apertureFlushWrites==0);
+        CHECK(!d.pci.getProperty("CobaltSurvey,StagingAttempt-v1"));
+    }
+    {
+        Device d; stagingDevice(d);
+        testState.apertureCpuRead=[](unsigned read,uint32_t value) {
+            return read==524288+12345 ? value^1 : value;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingZeroVerified")==0);
+        CHECK(d.service.strings.at("CobaltSurvey,StagingVramCleanup")=="restored-observed");
+        CHECK(testState.apertureCpuWrites>262144 && testState.apertureFlushWrites==2);
+        for(size_t i=0;i<testState.apertureCpu.size();++i) {
+            CHECK(testState.apertureCpu[i]==stagingOriginal(i));
+            CHECK(testState.apertureGpu[i]==stagingOriginal(i));
+        }
+    }
+    for (const unsigned corruptAt : {0u, 512u, 1024u}) {
+        Device d; stagingDevice(d);
+        testState.apertureDataRead=[corruptAt](unsigned read,uint32_t value) {
+            return read==corruptAt ? value^1 : value;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingRestoreVerified")== (corruptAt==0 ? 0u : 1u));
+        CHECK(d.service.strings.at("CobaltSurvey,StagingVramCleanup")==
+            (corruptAt==0 ? "not-needed" : "restored-observed"));
+        CHECK(d.service.strings.at("CobaltSurvey,StagingSelectorCleanup")=="restored-observed");
+        CHECK(testState.apertureFlushWrites==(corruptAt==0 ? 0u : corruptAt==512 ? 2u : 3u));
+        for(size_t i=0;i<testState.apertureCpu.size();++i) {
+            CHECK(testState.apertureCpu[i]==stagingOriginal(i));
+            CHECK(testState.apertureGpu[i]==stagingOriginal(i));
+        }
+    }
+    // Context loss at representative chunk boundaries is sticky. Even if the
+    // fake hardware state is changed back immediately, no cleanup write may
+    // reuse the stale mappings or selectors.
+    for (const unsigned writeAt : {1024u, 131072u, 262144u, 263168u, 293512u,
+                                   294536u, 425608u, 555656u}) {
+        Device d; stagingDevice(d); bool changed=false;
+        testState.onAperture=[&](const MmioEvent &event) {
+            if (!changed && event.operation=='v' && testState.apertureCpuWrites==writeAt) {
+                changed=true; d.pci.command=0;
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(changed);
+        CHECK(testState.apertureCpuWrites==writeAt);
+        CHECK(testState.apertureFlushWrites<=2);
+        CHECK(testState.apertureCpuWrites<=555656);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingContextLost")==1);
+        CHECK(testState.mapsLive==0 && testState.backingDescriptorsLive==0);
+        CHECK(testState.openLive==0 && testState.allocations==0);
+    }
+    const uint32_t stateOffsets[] = {0x458c,0x4644,0xa950,0xa954};
+    const unsigned stateMutationWrites[] = {1024,131072,263168,294536};
+    for (unsigned field=0;field<4;++field) {
+        Device d; stagingDevice(d); bool changed=false;
+        const auto read=testState.stateRead;
+        testState.stateRead=[read,&changed,offset=stateOffsets[field]](uint32_t observedOffset,uint32_t value) {
+            const uint32_t actual=read(observedOffset,value);
+            return changed && observedOffset==offset ? actual^1 : actual;
+        };
+        testState.onAperture=[&](const MmioEvent &event) {
+            if (!changed && event.operation=='v' &&
+                testState.apertureCpuWrites==stateMutationWrites[field]) changed=true;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(changed);
+        CHECK(testState.apertureCpuWrites==stateMutationWrites[field]);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingContextLost")==1);
+        CHECK(testState.apertureFlushWrites<=2);
+        CHECK(testState.mapsLive==0 && testState.backingDescriptorsLive==0);
+        CHECK(testState.openLive==0 && testState.allocations==0);
+    }
+    for (unsigned kind=0;kind<2;++kind) {
+        Device d; stagingDevice(d); bool changed=false;
+        const uint32_t changedOffset=(testState.apertureNbifSegmentBase+(kind==0 ? 0x12d : 0xc3))*4;
+        testState.apertureRegisterRead=[&](uint32_t offset,uint32_t value) {
+            return changed && offset==changedOffset ? value^1 : value;
+        };
+        testState.onAperture=[&](const MmioEvent &event) {
+            if (!changed && event.operation=='v' && testState.apertureCpuWrites==263168) changed=true;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(changed);
+        CHECK(testState.apertureCpuWrites==263168);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingContextLost")==1);
+        CHECK(testState.apertureFlushWrites==1);
+    }
+    {
+        Device d; stagingDevice(d); bool changed=false;
+        testState.onAperture=[&](const MmioEvent &event) {
+            if (!changed && event.operation=='v' && testState.apertureCpuWrites==1024) {
+                changed=true; d.pci.command=0;
+            }
+        };
+        d.pci.onClose=[&d] { d.pci.command=2; };
+        d.run("discovery-snapshot-validated");
+        CHECK(changed && d.pci.command==2);
+        CHECK(testState.apertureCpuWrites==1024);
+        CHECK(testState.apertureFlushWrites==0);
+    }
+    {
+        Device d; stagingDevice(d); bool armed=false, badReturned=false;
+        unsigned selectorWritesAtLoss=0;
+        const auto read=testState.stateRead;
+        testState.stateRead=[read,&armed,&badReturned](uint32_t offset,uint32_t value) {
+            const uint32_t actual=read(offset,value);
+            if (armed && !badReturned) { badReturned=true; return actual^1; }
+            return actual;
+        };
+        testState.onAperture=[&](const MmioEvent &event) {
+            if (!armed && event.operation=='v' && testState.apertureCpuWrites==1024) {
+                armed=true; selectorWritesAtLoss=testState.selectorWrites;
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(badReturned);
+        CHECK(testState.apertureCpuWrites==1024);
+        CHECK(testState.apertureFlushWrites==0);
+        CHECK(testState.selectorWrites==selectorWritesAtLoss);
+        CHECK(d.service.numbers.at("CobaltSurvey,StagingContextLost")==1);
+        CHECK(d.service.strings.at("CobaltSurvey,StagingVramCleanup")=="restore-skipped-or-unverified");
+    }
+}
+
 int main() {
     try {
         gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
@@ -1484,6 +1813,7 @@ int main() {
         indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState(); passiveConsoleTests();
         apertureTests();
         nativeApertureTests();
+        stagingTests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"; return 1;

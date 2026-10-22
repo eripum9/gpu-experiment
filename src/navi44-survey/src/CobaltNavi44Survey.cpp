@@ -11,6 +11,7 @@
 #include "gpu_profile.hpp"
 #include "gfx_topology.hpp"
 #include "aperture_plan.hpp"
+#include "psp_staging.hpp"
 
 #define super IOService
 OSDefineMetaClassAndStructors(CobaltNavi44Survey, IOService)
@@ -48,6 +49,11 @@ bool stateArmed() {
 bool apertureArmed() {
     uint32_t value = 0;
     return PE_parse_boot_argn("cobalt-survey-aperture", &value, sizeof(value)) && value == 1u;
+}
+
+bool stagingArmed() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-staging", &value, sizeof(value)) && value == 1u;
 }
 
 struct PciState {
@@ -132,6 +138,35 @@ struct HdpFlushTarget {
     uint32_t pageOffset() const { return byteOffset & ~0xfffu; }
 };
 
+// The only full-window writable endpoint. No caller receives its raw pointer;
+// all accesses are aligned dwords within this exact 1 MiB mapping.
+class StagingMapping {
+    volatile uint32_t *words {nullptr};
+    friend class Map;
+    explicit StagingMapping(volatile uint32_t *address) : words(address) {}
+public:
+    StagingMapping() = default;
+    bool valid() const { return words && !(reinterpret_cast<uintptr_t>(words) & 3u); }
+    bool read(size_t index, uint32_t &value) const {
+        if (!valid() || index >= cobalt::psp::StagingWindow::kBytes / 4) return false;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        value = cobaltSurveyTestApertureCpuRead(words + index);
+#else
+        value = words[index];
+#endif
+        return true;
+    }
+    bool write(size_t index, uint32_t value) const {
+        if (!valid() || index >= cobalt::psp::StagingWindow::kBytes / 4) return false;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureCpuWrite(words + index, value);
+#else
+        words[index] = value;
+#endif
+        return true;
+    }
+};
+
 class Map {
     IOMemoryMap *value {nullptr};
     const char *failure {"none"};
@@ -176,6 +211,11 @@ public:
         return plan.ok && plan.windowBytes == (1ULL << 20) &&
             !(plan.windowOffset & ((1ULL << 20) - 1)) &&
             createPolicy(a, plan.windowOffset, 4096, true);
+    }
+    bool createStagingWindow(const Aperture &a, const cobalt::survey::Plan &plan) {
+        return plan.ok && plan.windowBytes == cobalt::psp::StagingWindow::kBytes &&
+            !(plan.windowOffset & (cobalt::psp::StagingWindow::kBytes - 1)) &&
+            createPolicy(a, plan.windowOffset, cobalt::psp::StagingWindow::kBytes, true);
     }
     bool createFlushPage(const Aperture &a, const HdpFlushTarget &target) {
         return target.valid() && createPolicy(a, target.pageOffset(), 4096, true);
@@ -278,6 +318,14 @@ public:
         if (!base) return nullptr;
         return reinterpret_cast<volatile uint32_t *>(
             const_cast<volatile uint8_t *>(base + (target.byteOffset & 0xfff)));
+    }
+    StagingMapping stagingWindow(const cobalt::survey::Plan &plan) const {
+        if (!value || !plan.ok || plan.windowBytes != cobalt::psp::StagingWindow::kBytes ||
+            (plan.windowOffset & (cobalt::psp::StagingWindow::kBytes - 1)) ||
+            requestedOffset != plan.windowOffset || requestedLength != plan.windowBytes ||
+            requestedOptions != (kMapOptions & ~kIOMapReadOnly)) return {};
+        return StagingMapping(reinterpret_cast<volatile uint32_t *>(
+            const_cast<volatile uint8_t *>(bytes())));
     }
 };
 
@@ -808,6 +856,33 @@ struct ApertureResult {
     bool attempted {false}, success {false};
 };
 
+struct StagingResult : ApertureResult {
+    static constexpr size_t payloadBytes = 125472;
+    static_assert(payloadBytes % sizeof(uint32_t) == 0, "staging payload must contain whole dwords");
+    static_assert(payloadBytes <= cobalt::psp::StagingWindow::kBytes, "staging payload exceeds window");
+    static_assert(cobalt::psp::StagingWindow::kBytes % cobalt::psp::StagingWindow::kChunkBytes == 0,
+        "staging window must contain whole chunks");
+    cobalt::psp::StagingStats helperStats {};
+    uint64_t cpuReadBytes {0}, restoreBytes {0};
+    uint32_t cpuReadChunks {0}, restoreChunks {0};
+    bool originalStable {false}, zeroVerified {false}, copyVerified {false};
+    bool restoreVerified {false}, contextLost {false};
+};
+
+void clearStagingProperties(IOService *service) {
+    const char *names[] = {"Status", "Cleanup", "VramCleanup", "SelectorCleanup", "PlanReason",
+        "WindowOffset", "WindowBytes", "McAddress", "RemapFirstRaw", "RemapSecondRaw", "Attempted",
+        "SelectorWritesIssued", "DataReads", "VramWritesIssued", "FlushWritesIssued", "ReadOnly",
+        "FlushRoute", "GuardMapping", "FlushByteOffset", "NativeFlushByteOffset", "PayloadBytes",
+        "ZeroBytesIssued", "CopyBytesIssued", "ZeroChunksIssued", "CopyChunksIssued", "HelperFlushesIssued",
+        "RestoreBytesIssued", "RestoreChunksIssued", "CpuReadBytes", "CpuReadChunks", "OriginalStable",
+        "ZeroVerified", "CopyVerified", "RestoreVerified", "ContextLost"};
+    for (const char *name : names) {
+        char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,Staging%s", name);
+        service->removeProperty(key);
+    }
+}
+
 void clearApertureProperties(IOService *service) {
     const char *names[] = {"ApertureStatus", "ApertureCleanup", "ApertureVramCleanup", "ApertureSelectorCleanup", "AperturePlanReason",
         "ApertureWindowOffset", "ApertureWindowBytes", "ApertureMcAddress",
@@ -1005,6 +1080,249 @@ public:
     }
 };
 
+class StagingStorage {
+public:
+    uint32_t *original {nullptr};
+    uint8_t *payload {nullptr};
+    StagingStorage() = default;
+    StagingStorage(const StagingStorage &) = delete;
+    StagingStorage &operator=(const StagingStorage &) = delete;
+    ~StagingStorage() { reset(); }
+    void reset() {
+        if (payload) { IOFree(payload, StagingResult::payloadBytes); payload = nullptr; }
+        if (original) { IOFree(original, cobalt::psp::StagingWindow::kBytes); original = nullptr; }
+    }
+    bool allocate() {
+        original = static_cast<uint32_t *>(IOMalloc(cobalt::psp::StagingWindow::kBytes));
+        if (!original) return false;
+        payload = static_cast<uint8_t *>(IOMalloc(StagingResult::payloadBytes));
+        if (!payload) return false;
+        for (size_t offset = 0; offset < StagingResult::payloadBytes; ++offset)
+            payload[offset] = static_cast<uint8_t>((offset * 37u) ^ (offset >> 8) ^
+                (offset >> 16) ^ 0xa7u);
+        return true;
+    }
+};
+
+// One synthetic transfer only. The helper never restores or retries: recovery
+// uses the separately saved original and only the still-valid device context.
+class StagingTransaction final : public cobalt::psp::StagingBus {
+    IOService *service;
+    IOPCIDevice *pci;
+    const PciState &state;
+    const Aperture &mmio, &vram;
+    ProviderSession &session;
+    const ApertureProof &proof;
+    const HdpFlushTarget target;
+    StagingResult &result;
+    StagingStorage &storage;
+    uint32_t mib;
+    const volatile uint8_t *nbif;
+    StagingMapping cpu;
+    const StateObservation &prior;
+    const volatile uint8_t *liveState[2];
+    volatile uint32_t *flush;
+    SelectorIO io;
+    uint32_t savedLow {0}, savedHigh {0};
+    bool selectorDirty {false}, vramDirty {false};
+    static constexpr size_t kBytes = cobalt::psp::StagingWindow::kBytes;
+    static constexpr size_t kChunk = cobalt::psp::StagingWindow::kChunkBytes;
+    bool baseGuard() {
+        if (result.contextLost) return false;
+        const bool current = session.owns() && consoleGuard(pci, state, mmio, vram) &&
+            apertureOnlyClient(pci, service) && session.owns() && consoleGuard(pci, state, mmio, vram);
+        if (!current) result.contextLost = true;
+        return current;
+    }
+    bool registerRead(uint32_t offset, uint32_t &value) {
+        if (!baseGuard()) return false;
+        value = apertureRegisterRead(reinterpret_cast<const volatile uint32_t *>(
+            nbif + (offset & 0xfff)), offset);
+        return baseGuard();
+    }
+    bool selectorRead(uint32_t &low, uint32_t &high) {
+        if (!guard()) return false;
+        low = io.low();
+        if (!guard()) return false;
+        high = io.high();
+        return guard();
+    }
+    bool selectorWrite(bool high, uint32_t value) {
+        if (!guard()) return false;
+        selectorDirty = true; ++result.selectorWrites;
+        if (high) io.high(value); else io.low(value);
+        return guard();
+    }
+    static uint32_t sourceWord(const uint8_t *source) {
+        // Source buffers need not be dword-aligned.
+        return static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8) |
+            (static_cast<uint32_t>(source[2]) << 16) | (static_cast<uint32_t>(source[3]) << 24);
+    }
+    uint32_t expectedWord(size_t index, unsigned mode) const {
+        if (mode == 1) return storage.original[index];
+        if (mode == 3 && index * 4 < StagingResult::payloadBytes)
+            return sourceWord(storage.payload + index * 4);
+        return 0;
+    }
+    bool readWindow(unsigned mode) {
+        for (size_t offset = 0; offset < kBytes; offset += kChunk) {
+            if (!guard()) return false;
+            ++result.cpuReadChunks;
+            bool matches = true;
+            for (size_t local = 0; local < kChunk; local += 4) {
+                const size_t index = (offset + local) / 4;
+                uint32_t value = 0;
+                if (!cpu.read(index, value)) return false;
+                result.cpuReadBytes += 4;
+                if (mode == 0) storage.original[index] = value;
+                else if (value != expectedWord(index, mode)) matches = false;
+            }
+            if (!guard() || !matches) return false;
+        }
+        return true;
+    }
+    bool indexedSamples(unsigned mode) {
+        for (size_t page = 0; page < kBytes; page += kChunk) {
+            for (unsigned edge = 0; edge < 2; ++edge) {
+                const size_t offset = page + (edge ? kChunk - 4 : 0);
+                const uint64_t address = result.plan.windowOffset + offset;
+                const uint32_t low = static_cast<uint32_t>(address) | 0x80000000u;
+                const uint32_t high = static_cast<uint32_t>(address >> 31);
+                if (!selectorWrite(false, low) || !selectorWrite(true, high)) return false;
+                uint32_t observedLow = 0, observedHigh = 0;
+                if (!selectorRead(observedLow, observedHigh) || observedLow != low || observedHigh != high)
+                    return false;
+                if (!guard()) return false;
+                const uint32_t value = io.data(); ++result.dataReads;
+                if (!guard() || value != expectedWord(offset / 4, mode)) return false;
+            }
+        }
+        return true;
+    }
+    bool writeChunk(uint64_t offset, const uint8_t *source, size_t length) {
+        // This experiment only submits word-aligned zero, 125472-byte copy,
+        // and original restoration. Reject any tail instead of widening I/O.
+        if (!cpu.valid() || !length || length > kChunk || (offset & 3) || (length & 3) ||
+            offset < result.plan.windowOffset || offset - result.plan.windowOffset > kBytes ||
+            length > kBytes - (offset - result.plan.windowOffset)) return false;
+        if (!guard()) return false;
+        const size_t index = static_cast<size_t>((offset - result.plan.windowOffset) / 4);
+        for (size_t local = 0; local < length; local += 4) {
+            const uint32_t value = source ? sourceWord(source + local) : 0;
+            vramDirty = true;
+            if (!cpu.write(index + local / 4, value)) return false;
+            ++result.vramWrites;
+        }
+        return guard();
+    }
+public:
+    StagingTransaction(IOService *s, IOPCIDevice *p, const PciState &st,
+        const Aperture &m, const Aperture &v, ProviderSession &owner,
+        const ApertureProof &ip, const HdpFlushTarget &selected, StagingResult &r,
+        StagingStorage &buffers, uint32_t size, const volatile uint8_t *registers,
+        StagingMapping mapping, volatile uint32_t *flushWord, volatile uint32_t *selectors,
+        const StateObservation &observed, const volatile uint8_t *stateFirst,
+        const volatile uint8_t *stateSecond)
+        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), proof(ip), target(selected),
+          result(r), storage(buffers), mib(size), nbif(registers), cpu(mapping), prior(observed),
+          liveState {stateFirst, stateSecond}, flush(flushWord), io(selectors) {}
+    bool guard() {
+        if (result.contextLost) return false;
+        uint32_t remap = 0, memsize = 0;
+        bool current = target.valid() && registerRead(proof.remapOffset, remap) &&
+            remap == target.byteOffset && registerRead(proof.memsizeOffset, memsize) && memsize == mib;
+        for (unsigned n = 0; current && n < 4; ++n) {
+            if (!baseGuard()) { current = false; break; }
+            const uint32_t offset = proof.stateOffsets[n];
+            const auto *address = reinterpret_cast<const volatile uint32_t *>(liveState[n / 2] + (offset & 0xfff));
+#if defined(COBALT_SURVEY_HOSTTEST)
+            const uint32_t value = cobaltSurveyTestReadState32(const_cast<volatile uint32_t *>(address), offset);
+#else
+            const uint32_t value = *address;
+#endif
+            current = baseGuard() && value != UINT32_MAX && value == prior.values[n];
+        }
+        if (!current) result.contextLost = true;
+        return current;
+    }
+    bool contextValid() override { return guard(); }
+    bool zeroChunk(uint64_t offset, size_t length) override { return writeChunk(offset, nullptr, length); }
+    bool copyChunk(uint64_t offset, const uint8_t *source, size_t length) override {
+        return source && writeChunk(offset, source, length);
+    }
+    bool flushWrites() override {
+        if (!guard()) return false;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureFence();
+#else
+        __asm__ volatile("mfence" ::: "memory");
+#endif
+        if (!guard()) return false;
+        ++result.flushWrites;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureFlush(flush);
+#else
+        *flush = 0;
+#endif
+        uint32_t posted = 0;
+        if (!registerRead(proof.memsizeOffset, posted) || posted != mib) {
+            result.contextLost = true; return false;
+        }
+        return guard();
+    }
+    const char *prepare() {
+        uint32_t low = 0, high = 0;
+        if (!selectorRead(savedLow, savedHigh) || !selectorRead(low, high)) return "device-context-changed";
+        if (savedLow == UINT32_MAX || savedHigh == UINT32_MAX || savedLow != low || savedHigh != high)
+            return "selectors-unreadable-or-unstable";
+        if (!readWindow(0)) return "original-read-failed";
+        if (!readWindow(1)) return "original-read-mismatch";
+        result.originalStable = true;
+        return nullptr;
+    }
+    const char *exercise() {
+        if (!indexedSamples(1)) return "original-indexed-mismatch";
+        cobalt::psp::StagingWindow window(*this, result.plan.windowOffset);
+        const bool zeroed = window.zero(result.plan.windowOffset, kBytes);
+        result.helperStats = window.stats();
+        if (!zeroed || !window.cleared()) return "zero-or-flush-failed";
+        if (!readWindow(2) || !indexedSamples(2)) return "zero-read-mismatch";
+        result.zeroVerified = true;
+        const bool copied = window.copy(result.plan.windowOffset, storage.payload, StagingResult::payloadBytes);
+        result.helperStats = window.stats();
+        if (!copied || !window.payloadVisible()) return "copy-or-flush-failed";
+        if (!readWindow(3) || !indexedSamples(3)) return "copy-read-mismatch";
+        result.copyVerified = true;
+        return nullptr;
+    }
+    bool cleanup() {
+        bool restored = true;
+        if (vramDirty) {
+            restored = guard();
+            for (size_t offset = 0; restored && offset < kBytes; offset += kChunk) {
+                if (!guard()) { restored = false; break; }
+                ++result.restoreChunks; result.restoreBytes += kChunk;
+                restored = writeChunk(result.plan.windowOffset + offset,
+                    reinterpret_cast<const uint8_t *>(storage.original) + offset, kChunk);
+            }
+            restored = restored && flushWrites() && readWindow(1) && indexedSamples(1);
+            result.restoreVerified = restored;
+            result.vramCleanup = restored ? "restored-observed" : "restore-skipped-or-unverified";
+            result.cleanup = restored ? "vram-and-selectors-restored-observed" : "vram-restore-unverified";
+        }
+        if (selectorDirty) {
+            uint32_t low = 0, high = 0;
+            const bool selectorsRestored = selectorWrite(false, savedLow) && selectorWrite(true, savedHigh) &&
+                selectorRead(low, high) && low == savedLow && high == savedHigh;
+            result.selectorCleanup = selectorsRestored ? "restored-observed" : "restore-skipped-or-unverified";
+            if (!selectorsRestored) {
+                result.cleanup = "restore-skipped-or-unverified-device-context"; restored = false;
+            } else if (!vramDirty) result.cleanup = "selectors-restored-observed";
+        }
+        return restored;
+    }
+};
+
 const char *freshApertureState(IOService *service, IOPCIDevice *pci, const PciState &state,
     const Aperture &mmio, const Aperture &vram, ProviderSession &session,
     const ApertureProof &proof, const StateObservation &prior) {
@@ -1032,11 +1350,11 @@ const char *freshApertureState(IOService *service, IOPCIDevice *pci, const PciSt
     return nullptr;
 }
 
-void runAperture(IOService *service, IOPCIDevice *pci, const PciState &state,
+void runApertureExperiment(IOService *service, IOPCIDevice *pci, const PciState &state,
     const Aperture &mmio, const Aperture &vram, uint32_t mib,
     const ApertureProof &proof, const StateObservation &prior, const ConsoleObservation &console,
-    ApertureResult &result) {
-    if (!indexedArmed() || !stateArmed()) return;
+    ApertureResult &result, StagingResult *staging) {
+    if (!indexedArmed() || !stateArmed() || (staging && !apertureArmed())) return;
     if ((state.classRevision & 0xff) != 0xc0 || state.subsystem != 0x86011eae ||
         vram.length != (256ULL << 20) || mmio.length != 0x80000) {
         result.status = "board-policy-refused"; return;
@@ -1058,7 +1376,8 @@ void runAperture(IOService *service, IOPCIDevice *pci, const PciState &state,
     if (!session.open()) { result.status = "provider-busy"; return; }
     if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
         !apertureOnlyClient(pci, service)) { result.status = "device-context-changed"; return; }
-    if (pci->getProperty("CobaltSurvey,ApertureAttempt-v1")) { result.status = "already-attempted"; return; }
+    const char *attemptKey = staging ? "CobaltSurvey,StagingAttempt-v1" : "CobaltSurvey,ApertureAttempt-v1";
+    if (pci->getProperty(attemptKey)) { result.status = "already-attempted"; return; }
     ConsoleObservation freshConsole {};
     result.status = passiveConsole(pci, state, mmio, vram, freshConsole);
     if (result.status) return;
@@ -1104,15 +1423,68 @@ void runAperture(IOService *service, IOPCIDevice *pci, const PciState &state,
             result.status = "device-context-changed"; return;
         }
     }
-    if (!selectors.createIndexedPage(mmio) || !probe.createProbePage(vram, result.plan) ||
+    if (!selectors.createIndexedPage(mmio) ||
+        !(staging ? probe.createStagingWindow(vram, result.plan) : probe.createProbePage(vram, result.plan)) ||
         !flush.createFlushPage(mmio, target)) { result.status = "writable-map-failed"; return; }
     if (target.native) registers = flush.bytes();
-    volatile uint32_t *selectorWords = selectors.selectorPage(), *cpuWords = probe.probePage(result.plan),
+    volatile uint32_t *selectorWords = selectors.selectorPage(),
+        *cpuWords = staging ? nullptr : probe.probePage(result.plan),
         *flushWord = flush.flushWord(target);
-    if (!registers || !selectorWords || !cpuWords || !flushWord ||
+    const StagingMapping stagingMapping = staging ? probe.stagingWindow(result.plan) : StagingMapping {};
+    if (!registers || !selectorWords || (!staging && !cpuWords) || (staging && !stagingMapping.valid()) || !flushWord ||
         ((reinterpret_cast<uintptr_t>(selectorWords) | reinterpret_cast<uintptr_t>(cpuWords) |
           reinterpret_cast<uintptr_t>(flushWord) | reinterpret_cast<uintptr_t>(registers)) & 3)) {
         result.status = "writable-map-invalid"; return;
+    }
+    if (staging) {
+        Map liveState[2];
+        const uint32_t pages[] = {proof.stateOffsets[0] & ~0xfffu, proof.stateOffsets[2] & ~0xfffu};
+        if (pages[0] == pages[1]) { result.status = "live-state-map-invalid"; return; }
+        for (unsigned n = 0; n < 4; ++n) {
+            if ((proof.stateOffsets[n] & 3) ||
+                (proof.stateOffsets[n] & ~0xfffu) != pages[n / 2]) {
+                result.status = "live-state-map-invalid"; return;
+            }
+        }
+        for (unsigned n = 0; n < 2; ++n) {
+            if (!pages[n] || pages[n] == target.pageOffset() || pages[n] == (proof.remapOffset & ~0xfffu) ||
+                !liveState[n].create(mmio, pages[n], 4096)) {
+                result.status = "live-state-map-failed"; return;
+            }
+            const auto *address = liveState[n].bytes();
+            if (!address || (reinterpret_cast<uintptr_t>(address) & 3)) {
+                result.status = "live-state-map-invalid"; return;
+            }
+        }
+        StagingStorage storage;
+        if (!storage.allocate()) { result.status = "staging-allocation-failed"; return; }
+        StagingTransaction transaction(service, pci, state, mmio, vram, session, proof, target,
+            *staging, storage, mib, registers, stagingMapping, flushWord, selectorWords,
+            prior, liveState[0].bytes(), liveState[1].bytes());
+        result.status = transaction.prepare();
+        if (result.status) return;
+        if (!transaction.guard()) { result.status = "device-context-changed"; return; }
+        if (pci->getProperty(attemptKey)) { result.status = "already-attempted"; return; }
+        // Publish required authorization metadata before claiming or issuing
+        // selectors/VRAM writes. Missing metadata never starts the experiment.
+        if (!service->setProperty("CobaltSurvey,Ready", false) ||
+            !service->setProperty("CobaltSurvey,ReadOnly", false) ||
+            !service->setProperty("CobaltSurvey,AccessMode", "indexed-and-synthetic-staging-writes")) {
+            result.status = "metadata-publication-failed"; return;
+        }
+        if (!transaction.guard()) { result.status = "device-context-changed"; return; }
+        if (!pci->setProperty(attemptKey, true)) { result.status = "attempt-claim-failed"; return; }
+        result.attempted = true;
+        result.status = transaction.exercise();
+        const bool cleaned = transaction.cleanup();
+        storage.reset();
+        liveState[0].reset(); liveState[1].reset();
+        flush.reset(); probe.reset(); selectors.reset(); nbif.reset(); session.close();
+        if (!cleaned) result.status = "cleanup-unverified";
+        else if (!consoleGuard(pci, state, mmio, vram)) result.status = "device-context-changed";
+        result.success = !result.status;
+        if (result.success) result.status = "synthetic-zero-copy-and-restore-verified";
+        return;
     }
     ApertureTransaction transaction(service, pci, state, mmio, vram, session, proof, target, result,
         mib, registers, cpuWords, flushWord, selectorWords);
@@ -1136,6 +1508,18 @@ void runAperture(IOService *service, IOPCIDevice *pci, const PciState &state,
     else if (!consoleGuard(pci, state, mmio, vram)) result.status = "device-context-changed";
     result.success = !result.status;
     if (result.success) result.status = "pattern-and-restore-verified";
+}
+
+void runAperture(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, uint32_t mib,
+    const ApertureProof &proof, const StateObservation &prior, const ConsoleObservation &console,
+    ApertureResult &result, StagingResult *staging = nullptr) {
+    if (stagingArmed()) {
+        if (!staging) { result.status = "staging-result-unavailable"; return; }
+        runApertureExperiment(service, pci, state, mmio, vram, mib, proof, prior, console, *staging, staging);
+    } else {
+        runApertureExperiment(service, pci, state, mmio, vram, mib, proof, prior, console, result, nullptr);
+    }
 }
 
 void publishAperture(IOService *service, ApertureResult &result) {
@@ -1172,6 +1556,69 @@ void publishAperture(IOService *service, ApertureResult &result) {
         service->setProperty("CobaltSurvey,ApertureStatus", "metadata-publication-failed");
         service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
         result.success = false;
+    }
+}
+
+void publishStaging(IOService *service, StagingResult &result) {
+    bool published = true;
+    // Evaluate every publication even after one fails, so issued counts remain
+    // available independently of success metadata. Schema 6 is committed last.
+#define STAGING_PROPERTY(name, value) \
+    published = service->setProperty("CobaltSurvey,Staging" name, value) && published
+#define STAGING_NUMBER(name, value, bits) \
+    published = service->setProperty("CobaltSurvey,Staging" name, value, bits) && published
+    STAGING_PROPERTY("Attempted", result.attempted);
+    STAGING_NUMBER("SelectorWritesIssued", result.selectorWrites, 32);
+    STAGING_NUMBER("DataReads", result.dataReads, 32);
+    STAGING_NUMBER("VramWritesIssued", result.vramWrites, 32);
+    STAGING_NUMBER("FlushWritesIssued", result.flushWrites, 32);
+    STAGING_NUMBER("ZeroBytesIssued", result.helperStats.zeroBytesIssued, 64);
+    STAGING_NUMBER("CopyBytesIssued", result.helperStats.copyBytesIssued, 64);
+    STAGING_NUMBER("ZeroChunksIssued", result.helperStats.zeroChunksIssued, 32);
+    STAGING_NUMBER("CopyChunksIssued", result.helperStats.copyChunksIssued, 32);
+    STAGING_NUMBER("HelperFlushesIssued", result.helperStats.flushesIssued, 32);
+    STAGING_NUMBER("RestoreBytesIssued", result.restoreBytes, 64);
+    STAGING_NUMBER("RestoreChunksIssued", result.restoreChunks, 32);
+    STAGING_NUMBER("CpuReadBytes", result.cpuReadBytes, 64);
+    STAGING_NUMBER("CpuReadChunks", result.cpuReadChunks, 32);
+    STAGING_PROPERTY("Cleanup", result.cleanup);
+    STAGING_PROPERTY("VramCleanup", result.vramCleanup);
+    STAGING_PROPERTY("SelectorCleanup", result.selectorCleanup);
+    STAGING_NUMBER("RemapFirstRaw", result.remap[0], 32);
+    STAGING_NUMBER("RemapSecondRaw", result.remap[1], 32);
+    STAGING_PROPERTY("FlushRoute", result.flushRoute);
+    STAGING_PROPERTY("GuardMapping", result.guardMapping);
+    STAGING_NUMBER("FlushByteOffset", result.flushOffset, 32);
+    STAGING_NUMBER("NativeFlushByteOffset", result.nativeFlushOffset, 32);
+    STAGING_PROPERTY("PlanReason", result.plan.reason);
+    STAGING_NUMBER("WindowOffset", result.plan.windowOffset, 64);
+    STAGING_NUMBER("WindowBytes", result.plan.windowBytes, 64);
+    STAGING_NUMBER("McAddress", result.plan.mcAddress, 64);
+    STAGING_NUMBER("PayloadBytes", StagingResult::payloadBytes, 64);
+    STAGING_PROPERTY("ReadOnly", !result.attempted);
+    STAGING_PROPERTY("OriginalStable", result.originalStable);
+    STAGING_PROPERTY("ZeroVerified", result.zeroVerified);
+    STAGING_PROPERTY("CopyVerified", result.copyVerified);
+    STAGING_PROPERTY("RestoreVerified", result.restoreVerified);
+    STAGING_PROPERTY("ContextLost", result.contextLost);
+    STAGING_PROPERTY("Status", result.status);
+#undef STAGING_PROPERTY
+#undef STAGING_NUMBER
+    published = published && service->setProperty("CobaltSurvey,Schema", result.success ? 6ULL : 4ULL, 32);
+    if (!published) {
+        const char *partial[] = {"WindowOffset", "WindowBytes", "McAddress", "RemapFirstRaw", "RemapSecondRaw",
+            "PlanReason", "ReadOnly", "FlushRoute", "GuardMapping", "FlushByteOffset", "NativeFlushByteOffset",
+            "PayloadBytes", "OriginalStable", "ZeroVerified", "CopyVerified", "RestoreVerified"};
+        for (const char *name : partial) {
+            char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,Staging%s", name); service->removeProperty(key);
+        }
+        result.success = false;
+        result.status = "metadata-publication-failed";
+        service->removeProperty("CobaltSurvey,StagingStatus");
+        service->setProperty("CobaltSurvey,StagingStatus", result.status);
+        // Revoke any earlier schema 6 before the fallible fallback update.
+        service->removeProperty("CobaltSurvey,Schema");
+        service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
     }
 }
 
@@ -1230,6 +1677,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     clearStateProperties(this);
     clearConsoleProperties(this);
     clearApertureProperties(this);
+    clearStagingProperties(this);
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -1385,6 +1833,7 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     const bool collectAperture = apertureArmed();
     const ApertureProof proof = collectAperture ? apertureProof(parser, stateResult, mmio) : ApertureProof {};
     ApertureResult apertureResult;
+    StagingResult stagingResult;
     const uint64_t binaryOffset = parser.binaryOffset();
     const uint32_t ipCount = parser.ipCount();
     discovery.reset();
@@ -1421,18 +1870,22 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
             else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
             else if (collectAperture) {
-                runAperture(this, pci, s, mmio, vram, first, proof, stateResult, consoleResult, apertureResult);
+                runAperture(this, pci, s, mmio, vram, first, proof, stateResult, consoleResult,
+                    apertureResult, &stagingResult);
                 // runAperture owns every aperture resource synchronously. No
                 // mapped byte or provider ownership escapes into publication.
+                ApertureResult &experiment = stagingArmed() ? stagingResult : apertureResult;
                 if (!consoleGuard(pci, s, mmio, vram)) {
-                    apertureResult.success = false;
-                    apertureResult.status = "device-context-changed";
+                    experiment.success = false;
+                    experiment.status = "device-context-changed";
                 }
-                publishAperture(this, apertureResult);
+                if (stagingArmed()) publishStaging(this, stagingResult);
+                else publishAperture(this, apertureResult);
                 if (!consoleGuard(pci, s, mmio, vram)) {
-                    apertureResult.success = false;
-                    apertureResult.status = "device-context-changed";
-                    publishAperture(this, apertureResult);
+                    experiment.success = false;
+                    experiment.status = "device-context-changed";
+                    if (stagingArmed()) publishStaging(this, stagingResult);
+                    else publishAperture(this, apertureResult);
                 }
             }
         }
@@ -1445,6 +1898,7 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     clearStateProperties(this);
     clearConsoleProperties(this);
     clearApertureProperties(this);
+    clearStagingProperties(this);
     status("stopped");
     super::stop(provider);
 }
