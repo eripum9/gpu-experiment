@@ -184,15 +184,34 @@ Before any new selector or VRAM write, the service opens the provider,
 checks for other direct clients, rechecks the console and PSP/MMHUB state,
 and validates all mappings. NBIF's memory-size and HDP-flush-remap register
 offsets are resolved from the validated discovery segment. Two remap reads
-must agree and equal exactly `0x7f000`. An absent, different or changing
-remap refuses the experiment; the service never programs the remap register.
+must agree and equal either `0x7f000` or the independently resolved native
+NBIF memory-flush register. An absent, different or changing remap refuses
+the experiment; the service never programs the remap register. Every later
+guard requires that same selected value, including when a change would select
+the other otherwise supported route.
 The offset and segment pairs follow Linux v6.19's
 [NBIF header](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/include/asic_reg/nbif/nbif_6_3_1_offset.h).
 
+The native register is `BIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL`, dword
+offset `0xf7` in NBIF segment 2. Its byte address is calculated through
+discovery; a captured remap value alone cannot authorize an arbitrary target.
+Linux's [NBIF remap selection](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c)
+uses this native target for its VF or large-page fallback, and selects the
+isolated `0x7f000` hole for a non-VF system with 4 KiB pages. The survey can
+use either already configured route without changing that configuration.
+
 The writable mappings are restricted to the existing selector page, one
-VRAM page, and the single 4 KiB HDP flush page. The only HDP write is zero
-to the page's first dword. A CPU memory barrier precedes that write; a
-read of NBIF's memory-size register posts it. This sequence follows Linux's
+VRAM page, and one 4 KiB flush page. With the isolated route, the NBIF
+guard page remains mapped read-only and the flush word is the first dword
+of its separate page. With the native route, the flush word shares the NBIF
+guard page: the service releases its read-only preflight view before creating
+a single writable replacement. This avoids simultaneous read-only/writable
+aliases. The page has writable hardware permissions; fixed-purpose accessors
+only read the two guard registers and only write zero to the resolved flush
+word. It is not described as a read-only hardware mapping.
+
+A CPU memory barrier precedes that write; a read of NBIF's memory-size
+register posts it. This sequence follows Linux's
 [aperture access](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c)
 and [HDP flush](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_hdp.c)
 paths. It does not infer a valid remap from the HDP version alone.
@@ -214,7 +233,9 @@ an observation, not a guarantee against concurrent firmware access or reset.
 The provider-open contract has the same limitations as indexed discovery.
 
 Aperture operation counters and VRAM/selector cleanup results are separate
-from the discovery counters. No original VRAM contents are published.
+from the discovery counters. The selected route, native and selected flush
+byte offsets, and guard-page mapping policy are reported separately. No
+original VRAM contents are published.
 Maps are released and the provider is closed before the result is published.
 A complete successful result uses schema 5; refusals and failures preserve
 the independently valid discovery/state/console observations. `Ready` stays

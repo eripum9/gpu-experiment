@@ -47,11 +47,14 @@ struct TestState {
     bool apertureBootPresent = false, apertureClaimFail = false, apertureClaimed = false;
     uint64_t apertureOffset = 64ULL << 20;
     uint32_t apertureRemap = 0x7f000, apertureMemsize = 16304;
+    uint32_t apertureNbifSegmentBase = 0xd20;
+    bool apertureNativeRoute = false, apertureNbifReadLive = false;
     unsigned apertureRegisterReads = 0, apertureDataReads = 0, apertureCpuReads = 0;
     unsigned apertureCpuWrites = 0, apertureFlushWrites = 0, apertureFences = 0;
     bool probeMapLive = false, flushMapLive = false;
     volatile uint32_t *probePage = nullptr, *flushPage = nullptr;
     const volatile uint32_t *nbifPage = nullptr;
+    std::function<void()> onApertureNbifRelease;
     std::vector<uint32_t> apertureCpu = std::vector<uint32_t>(1024, 0xabc01234);
     std::vector<uint32_t> apertureGpu = std::vector<uint32_t>(4, 0xabc01234);
     std::vector<uint32_t> apertureFlush = std::vector<uint32_t>(1024);
@@ -240,7 +243,7 @@ public:
     IOByteCount descriptorOffset = 0;
     bool fragmented = false, wrongSegment = false;
     bool indexedMapping = false;
-    bool probeMapping = false, flushMapping = false;
+    bool probeMapping = false, flushMapping = false, nbifMapping = false, nativeFlushMapping = false;
     std::function<void()> onAddress;
     IOMemoryMap() { ++testState.mapsLive; }
     ~IOMemoryMap() override;
@@ -293,16 +296,20 @@ public:
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const bool flush = aperturePhase() && physical == 0xc0000000 && offset == 0x7f000 && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const bool nbifRead = aperturePhase() && physical == 0xc0000000 &&
+            (offset == 0x3000 || offset == 0x7f000) && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
+        const bool nativeFlush = aperturePhase() && physical == 0xc0000000 && offset == 0x3000 && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const bool stateMap = testState.stateBootPresent && n == 4096 && offset != 0x3000 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
         if (stateMap) {
             testState.stateMapRequests.emplace_back(offset, options);
             testState.stateMapBases.emplace_back(offset, reinterpret_cast<uintptr_t>(storage.data()));
         }
-        if (aperturePhase() && physical == 0xc0000000 && offset == 0x3000 && n == 4096 &&
-            options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))
-            testState.nbifPage = storage.data();
-        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !probe && !flush &&
+        if (nativeFlush && testState.apertureNbifReadLive)
+            throw std::runtime_error("native flush RW map aliases a live read-only NBIF map");
+        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !probe && !flush && !nbifRead && !nativeFlush &&
             (offset != expectedOffset || n != expectedLength ||
              options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
@@ -342,7 +349,7 @@ public:
         }
         map->address = mapNullAddress ? 0 : reinterpret_cast<uintptr_t>(
             indexed ? selectorStorage.data() : probe ? testState.apertureCpu.data() :
-                flush ? testState.apertureFlush.data() : storage.data());
+                (flush || nbifRead || nativeFlush) ? testState.apertureFlush.data() : storage.data());
         if (mapMisalignedAddress && map->address) ++map->address;
         if (indexed) {
             map->indexedMapping = true;
@@ -357,6 +364,17 @@ public:
             map->flushMapping = true; testState.flushMapLive = true;
             testState.flushPage = testState.apertureFlush.data();
         }
+        if (nbifRead) {
+            map->nbifMapping = true;
+            testState.apertureNbifReadLive = true;
+            testState.nbifPage = testState.apertureFlush.data();
+        }
+        if (nativeFlush) {
+            map->nativeFlushMapping = true;
+            testState.flushMapLive = true;
+            testState.flushPage = testState.apertureFlush.data();
+            testState.nbifPage = testState.apertureFlush.data();
+        }
         map->onAddress = onAddress;
         return map;
     }
@@ -365,6 +383,15 @@ inline IOMemoryMap::~IOMemoryMap() {
     if (indexedMapping) testState.indexedMapLive = false;
     if (probeMapping) testState.probeMapLive = false;
     if (flushMapping) testState.flushMapLive = false;
+    if (nbifMapping) {
+        testState.apertureNbifReadLive = false;
+        testState.nbifPage = nullptr;
+        if (testState.onApertureNbifRelease) testState.onApertureNbifRelease();
+    }
+    if (nativeFlushMapping) {
+        testState.flushMapLive = false;
+        testState.nbifPage = nullptr;
+    }
     if (ownsDescriptor) descriptor->release();
     --testState.mapsLive; ++testState.mapReleases;
     if (testState.onMapRelease) testState.onMapRelease(testState.mapReleases);
@@ -514,10 +541,13 @@ inline void apertureIoOwnership() {
         throw std::runtime_error("aperture access without owned explicit attempt");
 }
 inline uint32_t cobaltSurveyTestApertureRegisterRead(const volatile uint32_t *address, uint32_t offset) {
-    if (!aperturePhase() || !testState.nbifPage || (offset != 0x3934 && offset != 0x378c) ||
+    const uint32_t remapOffset = (testState.apertureNbifSegmentBase + 0x12d) * 4;
+    const uint32_t memsizeOffset = (testState.apertureNbifSegmentBase + 0xc3) * 4;
+    if (!aperturePhase() || !testState.nbifPage ||
+        (offset != remapOffset && offset != memsizeOffset) ||
         address != testState.nbifPage + (offset & 0xfff)/4)
         throw std::runtime_error("aperture register read outside proven NBIF allowlist");
-    uint32_t value = offset == 0x3934 ? testState.apertureRemap : testState.apertureMemsize;
+    uint32_t value = offset == remapOffset ? testState.apertureRemap : testState.apertureMemsize;
     if (testState.apertureRegisterRead) value = testState.apertureRegisterRead(offset, value);
     ++testState.apertureRegisterReads;
     apertureEvent('n', offset, value);
@@ -547,7 +577,11 @@ inline void cobaltSurveyTestApertureFence() {
 }
 inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
     apertureIoOwnership();
-    if (!testState.flushMapLive || address != testState.flushPage ||
+    const uint32_t nativeFlushOffset = (testState.apertureNbifSegmentBase + 0xf7) * 4;
+    volatile uint32_t *expected = testState.apertureNativeRoute
+        ? testState.apertureFlush.data() + (nativeFlushOffset & 0xfff) / 4
+        : testState.apertureFlush.data();
+    if (!testState.flushMapLive || address != expected ||
         testState.apertureFences != testState.apertureFlushWrites+1)
         throw std::runtime_error("HDP flush outside fixed page or without fence");
     *address = 0;
