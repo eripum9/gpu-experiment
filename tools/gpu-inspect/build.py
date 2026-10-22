@@ -89,6 +89,26 @@ def test_psp_protocol(cxx, firmware):
     run([output, *firmware])
 
 
+def test_psp_staging(cxx, firmware):
+    # Test the production bounded staging helper through the actual PSP loader
+    # and a simulated coherent/incoherent VRAM bus; this never maps hardware.
+    output = BUILD / ("psp-staging-test.exe" if os.name == "nt" else "psp-staging-test")
+    sources = [TESTS / "psp_staging_test.cpp", SRC / "psp.cpp"]
+    if Path(cxx).stem.lower() in ("cl", "clang-cl"):
+        objects = []
+        for source in sources:
+            obj = BUILD / f"psp-staging_{source.stem}.obj"
+            run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
+                 f"/I{TESTS / 'pspshim'}", f"/I{SRC}", "/c", source, f"/Fo{obj}"])
+            objects.append(obj)
+        run([cxx, "/nologo", *objects, f"/Fe{output}"])
+    else:
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O1",
+             "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+             "-I", TESTS / "pspshim", "-I", SRC, *sources, "-o", output])
+    run([output, *firmware])
+
+
 def test_psp_containers(cxx):
     parser_test = compile_host(cxx, "psp-container-test", [TESTS / "psp_container_test.cpp"])
     # Firmware is optional in host-only checkouts. CI repeats these executables
@@ -121,6 +141,7 @@ def test_psp_containers(cxx):
              *sources, "-o", output])
     run([output, *firmware])
     test_psp_protocol(cxx, firmware)
+    test_psp_staging(cxx, firmware)
 
 
 def main():

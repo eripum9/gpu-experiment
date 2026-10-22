@@ -73,6 +73,9 @@ jobs:
           build/gpu-inspect/psp-protocol-test \
             src/navi48-bringup/firmware/psp_14_0_2_sos.bin \
             src/navi48-bringup/firmware/psp_14_0_3_sos.bin
+          build/gpu-inspect/psp-staging-test \
+            src/navi48-bringup/firmware/psp_14_0_2_sos.bin \
+            src/navi48-bringup/firmware/psp_14_0_3_sos.bin
 
       - name: Compile x86_64 bring-up kext
         run: make -C src/navi48-bringup MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
@@ -115,6 +118,7 @@ jobs:
             build/gpu-inspect/psp-container-test
             build/gpu-inspect/psp-adapter-test
             build/gpu-inspect/psp-protocol-test
+            build/gpu-inspect/psp-staging-test
           if-no-files-found: error
           retention-days: 7
 
