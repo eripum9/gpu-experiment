@@ -23,6 +23,16 @@ constexpr IOOptionBits kIOMapReadOnly = 0x1000, kIOMapInhibitCache = 0x100;
 constexpr IOOptionBits kIOMapCacheMask = 0xf00, kIOMemoryMapperNone = 0x800;
 
 class IOService;
+class IOPlatformExpert;
+using IOReturn = int32_t;
+constexpr IOReturn kIOReturnSuccess = 0;
+// Match the production LP64 scalar width even when Windows unsigned long is32bit.
+struct PE_Video {
+    uint64_t v_baseAddr=0, v_rowBytes=0, v_width=0, v_height=0, v_depth=0, v_display=0;
+    char v_pixelFormat[64] {};
+    uint64_t v_offset=0, v_length=0;
+    uint8_t v_rotate=0, v_scale=0;
+};
 struct MmioEvent { char operation; uint32_t offset, value; };
 
 struct TestState {
@@ -34,6 +44,12 @@ struct TestState {
     std::string stateBoot = "1";
     bool stateBootPresent = false;
     std::string propertyFailKey;
+    bool platformAvailable = false, failConsoleSchema = false;
+    unsigned platformCalls = 0, consoleCalls = 0;
+    PE_Video console;
+    IOReturn consoleResult = kIOReturnSuccess;
+    std::function<void(unsigned, PE_Video &)> onConsole;
+    std::function<void(const std::string &)> onConsolePublication;
     unsigned openCalls = 0, closeCalls = 0, openLive = 0, iteratorsLive = 0;
     unsigned selectorWrites = 0, indexedDataReads = 0;
     unsigned stateReads = 0;
@@ -112,15 +128,27 @@ public:
     virtual IOService *probe(IOService *, SInt32 *) { return this; }
     virtual bool start(IOService *) { ++startCalls; return testState.superStart; }
     virtual void stop(IOService *) { ++stopCalls; }
+    static IOPlatformExpert *getPlatform();
+    void consolePublication(const char *key) {
+        if (std::string(key).find("CobaltSurvey,Console") != 0) return;
+        if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
+            testState.openLive || testState.iteratorsLive)
+            throw std::runtime_error("GPU resources retained at console publication");
+        if (testState.onConsolePublication) testState.onConsolePublication(key);
+    }
     bool setProperty(const char *key, const char *value) {
+        consolePublication(key);
         if (testState.propertyFailKey == key) return false;
         strings[key] = value; return true;
     }
     bool setProperty(const char *key, uint64_t value, unsigned) {
+        consolePublication(key);
+        if (testState.failConsoleSchema && std::string(key)=="CobaltSurvey,Schema" && value==4) return false;
         if (testState.propertyFailKey == key) return false;
         numbers[key] = value; return true;
     }
     bool setProperty(const char *key, bool value) {
+        consolePublication(key);
         if (testState.propertyFailKey == key) return false;
         if (std::string(key) == "CobaltSurvey,IndexedAttempt-v1" && testState.claimFail) return false;
         numbers[key] = value ? 1 : 0; return true;
@@ -147,6 +175,24 @@ public:
         registered = true;
     }
 };
+
+class IOPlatformExpert {
+public:
+    IOReturn getConsoleInfo(PE_Video *video) {
+        if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
+            testState.openLive || testState.iteratorsLive)
+            throw std::runtime_error("GPU resources retained at console API");
+        ++testState.consoleCalls;
+        *video = testState.console;
+        if (testState.onConsole) testState.onConsole(testState.consoleCalls, *video);
+        return testState.consoleResult;
+    }
+};
+inline IOPlatformExpert fakePlatform;
+inline IOPlatformExpert *IOService::getPlatform() {
+    ++testState.platformCalls;
+    return testState.platformAvailable ? &fakePlatform : nullptr;
+}
 
 class IOMemoryDescriptor;
 class IOMemoryMap : public OSObject {

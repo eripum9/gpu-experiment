@@ -63,7 +63,7 @@ def payload() -> dict[str, bytes]:
         "CobaltNavi44Survey hardware-test candidate\n"
         f"Source revision: {revision}\n"
         "Architecture: x86_64\n"
-        "Scope: default read-only PCI/direct-memory survey; separately gated indexed VRAM reads permit address-selector writes; optional passive PSP/MMHUB state reads\n"
+        "Scope: default read-only PCI/direct-memory survey; separately gated indexed VRAM reads permit address-selector writes; optional passive PSP/MMHUB state reads and OS console metadata\n"
         "Hardware validation: not yet loaded on the target GPU\n"
         "Acceleration: unavailable; Navi 44 bring-up remains disabled\n"
         "Contains no GPU firmware or Navi48Bringup executable\n"

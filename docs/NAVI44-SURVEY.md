@@ -124,6 +124,37 @@ that crosses that page boundary. Successful state publication uses survey
 schema 3; discovery-only read-only and indexed observations retain their
 existing schemas. Removing the state flag preserves the previous read set.
 
+### Passive OS console geometry
+
+The state mode also samples the OS console description twice using
+`IOPlatformExpert::getConsoleInfo`. This adds no GPU register reads, memory
+maps, or writes. It records the raw address, row bytes, dimensions, depth,
+display mode, offset, length, rotation and scale. The platform pointer is
+borrowed; the service neither changes the console nor maps its pixels.
+
+The scalar observations must agree and the target PCI identity, configuration
+and BAR descriptors must remain unchanged. Console failures have a separate
+status and preserve valid discovery and PSP/MMHUB observations. Successful
+console metadata uses schema 4; a state result without console metadata
+retains schema 3. The collector captures either result without additional
+privileges or commands.
+
+A derived BAR0-relative interval is reported only for a page-aligned raw
+address, zero console offset and rotation, graphics display mode, consistent
+nonzero geometry, checked arithmetic, and a complete interval inside the same
+validated BAR0 descriptor. A zero
+explicit length uses row bytes times height; a nonzero explicit length must
+cover that span and is included in the containment check. Other stable console
+descriptions retain their raw fields with a refusal reason. In particular,
+address low bits are not silently masked and nonzero offsets are not guessed.
+
+This describes a console interval, not a reserved firmware buffer. It does
+not select a scratch address, prove all firmware/display reservations, establish
+BAR0-to-GPU address translation, or authorize a firmware upload. Those remain
+separate initialization prerequisites. The API and scalar layout follow
+[XNU's platform expert](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOPlatformExpert.cpp)
+and [x86 console implementation](https://github.com/apple-oss-distributions/xnu/blob/main/pexpert/i386/pe_init.c).
+
 ### Installing the selected diagnostic mode
 
 The CI artifact is a hardware-test candidate. Keep the known working EFI

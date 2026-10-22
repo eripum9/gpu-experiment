@@ -1,5 +1,6 @@
 #include "CobaltNavi44Survey.hpp"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSData.h>
@@ -350,6 +351,117 @@ void publishStateFailure(IOService *service, const char *reason) {
         clearStateProperties(service);
 }
 
+// OS console metadata only. These observations do not reserve GPU memory or
+// establish that any address outside the current console is safe to write.
+constexpr unsigned kConsoleScalarCount = 10;
+const char *const kConsoleNames[kConsoleScalarCount] = {"ConsoleBaseRaw", "ConsoleRowBytes",
+    "ConsoleWidth", "ConsoleHeight", "ConsoleDepth", "ConsoleDisplay", "ConsoleOffsetRaw",
+    "ConsoleLengthRaw", "ConsoleRotate", "ConsoleScale"};
+struct ConsoleObservation {
+    uint64_t values[kConsoleScalarCount] {};
+    uint64_t offset {0}, span {0};
+    const char *rangeStatus {"unavailable"};
+};
+
+void clearConsoleProperties(IOService *service) {
+    for (const char *name : kConsoleNames) {
+        char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,%s", name);
+        service->removeProperty(key);
+    }
+    const char *extra[] = {"ConsoleStatus", "ConsoleRangeStatus", "ConsoleReadCount",
+        "ConsoleReadOnly", "ConsoleVramOffset", "ConsoleSpanBytes"};
+    for (const char *name : extra) {
+        char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,%s", name);
+        service->removeProperty(key);
+    }
+}
+
+void consoleScalars(const PE_Video &video, uint64_t (&values)[kConsoleScalarCount]) {
+    values[0] = static_cast<uint64_t>(video.v_baseAddr);
+    values[1] = static_cast<uint64_t>(video.v_rowBytes);
+    values[2] = static_cast<uint64_t>(video.v_width);
+    values[3] = static_cast<uint64_t>(video.v_height);
+    values[4] = static_cast<uint64_t>(video.v_depth);
+    values[5] = static_cast<uint64_t>(video.v_display);
+    values[6] = static_cast<uint64_t>(video.v_offset);
+    values[7] = static_cast<uint64_t>(video.v_length);
+    values[8] = static_cast<uint64_t>(video.v_rotate);
+    values[9] = static_cast<uint64_t>(video.v_scale);
+}
+
+const char *consoleRange(ConsoleObservation &result, const Aperture &vram) {
+    const uint64_t *v = result.values;
+    // Do not guess which low bits, if any, are flags. Retain the raw base.
+    if (!v[0] || (v[0] & 0xfff)) return "base-unaligned-or-zero";
+    if (v[6] != 0) return "offset-unsupported";
+    if (v[8] != 0) return "rotation-unsupported";
+    // x86 pexpert/i386/boot.h: GRAPHICS_MODE=1, FB_TEXT_MODE=2.
+    if (v[5] != 1) return "display-mode-unsupported";
+    if (!v[1] || !v[2] || !v[3] || !v[4] || v[4] > 64) return "geometry-invalid";
+    if (v[1] > UINT64_MAX / 8 || v[2] > UINT64_MAX / v[4] ||
+        v[2] * v[4] > v[1] * 8) return "geometry-invalid";
+    if (v[1] > UINT64_MAX / v[3]) return "span-overflow";
+    const uint64_t visible = v[1] * v[3];
+    const uint64_t span = v[7] ? v[7] : visible;
+    if (span < visible) return "length-too-small";
+    if (span > UINT64_MAX - v[0]) return "span-overflow";
+    if (v[0] < vram.physical) return "outside-bar0";
+    const uint64_t offset = v[0] - vram.physical;
+    if (offset >= vram.length || span > vram.length - offset) return "outside-bar0";
+    result.offset = offset; result.span = span;
+    return "inside-bar0-observed";
+}
+
+bool consoleGuard(IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram) {
+    return !pci->isInactive() && unchanged(pci, state) &&
+        apertureUnchanged(pci, 5, mmio) && apertureUnchanged(pci, 0, vram);
+}
+
+const char *passiveConsole(IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, ConsoleObservation &result) {
+    if (!consoleGuard(pci, state, mmio, vram)) return "pci-state-changed";
+    // getPlatform returns a borrowed singleton. Do not release it.
+    IOPlatformExpert *platform = IOService::getPlatform();
+    if (!platform) return "platform-unavailable";
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        if (!consoleGuard(pci, state, mmio, vram)) return "pci-state-changed";
+        PE_Video video {};
+        const IOReturn rc = platform->getConsoleInfo(&video);
+        if (!consoleGuard(pci, state, mmio, vram)) return "pci-state-changed";
+        if (rc != kIOReturnSuccess) return "console-api-failed";
+        uint64_t values[kConsoleScalarCount] {};
+        consoleScalars(video, values);
+        for (unsigned i = 0; i < kConsoleScalarCount; ++i) {
+            if (pass == 0) result.values[i] = values[i];
+            else if (values[i] != result.values[i]) return "console-unstable";
+        }
+    }
+    result.rangeStatus = consoleRange(result, vram);
+    return nullptr;
+}
+
+bool publishConsole(IOService *service, const ConsoleObservation &result) {
+    for (unsigned i = 0; i < kConsoleScalarCount; ++i) {
+        char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,%s", kConsoleNames[i]);
+        if (!service->setProperty(key, result.values[i], 64)) return false;
+    }
+    if (result.span && (!service->setProperty("CobaltSurvey,ConsoleVramOffset", result.offset, 64) ||
+        !service->setProperty("CobaltSurvey,ConsoleSpanBytes", result.span, 64))) return false;
+    return service->setProperty("CobaltSurvey,ConsoleRangeStatus", result.rangeStatus) &&
+        service->setProperty("CobaltSurvey,ConsoleReadCount", 2ULL, 32) &&
+        service->setProperty("CobaltSurvey,ConsoleReadOnly", true) &&
+        service->setProperty("CobaltSurvey,ConsoleStatus", "observed-stable") &&
+        service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
+}
+
+void publishConsoleFailure(IOService *service, const char *reason) {
+    clearConsoleProperties(service);
+    // State was already published successfully before console collection.
+    service->setProperty("CobaltSurvey,Schema", 3ULL, 32);
+    if (!service->setProperty("CobaltSurvey,ConsoleStatus", reason)) clearConsoleProperties(service);
+}
+
 uint32_t readMemsize(const volatile uint8_t *bytes) {
     return OSSwapLittleToHostInt32(*reinterpret_cast<const volatile uint32_t *>(bytes + kMemsizeInPage));
 }
@@ -633,6 +745,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
         removeProperty(key);
     }
     clearStateProperties(this);
+    clearConsoleProperties(this);
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -811,6 +924,15 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             publishStateFailure(this, stateFailure);
         } else if (!publishState(this, stateResult)) {
             publishStateFailure(this, "metadata-publication-failed");
+        } else {
+            // All GPU mappings and temporary snapshot storage were released
+            // before these OS calls. The existing state read set is unchanged.
+            ConsoleObservation consoleResult {};
+            const char *consoleFailure = passiveConsole(pci, s, mmio, vram, consoleResult);
+            if (!consoleFailure && !consoleGuard(pci, s, mmio, vram)) consoleFailure = "pci-state-changed";
+            if (consoleFailure) publishConsoleFailure(this, consoleFailure);
+            else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
+            else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
         }
     }
     status("discovery-snapshot-validated");
@@ -819,6 +941,7 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
 void CobaltNavi44Survey::stop(IOService *provider) {
     removeProperty("CobaltSurvey,DiscoverySnapshot");
     clearStateProperties(this);
+    clearConsoleProperties(this);
     status("stopped");
     super::stop(provider);
 }

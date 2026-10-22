@@ -792,11 +792,204 @@ static void passiveState() {
     }
 }
 
+static void consoleFixture(Device &d) {
+    d.load(stateFixture()); testState.stateBootPresent=true; testState.platformAvailable=true;
+    testState.console.v_baseAddr=d.vram.physical+(2ULL<<20);
+    testState.console.v_rowBytes=4096; testState.console.v_width=1024;
+    testState.console.v_height=768; testState.console.v_depth=32;
+    testState.console.v_display=1; testState.console.v_scale=1;
+}
+static void noConsoleRaw(const Device &d) {
+    CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleBaseRaw"));
+    CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleReadCount"));
+    CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleVramOffset"));
+    CHECK(!d.service.strings.count("CobaltSurvey,ConsoleRangeStatus"));
+    CHECK(d.service.numbers.at("CobaltSurvey,Schema")==3);
+    CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="observed-stable");
+}
+static void passiveConsoleTests() {
+    {
+        Device d; consoleFixture(d); d.run("discovery-snapshot-validated");
+        CHECK(testState.platformCalls==1); CHECK(testState.consoleCalls==2);
+        CHECK(testState.stateReads==8); CHECK(testState.mapRequests==4);
+        CHECK(testState.selectorWrites==0); CHECK(testState.openCalls==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==d.vram.physical+(2ULL<<20));
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")>UINT32_MAX);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleRowBytes")==4096);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleWidth")==1024);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleHeight")==768);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleDepth")==32);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleDisplay")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleOffsetRaw")==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleLengthRaw")==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleRotate")==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleScale")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleReadCount")==2);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleReadOnly")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleVramOffset")==2ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleSpanBytes")==4096*768);
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")=="observed-stable");
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")=="inside-bar0-observed");
+        d.service.stop(&d.pci);
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleBaseRaw"));
+        CHECK(!d.service.strings.count("CobaltSurvey,ConsoleStatus"));
+        testState.stateBootPresent=false;
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleReadCount"));
+        CHECK(!d.service.strings.count("CobaltSurvey,ConsoleRangeStatus"));
+        CHECK(testState.consoleCalls==2);
+    }
+    for(const char *arg : {"0", "2", "true"}) {
+        Device d; consoleFixture(d); testState.stateBoot=arg;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.platformCalls==0); CHECK(testState.consoleCalls==0);
+    }
+    {
+        Device d; consoleFixture(d); testState.stateBootPresent=false;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.platformCalls==0); CHECK(testState.consoleCalls==0);
+    }
+    for(unsigned kind=0;kind<3;++kind) {
+        Device d; consoleFixture(d);
+        if(kind==0) testState.platformAvailable=false;
+        if(kind==1) testState.consoleResult=-1;
+        if(kind==2) testState.onConsole=[](unsigned call, PE_Video &) { if(call==2) testState.consoleResult=-1; };
+        d.run("discovery-snapshot-validated"); noConsoleRaw(d);
+        CHECK(testState.consoleCalls==(kind==0?0u:kind==1?1u:2u));
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")==
+            (kind==0?"platform-unavailable":"console-api-failed"));
+    }
+    for(unsigned scalar=0;scalar<10;++scalar) {
+        Device d; consoleFixture(d);
+        testState.onConsole=[scalar](unsigned call, PE_Video &v) {
+            if(call!=2) return;
+            switch(scalar) {
+            case 0: ++v.v_baseAddr; break; case 1: ++v.v_rowBytes; break;
+            case 2: ++v.v_width; break; case 3: ++v.v_height; break;
+            case 4: ++v.v_depth; break; case 5: ++v.v_display; break;
+            case 6: ++v.v_offset; break; case 7: ++v.v_length; break;
+            case 8: ++v.v_rotate; break; case 9: ++v.v_scale; break;
+            }
+        };
+        d.run("discovery-snapshot-validated"); noConsoleRaw(d);
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")=="console-unstable");
+        CHECK(testState.consoleCalls==2);
+    }
+    // Padding/non-scalar metadata cannot spuriously change the observation.
+    {
+        Device d; consoleFixture(d);
+        testState.onConsole=[](unsigned call, PE_Video &v) { v.v_pixelFormat[0]=char(call); };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+    }
+    const char *rangeFailures[] = {"base-unaligned-or-zero", "base-unaligned-or-zero",
+        "offset-unsupported", "rotation-unsupported", "geometry-invalid", "geometry-invalid",
+        "geometry-invalid", "geometry-invalid", "geometry-invalid", "geometry-invalid",
+        "span-overflow", "span-overflow", "length-too-small", "outside-bar0", "outside-bar0", "outside-bar0"};
+    for(unsigned kind=0;kind<16;++kind) {
+        Device d; consoleFixture(d); auto &v=testState.console;
+        if(kind==0) v.v_baseAddr|=1;
+        if(kind==1) v.v_baseAddr=0;
+        if(kind==2) v.v_offset=4096;
+        if(kind==3) v.v_rotate=1;
+        if(kind==4) v.v_width=0;
+        if(kind==5) v.v_height=0;
+        if(kind==6) v.v_rowBytes=0;
+        if(kind==7) v.v_depth=65;
+        if(kind==8) v.v_width=UINT64_MAX;
+        if(kind==9) v.v_rowBytes=UINT64_MAX;
+        if(kind==10) { v.v_rowBytes=1ULL<<40; v.v_width=1; v.v_height=1ULL<<40; }
+        if(kind==11) v.v_baseAddr=UINT64_MAX&~0xfffULL;
+        if(kind==12) v.v_length=1;
+        if(kind==13) v.v_baseAddr=d.vram.physical-4096;
+        if(kind==14) v.v_baseAddr=d.vram.physical+d.vram.length;
+        if(kind==15) v.v_length=d.vram.length;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")==rangeFailures[kind]);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==v.v_baseAddr);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleOffsetRaw")==v.v_offset);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleLengthRaw")==v.v_length);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleVramOffset"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleSpanBytes"));
+        CHECK(testState.stateReads==8); CHECK(testState.mapRequests==4);
+    }
+    for(uint64_t display : {0ULL,2ULL,UINT64_MAX}) {
+        Device d; consoleFixture(d); testState.console.v_display=display;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")=="display-mode-unsupported");
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleDisplay")==display);
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleVramOffset"));
+    }
+    for(unsigned extra=0;extra<2;++extra) {
+        Device d; consoleFixture(d); auto &v=testState.console;
+        v.v_baseAddr=d.vram.physical+d.vram.length-4096*768;
+        v.v_length=4096*768+extra;
+        d.run("discovery-snapshot-validated");
+        if(extra) CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")=="outside-bar0");
+        else CHECK(d.service.numbers.at("CobaltSurvey,ConsoleSpanBytes")==v.v_length);
+    }
+    {
+        Device d; consoleFixture(d); testState.console.v_length=4ULL<<20;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleSpanBytes")==4ULL<<20);
+    }
+    for(unsigned kind=0;kind<4;++kind) for(unsigned at : {1u,2u}) {
+        Device d; consoleFixture(d);
+        testState.onConsole=[&d,kind,at](unsigned call, PE_Video &) {
+            if(call!=at) return;
+            if(kind==0) d.pci.command=0;
+            if(kind==1) d.pci.bars[0]+=4096;
+            if(kind==2) d.vram.physical+=4096;
+            if(kind==3) d.pci.inactive=true;
+        };
+        d.run("discovery-snapshot-validated"); noConsoleRaw(d);
+        CHECK(testState.consoleCalls==at);
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")=="pci-state-changed");
+    }
+    for(const char *key : {"ConsoleBaseRaw", "ConsoleRowBytes", "ConsoleWidth", "ConsoleHeight",
+        "ConsoleDepth", "ConsoleDisplay", "ConsoleOffsetRaw", "ConsoleLengthRaw", "ConsoleRotate", "ConsoleScale",
+        "ConsoleReadCount", "ConsoleReadOnly", "ConsoleRangeStatus", "ConsoleStatus", "ConsoleVramOffset", "ConsoleSpanBytes"}) {
+        Device d; consoleFixture(d); testState.propertyFailKey=std::string("CobaltSurvey,")+key;
+        d.run("discovery-snapshot-validated"); noConsoleRaw(d);
+        if(std::string(key)=="ConsoleStatus") CHECK(!d.service.strings.count("CobaltSurvey,ConsoleStatus"));
+        else CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")=="metadata-publication-failed");
+    }
+    {
+        Device d; consoleFixture(d); testState.failConsoleSchema=true;
+        d.run("discovery-snapshot-validated"); noConsoleRaw(d);
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")=="metadata-publication-failed");
+    }
+    for(const char *key : {"ConsoleBaseRaw", "ConsoleStatus"}) {
+        Device d; consoleFixture(d);
+        testState.onConsolePublication=[&d,key](const std::string &name) {
+            if(name==std::string("CobaltSurvey,")+key) d.pci.command=0;
+        };
+        d.run("discovery-snapshot-validated"); noConsoleRaw(d);
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleStatus")=="pci-state-changed");
+    }
+    {
+        Device d; consoleFixture(d); d.indexed(); d.run("discovery-snapshot-validated");
+        CHECK(testState.consoleCalls==2); CHECK(testState.stateReads==8);
+        CHECK(testState.selectorWrites==5124); CHECK(testState.mapRequests==4);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly")==0);
+        // Restart without stop must also remove every previous console property.
+        testState.stateBootPresent=false; testState.indexedBootPresent=false;
+        d.vram.length=d.vram.contiguous=16ULL<<30; d.mmio.storage[0x78c/4]=16384;
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleBaseRaw"));
+        CHECK(!d.service.strings.count("CobaltSurvey,ConsoleStatus"));
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==1);
+    }
+}
+
 int main() {
     try {
         gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
         revalidation(); parserAndPublication();
-        indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState();
+        indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState(); passiveConsoleTests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"; return 1;
