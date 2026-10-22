@@ -1,5 +1,6 @@
 #include "CobaltNavi44Survey.hpp"
 #include <FakeIOKit.hpp>
+#include "ipdiscovery.hpp"
 #include <iostream>
 
 static unsigned checks = 0;
@@ -36,6 +37,42 @@ static Bytes fixture() {
     put32(b,gc+12,2); put32(b,gc+16,4); put32(b,gc+24,4);
     put32(b,gc+60,16); put32(b,gc+76,2); repair(b); return b;
 }
+static Bytes stateFixture(uint32_t mmhubBase=0x2500) {
+    Bytes b=fixture();
+    b.insert(b.begin()+static_cast<std::ptrdiff_t>(gc),12,0);
+    put16(b,prefix+10,uint16_t(gc+gcSize+12-prefix));
+    put16(b,prefix+16,uint16_t(ipdsSize+12));
+    put16(b,prefix+20,uint16_t(gc+12-prefix));
+    put16(b,ipds+6,uint16_t(ipdsSize+12));
+    put16(b,die+2,6);
+    const size_t mmhub=die+4+5*12;
+    put16(b,mmhub,34); b[mmhub+3]=1; b[mmhub+4]=4; b[mmhub+5]=1; b[mmhub+6]=0;
+    put32(b,mmhub+8,mmhubBase);
+    const size_t shiftedGc=gc+12;
+    put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12));
+    put16(b,prefix+22,sum(b,shiftedGc,shiftedGc+gcSize));
+    put16(b,prefix+8,sum(b,prefix+10,shiftedGc+gcSize));
+    b.resize(10240);
+    return b;
+}
+static Bytes duplicateStateFixture() {
+    Bytes b=stateFixture();
+    const size_t oldGc=gc+12;
+    b.insert(b.begin()+static_cast<std::ptrdiff_t>(oldGc),12,0);
+    const size_t source=die+4+5*12, duplicate=die+4+6*12;
+    std::memcpy(b.data()+duplicate,b.data()+source,12);
+    put16(b,prefix+10,uint16_t(gc+gcSize+24-prefix));
+    put16(b,prefix+16,uint16_t(ipdsSize+24));
+    put16(b,prefix+20,uint16_t(gc+24-prefix));
+    put16(b,ipds+6,uint16_t(ipdsSize+24));
+    put16(b,die+2,7);
+    const size_t shiftedGc=gc+24;
+    put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+24));
+    put16(b,prefix+22,sum(b,shiftedGc,shiftedGc+gcSize));
+    put16(b,prefix+8,sum(b,prefix+10,shiftedGc+gcSize));
+    b.resize(10240);
+    return b;
+}
 
 struct Device {
     IOPCIDevice pci;
@@ -64,7 +101,8 @@ struct Device {
     }
     void run(const char *expected) {
         CHECK(service.start(&pci)); CHECK(service.registered);
-        CHECK(service.strings.at("CobaltSurvey,Status")==expected);
+        if (service.strings.at("CobaltSurvey,Status")!=expected)
+            throw std::runtime_error(std::string("expected status ")+expected+" got "+service.strings.at("CobaltSurvey,Status"));
         CHECK(service.numbers.at("CobaltSurvey,Ready")==0);
         CHECK(testState.mapsLive==0); CHECK(testState.allocations==0);
         CHECK(testState.backingDescriptorsLive==0);
@@ -622,11 +660,143 @@ static void parserAndPublication() {
     }
 }
 
+static void passiveState() {
+    {
+        const Bytes state=stateFixture(); IpDiscovery verify;
+        if(!verify.init(state.data(),state.size())) throw std::runtime_error("synthetic state fixture did not parse");
+        Device d; d.load(state); testState.stateBootPresent=true;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.stateReads==8); CHECK(testState.stateEvents.size()==8);
+        const uint32_t expected[] = {0x458c,0x4644,0xa950,0xa954,0x458c,0x4644,0xa950,0xa954};
+        for(unsigned i=0;i<8;++i) CHECK(testState.stateEvents[i].first==expected[i]);
+        CHECK(testState.stateMapRequests.size()==2);
+        CHECK(testState.stateMapRequests[0].first==0x4000);
+        CHECK(testState.stateMapRequests[1].first==0xa000);
+        for(const auto &request : testState.stateMapRequests)
+            CHECK(request.second==(kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache));
+        CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="observed-stable");
+        CHECK(d.service.numbers.at("CobaltSurvey,StatePspBootloaderRaw")==0x11);
+        CHECK(d.service.numbers.at("CobaltSurvey,StatePspSosRaw")==0x22);
+        CHECK(d.service.numbers.at("CobaltSurvey,StateFbBaseRaw")==0x33);
+        CHECK(d.service.numbers.at("CobaltSurvey,StateFbTopRaw")==0x44);
+        CHECK(d.service.numbers.at("CobaltSurvey,StatePspBootloaderByteOffset")==0x458c);
+        CHECK(d.service.numbers.at("CobaltSurvey,StateFbBaseByteOffset")==0xa950);
+        CHECK(d.service.numbers.at("CobaltSurvey,StateReadCount")==8);
+        CHECK(d.service.numbers.at("CobaltSurvey,StateReadOnly")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly")==1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready")==0);
+        CHECK(testState.selectorWrites==0); CHECK(testState.openCalls==0);
+        d.service.stop(&d.pci);
+        CHECK(!d.service.strings.count("CobaltSurvey,StateStatus"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,StatePspBootloaderRaw"));
+        testState.stateBootPresent=false;
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,StateStatus"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,StateReadCount"));
+    }
+    {
+        Device d; d.load(stateFixture(0x2800)); testState.stateBootPresent=true;
+        testState.stateAllowedOffsets={0x458c,0x4644,0xb550,0xb554};
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.stateReads==8);
+        CHECK(testState.stateMapRequests[0].first==0x4000);
+        CHECK(testState.stateMapRequests[1].first==0xb000);
+        CHECK(d.service.numbers.at("CobaltSurvey,StateFbBaseByteOffset")==0xb550);
+    }
+    for(const auto *arg : {"", "0", "2", "49", "-1", "1x", "true"}) {
+        Device d; d.load(stateFixture()); testState.stateBootPresent=true; testState.stateBoot=arg;
+        d.run("discovery-snapshot-validated"); CHECK(testState.stateReads==0);
+        CHECK(testState.stateMapRequests.empty()); CHECK(!d.service.numbers.count("CobaltSurvey,StateReadCount"));
+    }
+    for(unsigned failure=0;failure<9;++failure) {
+        Device d; Bytes b=failure==6 ? duplicateStateFixture() : stateFixture();
+        if(failure==0) { put16(b,die+2,5); put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12)); put16(b,prefix+8,sum(b,prefix+10,gc+gcSize+12)); }
+        if(failure==1) { b[die+4+5*12+4]=5; put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12)); put16(b,prefix+8,sum(b,prefix+10,gc+gcSize+12)); }
+        if(failure==2) {
+            put32(b,die+4+5*12+8,0xfffffff0u);
+            put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12));
+            put16(b,prefix+8,sum(b,prefix+10,gc+gcSize+12));
+        }
+        if(failure==5) { b[die+4+5*12+2]=1; put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12)); put16(b,prefix+8,sum(b,prefix+10,gc+gcSize+12)); }
+        if(failure==7) { put32(b,die+4+5*12+8,0x100000u); put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12)); put16(b,prefix+8,sum(b,prefix+10,gc+gcSize+12)); }
+        if(failure==8) { b[die+4+5*12+3]=0; put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+12)); put16(b,prefix+8,sum(b,prefix+10,gc+gcSize+12)); }
+        d.load(b); testState.stateBootPresent=true;
+        if(failure==3) testState.stateRead=[](uint32_t offset,uint32_t value) { return offset==0x458c ? UINT32_MAX : value; };
+        if(failure==4) testState.stateRead=[](uint32_t offset,uint32_t value) { return offset==0xa950 && testState.stateReads==2 ? value^1u : value; };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.blobs.count("CobaltSurvey,DiscoverySnapshot")==1);
+        if(failure==0 || failure==1 || failure==2 || failure==5 || failure==6 || failure==7 || failure==8)
+            CHECK(testState.stateMapRequests.empty());
+        CHECK(!d.service.numbers.count("CobaltSurvey,StatePspBootloaderRaw"));
+        CHECK(testState.selectorWrites==0); CHECK(testState.openCalls==0);
+    }
+    for(unsigned releaseAt : {1u,4u}) {
+        Device d; d.load(stateFixture()); testState.stateBootPresent=true;
+        testState.onMapRelease=[&d,releaseAt](unsigned released) {
+            if(released==releaseAt) d.pci.command=0;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="pci-state-changed");
+        CHECK(!d.service.numbers.count("CobaltSurvey,StatePspBootloaderRaw"));
+        CHECK(testState.stateReads==8);
+    }
+    {
+        Device d; d.load(stateFixture()); testState.stateBootPresent=true;
+        testState.onDiscoverySnapshotPublication=[&d]() { d.pci.command=0; };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="pci-state-changed");
+        CHECK(!d.service.numbers.count("CobaltSurvey,StatePspBootloaderRaw"));
+        CHECK(testState.stateReads==8);
+    }
+    for(unsigned change : {0u,1u,2u}) {
+        Device d; d.load(stateFixture()); testState.stateBootPresent=true;
+        testState.stateRead=[&d,change](uint32_t, uint32_t value) {
+            if(testState.stateReads==3) {
+                if(change==0) d.pci.command=0;
+                if(change==1) d.pci.bars[5]+=4096;
+                if(change==2) d.pci.inactive=true;
+            }
+            return value;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.stateReads==4);
+        CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="pci-state-changed");
+        CHECK(!d.service.numbers.count("CobaltSurvey,StatePspBootloaderRaw"));
+    }
+    {
+        Device d; d.load(stateFixture()); d.indexed(); testState.stateBootPresent=true;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.stateReads==8); CHECK(testState.openCalls==1);
+        CHECK(testState.selectorWrites==5124);
+        CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly")==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==3);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready")==0);
+    }
+    {
+        Device d; d.load(stateFixture()); testState.stateBootPresent=true;
+        testState.failMapRequest=3;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="state-map-failed");
+        CHECK(testState.stateReads==0); CHECK(!d.service.numbers.count("CobaltSurvey,StateReadCount"));
+    }
+    for(const char *key : {"StatePspBootloaderRaw", "StatePspSosRaw", "StateFbBaseRaw", "StateFbTopRaw",
+        "StatePspBootloaderByteOffset", "StatePspSosByteOffset", "StateFbBaseByteOffset", "StateFbTopByteOffset",
+        "StateReadCount", "StateReadOnly", "StateStatus"}) {
+        Device d; d.load(stateFixture()); testState.stateBootPresent=true;
+        testState.propertyFailKey=std::string("CobaltSurvey,")+key;
+        d.run("discovery-snapshot-validated");
+        if(std::string(key)=="StateStatus") CHECK(!d.service.strings.count("CobaltSurvey,StateStatus"));
+        else CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="metadata-publication-failed");
+        for(const char *raw : {"StatePspBootloaderRaw", "StatePspSosRaw", "StateFbBaseRaw", "StateFbTopRaw"})
+            CHECK(!d.service.numbers.count(std::string("CobaltSurvey,")+raw));
+    }
+}
+
 int main() {
     try {
         gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
         revalidation(); parserAndPublication();
-        indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults();
+        indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"; return 1;

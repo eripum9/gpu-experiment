@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -30,9 +31,19 @@ struct TestState {
     bool publicationFail = false;
     std::string indexedBoot = "1";
     bool indexedBootPresent = false, claimFail = false;
+    std::string stateBoot = "1";
+    bool stateBootPresent = false;
     std::string propertyFailKey;
     unsigned openCalls = 0, closeCalls = 0, openLive = 0, iteratorsLive = 0;
     unsigned selectorWrites = 0, indexedDataReads = 0;
+    unsigned stateReads = 0;
+    std::vector<std::pair<uint64_t, IOOptionBits>> stateMapRequests;
+    std::vector<std::pair<uint64_t, uintptr_t>> stateMapBases;
+    std::vector<std::pair<uint32_t, uint32_t>> stateEvents;
+    std::vector<uint32_t> stateAllowedOffsets = {0x458c,0x4644,0xa950,0xa954};
+    std::function<uint32_t(uint32_t, uint32_t)> stateRead;
+    std::function<void(unsigned)> onMapRelease;
+    std::function<void()> onDiscoverySnapshotPublication;
     bool indexedMapLive = false;
     volatile uint32_t *indexedPage = nullptr;
     IOService *indexedOwner = nullptr;
@@ -43,6 +54,7 @@ struct TestState {
     std::function<uint32_t(uint32_t, uint32_t)> selectorRead;
     std::function<uint32_t(unsigned, uint32_t)> dataRead;
     unsigned allocations = 0, mapsLive = 0, mapRequests = 0, mapReleases = 0;
+    unsigned failMapRequest = 0;
     unsigned memsizeReads = 0, backingDescriptorsLive = 0, backingDescriptorReleases = 0;
     std::vector<uint32_t> memsizeValues;
     std::function<void(unsigned)> onMemsize;
@@ -121,6 +133,8 @@ public:
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at snapshot publication");
         if (testState.publicationFail) return false;
+        if (std::string(key) == "CobaltSurvey,DiscoverySnapshot" && testState.onDiscoverySnapshotPublication)
+            testState.onDiscoverySnapshotPublication();
         auto *value = dynamic_cast<OSData *>(object);
         if (!value) throw std::runtime_error("non OSData publication");
         blobs[key] = value->bytes; return true;
@@ -191,14 +205,21 @@ public:
         ++testState.mapRequests; ++requests;
         const bool indexed = offset == 0 && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
-        if (task != kernel_task || address != 0 || (!indexed &&
+        const bool stateMap = testState.stateBootPresent && n == 4096 && offset != 0x3000 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
+        if (stateMap) {
+            testState.stateMapRequests.emplace_back(offset, options);
+            testState.stateMapBases.emplace_back(offset, reinterpret_cast<uintptr_t>(storage.data()));
+        }
+        if (task != kernel_task || address != 0 || (!indexed && !stateMap &&
             (offset != expectedOffset || n != expectedLength ||
              options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
         if (indexed && physical != 0xc0000000)
             throw std::runtime_error("writable mapping outside BAR5 page zero");
         if (onMap) onMap();
-        if (mapFail || (indexed && indexedMapFail)) return nullptr;
+        if (mapFail || (indexed && indexedMapFail) ||
+            (testState.failMapRequest && testState.mapRequests == testState.failMapRequest)) return nullptr;
         auto *map = new IOMemoryMap;
         map->physical = physical + offset + (mapWrongPhysical ? 4 : 0);
         map->length = n - (mapTruncated ? 1 : 0);
@@ -242,6 +263,7 @@ inline IOMemoryMap::~IOMemoryMap() {
     if (indexedMapping) testState.indexedMapLive = false;
     if (ownsDescriptor) descriptor->release();
     --testState.mapsLive; ++testState.mapReleases;
+    if (testState.onMapRelease) testState.onMapRelease(testState.mapReleases);
 }
 inline uint64_t IOMemoryMap::getPhysicalSegment(IOByteCount offset, IOByteCount *n, IOOptionBits segmentOptions) {
     if (!descriptor) throw std::runtime_error("null mapping descriptor");
@@ -333,6 +355,24 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
     if (testState.onMmio) testState.onMmio(event);
     return value;
 }
+inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t offset) {
+    if (!testState.stateBootPresent || (testState.mapsLive != 2 && testState.mapsLive != 4) ||
+        std::find(testState.stateAllowedOffsets.begin(), testState.stateAllowedOffsets.end(), offset) ==
+            testState.stateAllowedOffsets.end())
+        throw std::runtime_error("state MMIO outside fixed passive allowlist");
+    const uint64_t page = offset & ~uint32_t(0xfff);
+    bool mappedAddress = false;
+    for (const auto &mapping : testState.stateMapBases)
+        if (mapping.first == page && reinterpret_cast<uintptr_t>(address) ==
+            mapping.second + (offset & 0xfffu)) mappedAddress = true;
+    if (!mappedAddress) throw std::runtime_error("state MMIO pointer outside mapped page");
+    const uint32_t observed[] = {0x11u,0x22u,0x33u,0x44u};
+    const uint32_t actual = testState.stateRead ? testState.stateRead(offset, *address) :
+        observed[testState.stateReads % 4];
+    testState.stateEvents.emplace_back(offset, actual);
+    ++testState.stateReads;
+    return actual;
+}
 inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t value) {
     if (!testState.indexedMapLive || testState.openLive != 1 || !testState.indexedOwner ||
         testState.indexedOwner->numbers.at("CobaltSurvey,ReadOnly") != 0 ||
@@ -347,12 +387,13 @@ inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t
 
 inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool indexed = std::string(key) == "cobalt-survey-indexed";
-    if (std::string(key) != "cobalt-survey" && !indexed) throw std::runtime_error("unexpected boot argument");
-    if (indexed ? !testState.indexedBootPresent : !testState.bootPresent) return false;
+    const bool state = std::string(key) == "cobalt-survey-state";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state) throw std::runtime_error("unexpected boot argument");
+    if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : testState.boot;
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
     const auto numeric = std::strtoll(token.c_str(), &end, 0);

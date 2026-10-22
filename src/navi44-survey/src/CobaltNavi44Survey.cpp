@@ -38,6 +38,11 @@ bool indexedArmed() {
     return PE_parse_boot_argn("cobalt-survey-indexed", &value, sizeof(value)) && value == 1u;
 }
 
+bool stateArmed() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-state", &value, sizeof(value)) && value == 1u;
+}
+
 struct PciState {
     uint32_t identity, classRevision, subsystem;
     uint16_t command;
@@ -234,6 +239,116 @@ public:
         return reinterpret_cast<volatile uint32_t *>(const_cast<volatile uint8_t *>(bytes()));
     }
 };
+
+struct StateObservation {
+    uint32_t values[8] {};
+    uint32_t offsets[4] {};
+};
+
+void clearStateProperties(IOService *service) {
+    const char *keys[] = {"StateStatus", "StatePspBootloaderRaw", "StatePspSosRaw",
+        "StateFbBaseRaw", "StateFbTopRaw", "StatePspBootloaderByteOffset",
+        "StatePspSosByteOffset", "StateFbBaseByteOffset", "StateFbTopByteOffset",
+        "StateReadCount", "StateReadOnly"};
+    for (const char *key : keys) {
+        char property[64];
+        snprintf(property, sizeof(property), "CobaltSurvey,%s", key);
+        service->removeProperty(property);
+    }
+}
+
+const char *passiveState(IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, const IpDiscovery &discovery,
+    StateObservation &result) {
+    constexpr uint16_t kMp0 = IpDiscovery::HwMp0;
+    constexpr uint16_t kMmhub = IpDiscovery::HwMmhub;
+    const uint16_t ids[] = {kMp0, kMmhub};
+    const cobalt::Version versions[] = {{14, 0, 2}, {4, 1, 0}};
+    for (unsigned i = 0; i < 2; ++i) {
+        unsigned matches = 0;
+        for (uint16_t n = 0; n < discovery.ipCount(); ++n) {
+            IpDiscovery::IpEntry entry {};
+            if (!discovery.ipAt(n, entry)) return "ip-record-invalid";
+            if (entry.hwId == ids[i]) {
+                ++matches;
+                if (entry.instance != 0 || !entry.numBases ||
+                    !cobalt::version_matches(versions[i], {entry.major, entry.minor, entry.revision}))
+                    return "ip-version-or-instance-mismatch";
+            }
+        }
+        if (matches != 1) return "ip-record-missing-or-duplicate";
+    }
+    const uint32_t dwords[] = {0x63, 0x91, 0x554, 0x555};
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!discovery.regByteOffset(i < 2 ? kMp0 : kMmhub, 0, 0, dwords[i], result.offsets[i]))
+            return "register-offset-unavailable";
+        if ((result.offsets[i] & 3u) || result.offsets[i] > mmio.length ||
+            sizeof(uint32_t) > mmio.length - result.offsets[i]) return "register-offset-out-of-range";
+    }
+    const uint64_t pages[2] = {result.offsets[0] & ~uint64_t(0xfff), result.offsets[2] & ~uint64_t(0xfff)};
+    const uint64_t within[4] = {result.offsets[0] - pages[0], result.offsets[1] - pages[0],
+        result.offsets[2] - pages[1], result.offsets[3] - pages[1]};
+    for (unsigned i = 0; i < 4; ++i)
+        if ((within[i] & 3u) || within[i] > 4092) return "register-offset-out-of-range";
+    if (pci->isInactive() || !unchanged(pci, state) || !apertureUnchanged(pci, 5, mmio) ||
+        !apertureUnchanged(pci, 0, vram)) return "pci-state-changed";
+    Map maps[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!maps[i].create(mmio, pages[i], 4096)) return "state-map-failed";
+        const volatile uint8_t *bytes = maps[i].bytes();
+        if (!bytes || (reinterpret_cast<uintptr_t>(bytes) & 3u)) return "state-map-invalid";
+    }
+    const volatile uint8_t *mapped[2] = {maps[0].bytes(), maps[1].bytes()};
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned reg = 0; reg < 4; ++reg) {
+            if (pci->isInactive() || !unchanged(pci, state) ||
+                !apertureUnchanged(pci, 5, mmio) || !apertureUnchanged(pci, 0, vram))
+                return "pci-state-changed";
+            const unsigned mapIndex = reg < 2 ? 0 : 1;
+            const uintptr_t address = reinterpret_cast<uintptr_t>(mapped[mapIndex] + within[reg]);
+            if (address & 3u) return "state-map-invalid";
+#if defined(COBALT_SURVEY_HOSTTEST)
+            result.values[pass * 4 + reg] = cobaltSurveyTestReadState32(
+                reinterpret_cast<volatile uint32_t *>(address), result.offsets[reg]);
+#else
+            result.values[pass * 4 + reg] = *reinterpret_cast<const volatile uint32_t *>(address);
+#endif
+            if (pci->isInactive() || !unchanged(pci, state) ||
+                !apertureUnchanged(pci, 5, mmio) || !apertureUnchanged(pci, 0, vram))
+                return "pci-state-changed";
+            if (result.values[pass * 4 + reg] == UINT32_MAX) return "register-unreadable";
+            if (pass == 1 && result.values[4 + reg] != result.values[reg]) return "state-unstable";
+        }
+    }
+    for (auto &map : maps) map.reset();
+    if (pci->isInactive() || !unchanged(pci, state) ||
+        !apertureUnchanged(pci, 5, mmio) || !apertureUnchanged(pci, 0, vram))
+        return "pci-state-changed";
+    return nullptr;
+}
+
+bool publishState(IOService *service, const StateObservation &state) {
+    const char *names[] = {"StatePspBootloaderRaw", "StatePspSosRaw", "StateFbBaseRaw", "StateFbTopRaw"};
+    const char *offsetNames[] = {"StatePspBootloaderByteOffset", "StatePspSosByteOffset",
+        "StateFbBaseByteOffset", "StateFbTopByteOffset"};
+    for (unsigned i = 0; i < 4; ++i) {
+        char key[64];
+        snprintf(key, sizeof(key), "CobaltSurvey,%s", names[i]);
+        if (!service->setProperty(key, state.values[i], 32)) return false;
+        snprintf(key, sizeof(key), "CobaltSurvey,%s", offsetNames[i]);
+        if (!service->setProperty(key, state.offsets[i], 32)) return false;
+    }
+    return service->setProperty("CobaltSurvey,StateReadCount", 8ULL, 32) &&
+        service->setProperty("CobaltSurvey,StateReadOnly", true) &&
+        service->setProperty("CobaltSurvey,StateStatus", "observed-stable") &&
+        service->setProperty("CobaltSurvey,Schema", 3ULL, 32);
+}
+
+void publishStateFailure(IOService *service, const char *reason) {
+    clearStateProperties(service);
+    if (!service->setProperty("CobaltSurvey,StateStatus", reason))
+        clearStateProperties(service);
+}
 
 uint32_t readMemsize(const volatile uint8_t *bytes) {
     return OSSwapLittleToHostInt32(*reinterpret_cast<const volatile uint32_t *>(bytes + kMemsizeInPage));
@@ -517,6 +632,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
         snprintf(key, sizeof(key), "CobaltSurvey,%s", name);
         removeProperty(key);
     }
+    clearStateProperties(this);
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -663,6 +779,12 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     else if (!parser.gcTopology(topology) || !cobalt::gfx_topology_compatible(
         cobalt::Family::Navi44, cobalt::kNavi44Profile.gc, topology)) failure = "discovery-topology-invalid";
     if (failure) { IOFree(snapshot, allocationSize); status(failure); return; }
+    const bool collectState = stateArmed();
+    StateObservation stateResult {};
+    const char *stateFailure = nullptr;
+    if (collectState) {
+        stateFailure = passiveState(pci, s, mmio, vram, parser, stateResult);
+    }
     const uint64_t binaryOffset = parser.binaryOffset();
     const uint32_t ipCount = parser.ipCount();
     discovery.reset();
@@ -681,11 +803,22 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     setProperty("CobaltSurvey,ComputeUnitCapacity", topology.maxComputeUnits, 32);
     setProperty("CobaltSurvey,RenderBackendsPerEngineCapacity", topology.renderBackendsPerEngine, 32);
     setProperty("CobaltSurvey,MaxWavesPerSIMD", topology.maxWavesPerSimd, 32);
+    if (collectState && !stateFailure && (pci->isInactive() || !unchanged(pci, s) ||
+        !apertureUnchanged(pci, 5, mmio) || !apertureUnchanged(pci, 0, vram)))
+        stateFailure = "pci-state-changed";
+    if (collectState) {
+        if (stateFailure) {
+            publishStateFailure(this, stateFailure);
+        } else if (!publishState(this, stateResult)) {
+            publishStateFailure(this, "metadata-publication-failed");
+        }
+    }
     status("discovery-snapshot-validated");
 }
 
 void CobaltNavi44Survey::stop(IOService *provider) {
     removeProperty("CobaltSurvey,DiscoverySnapshot");
+    clearStateProperties(this);
     status("stopped");
     super::stop(provider);
 }

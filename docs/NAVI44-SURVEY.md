@@ -87,6 +87,45 @@ firmware, start queues, allocate DMA, or program display or power state.
 
 ## Deployment and collection
 
+### Passive PSP and memory-window state
+
+`cobalt-survey-state=1` requests an additional passive observation after the
+discovery snapshot passes its checksums, critical IP checks and GC topology
+validation. It still requires `cobalt-survey=1`. On a limited BAR0 aperture,
+the existing indexed-discovery flag is also needed to obtain that snapshot.
+
+The read set is fixed to four dwords: PSP MPASP `C2PMSG_35` and `C2PMSG_81`,
+and MMHUB `MMMC_VM_FB_LOCATION_BASE` and `TOP`. Their byte offsets come from
+the validated discovery records, with the register-offset and segment pairs
+from Linux v6.19's
+[MP 14.0.2 header](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/include/asic_reg/mp/mp_14_0_2_offset.h)
+and [MMHUB 4.1.0 header](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_4_1_0_offset.h).
+The selected instances must be unique and match those versions. No register
+base from another board is substituted when discovery is missing or invalid.
+
+The extra mappings are read-only, uncached, bounded BAR5 pages. All addresses
+and mappings are validated before the first additional register read. The
+service checks the PCI identity, configuration, active state and BAR
+descriptors around every read, and requires two identical four-register
+passes. An unreadable register, changed device, changed values, or failed
+mapping prevents publication of a state result. State failure is reported
+separately from a successfully captured discovery table.
+
+The state properties report raw values and resolved byte offsets, together
+with their separate read-only scope and completion status. They do not mean
+that the PSP is ready for a new firmware package or that its memory window
+is available for driver allocations. The inherited GOP/firmware state still
+needs interpretation before any initialization test. In particular, this
+mode sends no SMU query, PSP mailbox command, or firmware upload. It adds no
+GPU, VRAM, PCI configuration or selector writes; an explicitly enabled
+indexed-discovery pass retains its previously documented selector writes.
+The implementation maps one page per selected IP pair and refuses a pair
+that crosses that page boundary. Successful state publication uses survey
+schema 3; discovery-only read-only and indexed observations retain their
+existing schemas. Removing the state flag preserves the previous read set.
+
+### Installing the selected diagnostic mode
+
 The CI artifact is a hardware-test candidate. Keep the known working EFI
 backup before adding it to a separate test configuration. Do not substitute
 `Navi48Bringup.kext`, enable its boot arguments, or install the Mesa/Metal
@@ -123,7 +162,8 @@ Keep the captured output private. Bring the USB report back to Windows
 for review before progressing to initialization or acceleration tests.
 To remove the survey, restore the saved EFI or remove its Kernel/Add entry,
 bundle, and `cobalt-survey=1` argument. No internal ESP changes are required.
-Remove `cobalt-survey-indexed=1` as well when disabling that experiment.
+Remove `cobalt-survey-indexed=1` and `cobalt-survey-state=1` as well when
+disabling those experiments.
 
 ## Build
 
