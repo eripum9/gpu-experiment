@@ -10,6 +10,7 @@
 #include "ipdiscovery.hpp"
 #include "gpu_profile.hpp"
 #include "gfx_topology.hpp"
+#include "aperture_plan.hpp"
 
 #define super IOService
 OSDefineMetaClassAndStructors(CobaltNavi44Survey, IOService)
@@ -42,6 +43,11 @@ bool indexedArmed() {
 bool stateArmed() {
     uint32_t value = 0;
     return PE_parse_boot_argn("cobalt-survey-state", &value, sizeof(value)) && value == 1u;
+}
+
+bool apertureArmed() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-aperture", &value, sizeof(value)) && value == 1u;
 }
 
 struct PciState {
@@ -151,8 +157,14 @@ public:
     bool create(const Aperture &a, uint64_t offset, uint64_t length) {
         return createPolicy(a, offset, length, false);
     }
-    // The only writable mapping policy is this fixed BAR5 selector page.
+    // Writable mappings remain fixed-purpose and page-bounded.
     bool createIndexedPage(const Aperture &a) { return createPolicy(a, 0, 4096, true); }
+    bool createProbePage(const Aperture &a, const cobalt::survey::Plan &plan) {
+        return plan.ok && plan.windowBytes == (1ULL << 20) &&
+            !(plan.windowOffset & ((1ULL << 20) - 1)) &&
+            createPolicy(a, plan.windowOffset, 4096, true);
+    }
+    bool createFlushPage(const Aperture &a) { return createPolicy(a, 0x7f000, 4096, true); }
 private:
     bool createPolicy(const Aperture &a, uint64_t offset, uint64_t length, bool indexed) {
         requestedOptions = indexed ? (kMapOptions & ~kIOMapReadOnly) : kMapOptions;
@@ -236,6 +248,16 @@ public:
     }
     volatile uint32_t *selectorPage() const {
         if (requestedOffset != 0 || requestedLength != 4096 ||
+            requestedOptions != (kMapOptions & ~kIOMapReadOnly)) return nullptr;
+        return reinterpret_cast<volatile uint32_t *>(const_cast<volatile uint8_t *>(bytes()));
+    }
+    volatile uint32_t *probePage(const cobalt::survey::Plan &plan) const {
+        if (!plan.ok || requestedOffset != plan.windowOffset || requestedLength != 4096 ||
+            requestedOptions != (kMapOptions & ~kIOMapReadOnly)) return nullptr;
+        return reinterpret_cast<volatile uint32_t *>(const_cast<volatile uint8_t *>(bytes()));
+    }
+    volatile uint32_t *flushPage() const {
+        if (requestedOffset != 0x7f000 || requestedLength != 4096 ||
             requestedOptions != (kMapOptions & ~kIOMapReadOnly)) return nullptr;
         return reinterpret_cast<volatile uint32_t *>(const_cast<volatile uint8_t *>(bytes()));
     }
@@ -698,6 +720,402 @@ const char *indexedSnapshot(IOService *service, IOPCIDevice *pci, const PciState
     return failure;
 }
 
+// Everything retained here is a value. IpDiscovery points into temporary
+// snapshot storage and must never be consulted by the aperture transaction.
+struct ApertureProof {
+    const char *failure {"aperture-ip-proof-unavailable"};
+    uint32_t remapOffset {0}, memsizeOffset {0}, stateOffsets[4] {};
+};
+
+ApertureProof apertureProof(const IpDiscovery &d, const StateObservation &observed,
+    const Aperture &mmio) {
+    ApertureProof proof;
+    const uint16_t ids[] = {IpDiscovery::HwNbif, IpDiscovery::HwHdp};
+    const cobalt::Version versions[] = {{6, 3, 1}, {7, 0, 0}};
+    for (unsigned i = 0; i < 2; ++i) {
+        unsigned count = 0;
+        for (uint16_t n = 0; n < d.ipCount(); ++n) {
+            IpDiscovery::IpEntry entry {};
+            if (!d.ipAt(n, entry)) return proof;
+            if (entry.hwId != ids[i]) continue;
+            ++count;
+            if (entry.instance != 0 || entry.numBases < (i == 0 ? 3 : 1) ||
+                !cobalt::version_matches(versions[i], {entry.major, entry.minor, entry.revision}))
+                return proof;
+        }
+        if (count != 1) return proof;
+    }
+    if (!d.regByteOffset(IpDiscovery::HwNbif, 0, 2, 0x12d, proof.remapOffset) ||
+        !d.regByteOffset(IpDiscovery::HwNbif, 0, 2, 0xc3, proof.memsizeOffset)) return proof;
+    if ((proof.remapOffset & 3) || (proof.memsizeOffset & 3) ||
+        (proof.remapOffset & ~0xfffu) != (proof.memsizeOffset & ~0xfffu) ||
+        proof.remapOffset > mmio.length || 4 > mmio.length - proof.remapOffset ||
+        proof.memsizeOffset > mmio.length || 4 > mmio.length - proof.memsizeOffset) return proof;
+    for (unsigned i = 0; i < 4; ++i) proof.stateOffsets[i] = observed.offsets[i];
+    proof.failure = nullptr;
+    return proof;
+}
+
+// No registry writes during access guards: diagnostics are published after
+// closing this independent provider session, without altering Indexed* fields.
+bool apertureOnlyClient(IOPCIDevice *pci, IOService *service) {
+    OSIterator *iterator = pci->getClientIterator();
+    if (!iterator) return false;
+    unsigned count = 0, self = 0;
+    while (count < 64) {
+        OSObject *entry = iterator->getNextObject();
+        if (!entry) break;
+        ++count;
+        if (entry == service) ++self;
+    }
+    const bool valid = iterator->isValid() && count == 1 && self == 1;
+    iterator->release();
+    return valid;
+}
+
+struct ApertureResult {
+    const char *status {"prerequisites-unavailable"};
+    const char *cleanup {"not-needed"};
+    const char *vramCleanup {"not-needed"}, *selectorCleanup {"not-needed"};
+    cobalt::survey::Plan plan {false, "not-planned", 0, 0, 0};
+    uint32_t remap[2] {}, selectorWrites {0}, dataReads {0}, vramWrites {0}, flushWrites {0};
+    bool attempted {false}, success {false};
+};
+
+void clearApertureProperties(IOService *service) {
+    const char *names[] = {"ApertureStatus", "ApertureCleanup", "ApertureVramCleanup", "ApertureSelectorCleanup", "AperturePlanReason",
+        "ApertureWindowOffset", "ApertureWindowBytes", "ApertureMcAddress",
+        "ApertureRemapFirstRaw", "ApertureRemapSecondRaw", "ApertureAttempted",
+        "ApertureSelectorWritesIssued", "ApertureDataReads", "ApertureVramWritesIssued",
+        "ApertureFlushWritesIssued", "ApertureReadOnly"};
+    for (const char *name : names) {
+        char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,%s", name);
+        service->removeProperty(key);
+    }
+}
+
+uint32_t apertureRegisterRead(const volatile uint32_t *address, uint32_t offset) {
+#if defined(COBALT_SURVEY_HOSTTEST)
+    return cobaltSurveyTestApertureRegisterRead(address, offset);
+#else
+    (void)offset;
+    return *address;
+#endif
+}
+
+// Fixed 16-byte reader/writer. There is intentionally no public address, count,
+// arbitrary MMIO write, MM_DATA write, or firmware-loader operation.
+class ApertureTransaction {
+    IOService *service;
+    IOPCIDevice *pci;
+    const PciState &state;
+    const Aperture &mmio, &vram;
+    ProviderSession &session;
+    const ApertureProof &proof;
+    ApertureResult &result;
+    uint32_t mib;
+    const volatile uint8_t *nbif;
+    volatile uint32_t *cpu, *flush;
+    SelectorIO io;
+    uint32_t savedLow {0}, savedHigh {0}, original[4] {};
+    bool selectorDirty {false}, vramDirty {false};
+    mutable bool contextLost {false};
+    bool baseGuard() const {
+        if (contextLost) return false;
+        const bool current = session.owns() && consoleGuard(pci, state, mmio, vram) &&
+            apertureOnlyClient(pci, service) && session.owns() &&
+            consoleGuard(pci, state, mmio, vram);
+        if (!current) contextLost = true;
+        return current;
+    }
+    bool registerRead(uint32_t offset, uint32_t &value) const {
+        if (!baseGuard()) return false;
+        value = apertureRegisterRead(reinterpret_cast<const volatile uint32_t *>(
+            nbif + (offset & 0xfff)), offset);
+        return baseGuard();
+    }
+    bool selectorRead(uint32_t &low, uint32_t &high) const {
+        if (!guard()) return false;
+        low = io.low();
+        if (!guard()) return false;
+        high = io.high();
+        return guard();
+    }
+    bool selectorWrite(bool high, uint32_t value) {
+        if (!guard()) return false;
+        selectorDirty = true; ++result.selectorWrites;
+        if (high) io.high(value); else io.low(value);
+        return guard();
+    }
+    bool cpuRead(uint32_t (&words)[4]) const {
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!guard()) return false;
+#if defined(COBALT_SURVEY_HOSTTEST)
+            words[i] = cobaltSurveyTestApertureCpuRead(cpu + i);
+#else
+            words[i] = cpu[i];
+#endif
+            if (!guard()) return false;
+        }
+        return true;
+    }
+    bool cpuWrite(const uint32_t (&words)[4]) {
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!guard()) return false;
+            vramDirty = true; ++result.vramWrites;
+#if defined(COBALT_SURVEY_HOSTTEST)
+            cobaltSurveyTestApertureCpuWrite(cpu + i, words[i]);
+#else
+            cpu[i] = words[i];
+#endif
+            if (!guard()) return false;
+        }
+        return true;
+    }
+    bool indexedRead(uint32_t (&words)[4]) {
+        for (unsigned i = 0; i < 4; ++i) {
+            const uint64_t pos = result.plan.windowOffset + 4 * i;
+            const uint32_t low = static_cast<uint32_t>(pos) | 0x80000000u;
+            const uint32_t high = static_cast<uint32_t>(pos >> 31);
+            if (!selectorWrite(false, low) || !selectorWrite(true, high)) return false;
+            uint32_t actualLow = 0, actualHigh = 0;
+            if (!selectorRead(actualLow, actualHigh) || actualLow != low || actualHigh != high)
+                return false;
+            if (!guard()) return false;
+            words[i] = io.data(); ++result.dataReads;
+            if (!guard()) return false;
+        }
+        return true;
+    }
+    static bool equal(const uint32_t (&a)[4], const uint32_t (&b)[4]) {
+        for (unsigned i = 0; i < 4; ++i) if (a[i] != b[i]) return false;
+        return true;
+    }
+    bool visible() {
+        if (!guard()) return false;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureFence();
+#else
+        __asm__ volatile("mfence" ::: "memory");
+#endif
+        if (!guard()) return false;
+        ++result.flushWrites;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureFlush(flush);
+#else
+        *flush = 0;
+#endif
+        // Linux NBIO 6.3.1's CPU-write flush posts via MEMSIZE after the
+        // remapped HDP write. Only the already-whitelisted page is writable.
+        uint32_t posted = 0;
+        if (!registerRead(proof.memsizeOffset, posted) || posted != mib) {
+            contextLost = true;
+            return false;
+        }
+        return guard();
+    }
+public:
+    ApertureTransaction(IOService *s, IOPCIDevice *p, const PciState &st,
+        const Aperture &m, const Aperture &v, ProviderSession &owner,
+        const ApertureProof &ip, ApertureResult &r, uint32_t size,
+        const volatile uint8_t *registers, volatile uint32_t *probe,
+        volatile uint32_t *flushWord, volatile uint32_t *selectors)
+        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), proof(ip),
+          result(r), mib(size), nbif(registers), cpu(probe), flush(flushWord), io(selectors) {}
+    bool guard() const {
+        if (contextLost) return false;
+        uint32_t remap = 0, memsize = 0;
+        const bool current = registerRead(proof.remapOffset, remap) && remap == 0x7f000 &&
+            registerRead(proof.memsizeOffset, memsize) && memsize == mib;
+        if (!current) contextLost = true;
+        return current;
+    }
+    const char *saveSelectors() {
+        uint32_t low = 0, high = 0;
+        if (!selectorRead(savedLow, savedHigh) || !selectorRead(low, high)) return "device-context-changed";
+        if (savedLow == UINT32_MAX || savedHigh == UINT32_MAX ||
+            savedLow != low || savedHigh != high) return "selectors-unreadable-or-unstable";
+        return nullptr;
+    }
+    const char *exercise() {
+        uint32_t cpuWords[4] {}, indexedWords[4] {};
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            if (!cpuRead(cpuWords) || !indexedRead(indexedWords)) return "original-read-failed";
+            if (!equal(cpuWords, indexedWords) || (pass && !equal(original, cpuWords)))
+                return "original-read-mismatch";
+            if (!pass) for (unsigned i = 0; i < 4; ++i) original[i] = cpuWords[i];
+        }
+        uint32_t pattern[4] {};
+        const uint32_t masks[] = {0xc0ba1744u, 0x59a63ce1u, 0x138bf025u, 0xe72d460bu};
+        for (unsigned i = 0; i < 4; ++i) pattern[i] = original[i] ^ masks[i];
+        if (!cpuWrite(pattern) || !visible()) return "pattern-write-or-flush-failed";
+        if (!cpuRead(cpuWords) || !indexedRead(indexedWords)) return "pattern-read-failed";
+        if (!equal(pattern, cpuWords) || !equal(pattern, indexedWords)) return "pattern-read-mismatch";
+        return nullptr;
+    }
+    bool cleanup() {
+        bool restored = true;
+        if (vramDirty) {
+            uint32_t cpuWords[4] {}, indexedWords[4] {};
+            restored = cpuWrite(original) && visible() && cpuRead(cpuWords) &&
+                indexedRead(indexedWords) && equal(original, cpuWords) && equal(original, indexedWords);
+            result.cleanup = restored ? "vram-and-selectors-restored-observed" : "vram-restore-unverified";
+            result.vramCleanup = restored ? "restored-observed" : "restore-skipped-or-unverified";
+        }
+        if (selectorDirty) {
+            uint32_t low = 0, high = 0;
+            const bool selectorsRestored = selectorWrite(false, savedLow) && selectorWrite(true, savedHigh) &&
+                selectorRead(low, high) && low == savedLow && high == savedHigh;
+            result.selectorCleanup = selectorsRestored ? "restored-observed" : "restore-skipped-or-unverified";
+            if (!selectorsRestored) {
+                result.cleanup = "restore-skipped-or-unverified-device-context";
+                restored = false;
+            } else if (!vramDirty) result.cleanup = "selectors-restored-observed";
+        }
+        return restored;
+    }
+};
+
+const char *freshApertureState(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, ProviderSession &session,
+    const ApertureProof &proof, const StateObservation &prior) {
+    Map maps[2];
+    const uint32_t pages[] = {proof.stateOffsets[0] & ~0xfffu, proof.stateOffsets[2] & ~0xfffu};
+    for (unsigned n = 0; n < 2; ++n)
+        if (!maps[n].create(mmio, pages[n], 4096)) return "fresh-state-map-failed";
+    const volatile uint8_t *bytes[] = {maps[0].bytes(), maps[1].bytes()};
+    if (!bytes[0] || !bytes[1] || (reinterpret_cast<uintptr_t>(bytes[0]) & 3) ||
+        (reinterpret_cast<uintptr_t>(bytes[1]) & 3)) return "fresh-state-map-invalid";
+    for (unsigned pass = 0; pass < 2; ++pass) for (unsigned n = 0; n < 4; ++n) {
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
+            !apertureOnlyClient(pci, service)) return "device-context-changed";
+        const uint32_t offset = proof.stateOffsets[n];
+        const auto *address = reinterpret_cast<const volatile uint32_t *>(bytes[n / 2] + (offset & 0xfff));
+#if defined(COBALT_SURVEY_HOSTTEST)
+        const uint32_t value = cobaltSurveyTestReadState32(const_cast<volatile uint32_t *>(address), offset);
+#else
+        const uint32_t value = *address;
+#endif
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
+            !apertureOnlyClient(pci, service)) return "device-context-changed";
+        if (value == UINT32_MAX || value != prior.values[n]) return "fresh-state-changed";
+    }
+    return nullptr;
+}
+
+void runAperture(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, uint32_t mib,
+    const ApertureProof &proof, const StateObservation &prior, const ConsoleObservation &console,
+    ApertureResult &result) {
+    if (!indexedArmed() || !stateArmed()) return;
+    if ((state.classRevision & 0xff) != 0xc0 || state.subsystem != 0x86011eae ||
+        vram.length != (256ULL << 20) || mmio.length != 0x80000) {
+        result.status = "board-policy-refused"; return;
+    }
+    if (proof.failure) { result.status = proof.failure; return; }
+    if (!console.span || !prior.offsets[0] || prior.values[0] != 0x80000000 || prior.values[1] != 0 ||
+        prior.values[2] > 0xffffff || prior.values[3] > 0xffffff) {
+        result.status = "state-or-console-policy-refused"; return;
+    }
+    result.plan = cobalt::survey::planAperture({vram.physical,
+        (static_cast<uint64_t>(state.bars[1]) << 32) | (state.bars[0] & ~0xfu), vram.length,
+        static_cast<uint64_t>(mib) << 20, static_cast<uint64_t>(prior.values[2]) << 24,
+        (static_cast<uint64_t>(prior.values[3]) + 1) << 24,
+        console.values[0] & ~3ULL, console.span, 516ULL << 20});
+    if (!result.plan.ok) { result.status = "window-plan-refused"; return; }
+    if (!apertureOnlyClient(pci, service)) { result.status = "peer-refused"; return; }
+    ProviderSession session(pci, service);
+    if (!session.open()) { result.status = "provider-busy"; return; }
+    if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
+        !apertureOnlyClient(pci, service)) { result.status = "device-context-changed"; return; }
+    if (pci->getProperty("CobaltSurvey,ApertureAttempt-v1")) { result.status = "already-attempted"; return; }
+    ConsoleObservation freshConsole {};
+    result.status = passiveConsole(pci, state, mmio, vram, freshConsole);
+    if (result.status) return;
+    for (unsigned n = 0; n < kConsoleScalarCount; ++n)
+        if (freshConsole.values[n] != console.values[n]) { result.status = "fresh-console-changed"; return; }
+    result.status = freshApertureState(service, pci, state, mmio, vram, session, proof, prior);
+    if (result.status) return;
+    Map nbif, selectors, probe, flush;
+    if (!nbif.create(mmio, proof.remapOffset & ~0xfffu, 4096)) {
+        result.status = "nbif-map-failed"; return;
+    }
+    const volatile uint8_t *registers = nbif.bytes();
+    if (!registers || (reinterpret_cast<uintptr_t>(registers) & 3)) {
+        result.status = "nbif-map-invalid"; return;
+    }
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
+            !apertureOnlyClient(pci, service)) { result.status = "device-context-changed"; return; }
+        result.remap[pass] = apertureRegisterRead(reinterpret_cast<const volatile uint32_t *>(
+            registers + (proof.remapOffset & 0xfff)), proof.remapOffset);
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
+            !apertureOnlyClient(pci, service)) { result.status = "device-context-changed"; return; }
+        if (result.remap[pass] != 0x7f000) { result.status = "hdp-remap-not-whitelisted"; return; }
+    }
+    if (!selectors.createIndexedPage(mmio) || !probe.createProbePage(vram, result.plan) ||
+        !flush.createFlushPage(mmio)) { result.status = "writable-map-failed"; return; }
+    volatile uint32_t *selectorWords = selectors.selectorPage(), *cpuWords = probe.probePage(result.plan),
+        *flushWord = flush.flushPage();
+    if (!selectorWords || !cpuWords || !flushWord ||
+        ((reinterpret_cast<uintptr_t>(selectorWords) | reinterpret_cast<uintptr_t>(cpuWords) |
+          reinterpret_cast<uintptr_t>(flushWord)) & 3)) { result.status = "writable-map-invalid"; return; }
+    ApertureTransaction transaction(service, pci, state, mmio, vram, session, proof, result,
+        mib, registers, cpuWords, flushWord, selectorWords);
+    result.status = transaction.saveSelectors();
+    if (result.status) return;
+    if (!transaction.guard()) { result.status = "device-context-changed"; return; }
+    if (pci->getProperty("CobaltSurvey,ApertureAttempt-v1")) { result.status = "already-attempted"; return; }
+    if (!pci->setProperty("CobaltSurvey,ApertureAttempt-v1", true)) {
+        result.status = "attempt-claim-failed"; return;
+    }
+    result.attempted = true;
+    if (!service->setProperty("CobaltSurvey,ReadOnly", false) ||
+        !service->setProperty("CobaltSurvey,AccessMode", "indexed-and-bounded-aperture-writes")) {
+        result.status = "metadata-publication-failed"; return;
+    }
+    result.status = transaction.exercise();
+    const bool cleaned = transaction.cleanup();
+    // Destructor order releases mappings before provider close on every exit.
+    flush.reset(); probe.reset(); selectors.reset(); nbif.reset(); session.close();
+    if (!cleaned) result.status = "cleanup-unverified";
+    else if (!consoleGuard(pci, state, mmio, vram)) result.status = "device-context-changed";
+    result.success = !result.status;
+    if (result.success) result.status = "pattern-and-restore-verified";
+}
+
+void publishAperture(IOService *service, ApertureResult &result) {
+    bool counts = service->setProperty("CobaltSurvey,ApertureAttempted", result.attempted);
+    counts = service->setProperty("CobaltSurvey,ApertureSelectorWritesIssued", result.selectorWrites, 32) && counts;
+    counts = service->setProperty("CobaltSurvey,ApertureDataReads", result.dataReads, 32) && counts;
+    counts = service->setProperty("CobaltSurvey,ApertureVramWritesIssued", result.vramWrites, 32) && counts;
+    counts = service->setProperty("CobaltSurvey,ApertureFlushWritesIssued", result.flushWrites, 32) && counts;
+    counts = service->setProperty("CobaltSurvey,ApertureCleanup", result.cleanup) && counts;
+    counts = service->setProperty("CobaltSurvey,ApertureVramCleanup", result.vramCleanup) && counts;
+    counts = service->setProperty("CobaltSurvey,ApertureSelectorCleanup", result.selectorCleanup) && counts;
+    const bool published = counts &&
+        service->setProperty("CobaltSurvey,ApertureRemapFirstRaw", result.remap[0], 32) &&
+        service->setProperty("CobaltSurvey,ApertureRemapSecondRaw", result.remap[1], 32) &&
+        service->setProperty("CobaltSurvey,AperturePlanReason", result.plan.reason) &&
+        service->setProperty("CobaltSurvey,ApertureWindowOffset", result.plan.windowOffset, 64) &&
+        service->setProperty("CobaltSurvey,ApertureWindowBytes", result.plan.windowBytes, 64) &&
+        service->setProperty("CobaltSurvey,ApertureMcAddress", result.plan.mcAddress, 64) &&
+        service->setProperty("CobaltSurvey,ApertureReadOnly", !result.attempted) &&
+        service->setProperty("CobaltSurvey,ApertureStatus", result.status) &&
+        service->setProperty("CobaltSurvey,Schema", result.success ? 5ULL : 4ULL, 32);
+    if (!published) {
+        const char *partial[] = {"ApertureWindowOffset", "ApertureWindowBytes", "ApertureMcAddress",
+            "ApertureRemapFirstRaw", "ApertureRemapSecondRaw", "AperturePlanReason", "ApertureReadOnly"};
+        for (const char *name : partial) {
+            char key[64]; snprintf(key, sizeof(key), "CobaltSurvey,%s", name); service->removeProperty(key);
+        }
+        service->removeProperty("CobaltSurvey,ApertureStatus");
+        service->setProperty("CobaltSurvey,ApertureStatus", "metadata-publication-failed");
+        service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
+        result.success = false;
+    }
+}
+
 bool criticalIps(const IpDiscovery &d) {
     const uint16_t ids[] = {IpDiscovery::HwGc, IpDiscovery::HwMp0,
         IpDiscovery::HwMp1, IpDiscovery::HwSdma0, IpDiscovery::HwDmu};
@@ -752,6 +1170,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     }
     clearStateProperties(this);
     clearConsoleProperties(this);
+    clearApertureProperties(this);
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -904,6 +1323,9 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     if (collectState) {
         stateFailure = passiveState(pci, s, mmio, vram, parser, stateResult);
     }
+    const bool collectAperture = apertureArmed();
+    const ApertureProof proof = collectAperture ? apertureProof(parser, stateResult, mmio) : ApertureProof {};
+    ApertureResult apertureResult;
     const uint64_t binaryOffset = parser.binaryOffset();
     const uint32_t ipCount = parser.ipCount();
     discovery.reset();
@@ -939,6 +1361,21 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             if (consoleFailure) publishConsoleFailure(this, consoleFailure);
             else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
             else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
+            else if (collectAperture) {
+                runAperture(this, pci, s, mmio, vram, first, proof, stateResult, consoleResult, apertureResult);
+                // runAperture owns every aperture resource synchronously. No
+                // mapped byte or provider ownership escapes into publication.
+                if (!consoleGuard(pci, s, mmio, vram)) {
+                    apertureResult.success = false;
+                    apertureResult.status = "device-context-changed";
+                }
+                publishAperture(this, apertureResult);
+                if (!consoleGuard(pci, s, mmio, vram)) {
+                    apertureResult.success = false;
+                    apertureResult.status = "device-context-changed";
+                    publishAperture(this, apertureResult);
+                }
+            }
         }
     }
     status("discovery-snapshot-validated");
@@ -948,6 +1385,7 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     removeProperty("CobaltSurvey,DiscoverySnapshot");
     clearStateProperties(this);
     clearConsoleProperties(this);
+    clearApertureProperties(this);
     status("stopped");
     super::stop(provider);
 }

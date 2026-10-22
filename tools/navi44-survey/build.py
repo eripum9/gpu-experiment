@@ -3,8 +3,9 @@
 
 Windows: run in a VS developer shell and pass --cxx cl.
 macOS/Linux: defaults to CXX or clang++/g++/c++.
-The fake API instruments selector writes and provider ownership. It deliberately
-has no PCI/config writes, MM_DATA writes, DMA, IRQ, or GPU activation APIs.
+The fake API instruments provider ownership and the fixed-purpose selector,
+aperture-pattern and HDP-flush accesses. It deliberately has no PCI/config
+writes, MM_DATA writes, DMA, IRQ, or GPU activation APIs.
 """
 import argparse
 import os
@@ -48,6 +49,21 @@ def main():
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              *[part for path in includes for part in ("-I", path)], *sources, "-o", executable])
     run([executable])
+
+    # Keep the pure aperture planner check independent from the service test:
+    # it needs no IOKit shims and is safe to run on ordinary host toolchains.
+    plan_source = SERVICE / "hosttest/aperture_plan_test.cpp"
+    plan_executable = BUILD / ("aperture-plan-test.exe" if os.name == "nt" else "aperture-plan-test")
+    if Path(cxx).stem.lower() in ("cl", "clang-cl"):
+        plan_object = BUILD / "aperture_plan_test.obj"
+        run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/Zc:__cplusplus",
+             f"/I{SERVICE / 'src'}", "/c", plan_source, f"/Fo{plan_object}"])
+        run([cxx, "/nologo", plan_object, f"/Fe{plan_executable}"])
+    else:
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1",
+             "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+             "-I", SERVICE / "src", plan_source, "-o", plan_executable])
+    run([plan_executable])
 
 
 if __name__ == "__main__":

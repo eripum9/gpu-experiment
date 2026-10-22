@@ -1018,11 +1018,321 @@ static void passiveConsoleTests() {
     }
 }
 
+static Bytes apertureFixture() {
+    Bytes b=stateFixture();
+    const size_t oldGc=gc+12;
+    b.insert(b.begin()+static_cast<std::ptrdiff_t>(oldGc),32,0);
+    const size_t nbif=die+4+6*12, hdp=nbif+20, shiftedGc=oldGc+32;
+    put16(b,nbif,108); b[nbif+3]=3; b[nbif+4]=6; b[nbif+5]=3; b[nbif+6]=1;
+    put32(b,nbif+8,0x1000); put32(b,nbif+12,0x2000); put32(b,nbif+16,0xd20);
+    put16(b,hdp,41); b[hdp+3]=1; b[hdp+4]=7; put32(b,hdp+8,0x1000);
+    put16(b,prefix+10,uint16_t(shiftedGc+gcSize-prefix));
+    put16(b,prefix+16,uint16_t(ipdsSize+44)); put16(b,prefix+20,uint16_t(shiftedGc-prefix));
+    put16(b,ipds+6,uint16_t(ipdsSize+44)); put16(b,die+2,8);
+    put16(b,prefix+14,sum(b,ipds,ipds+ipdsSize+44));
+    put16(b,prefix+22,sum(b,shiftedGc,shiftedGc+gcSize));
+    put16(b,prefix+8,sum(b,prefix+10,shiftedGc+gcSize)); b.resize(10240);
+    return b;
+}
+static void apertureDevice(Device &d) {
+    consoleFixture(d); d.load(apertureFixture()); d.indexed();
+    d.mmio.length=d.mmio.contiguous=0x80000; d.pci.subsystem=0x86011eae;
+    testState.apertureBootPresent=true;
+    testState.stateRead=[](uint32_t offset,uint32_t) {
+        if(offset==0x458c) return 0x80000000u;
+        if(offset==0x4644) return 0u;
+        if(offset==0xa950) return 0x8000u;
+        if(offset==0xa954) return 0x83fbu;
+        throw std::runtime_error("unexpected aperture state offset");
+    };
+}
+static const std::string &apertureStatus(const Device &d) {
+    return d.service.strings.at("CobaltSurvey,ApertureStatus");
+}
+static void noApertureWrites() {
+    CHECK(testState.selectorWrites==5124); CHECK(testState.apertureCpuWrites==0);
+    CHECK(testState.apertureFlushWrites==0); CHECK(testState.apertureDataReads==0);
+}
+static void apertureTests() {
+    unsigned successfulRegisterReads=0, successfulCoreEvents=0;
+    {
+        Device d; apertureDevice(d);
+        testState.onAperture=[](const MmioEvent &e) {
+            if(e.operation=='v') {
+                CHECK(e.offset<16); CHECK((e.offset&3)==0);
+                // CPU writes are posted; the indexed GPU view changes only
+                // when the audited HDP flush is issued after the fence.
+                if(testState.apertureCpuWrites<=4)
+                    for(auto word:testState.apertureGpu) CHECK(word==0xabc01234);
+            }
+            if(e.operation=='h') CHECK(testState.apertureCpuWrites==testState.apertureFlushWrites*4);
+            if(e.operation=='d'||e.operation=='c') CHECK(e.offset<16 && !(e.offset&3));
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(apertureStatus(d)=="pattern-and-restore-verified");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==5);
+        CHECK(d.service.numbers.at("CobaltSurvey,IndexedSelectorWritesIssued")==5124);
+        CHECK(d.service.numbers.at("CobaltSurvey,IndexedDataReads")==5120);
+        CHECK(d.service.numbers.at("CobaltSurvey,ApertureSelectorWritesIssued")==34);
+        CHECK(d.service.numbers.at("CobaltSurvey,ApertureDataReads")==16);
+        CHECK(d.service.numbers.at("CobaltSurvey,ApertureVramWritesIssued")==8);
+        CHECK(d.service.numbers.at("CobaltSurvey,ApertureFlushWritesIssued")==2);
+        CHECK(testState.apertureCpuWrites==8); CHECK(testState.apertureFlushWrites==2);
+        CHECK(testState.openCalls==2); CHECK(testState.closeCalls==2);
+        CHECK(testState.consoleCalls==4); CHECK(testState.stateReads==16);
+        CHECK(testState.selectorWrites==5158); CHECK(testState.indexedDataReads==5120);
+        CHECK(testState.apertureDataReads==16); CHECK(testState.apertureCpuReads==16);
+        CHECK(d.mmio.selectorStorage[0]==0x12345678); CHECK(d.mmio.selectorStorage[6]==2);
+        CHECK(d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureVramCleanup")=="restored-observed");
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureSelectorCleanup")=="restored-observed");
+        for(unsigned i=0;i<4;++i) { CHECK(testState.apertureCpu[i]==0xabc01234); CHECK(testState.apertureGpu[i]==0xabc01234); }
+        for(unsigned i=4;i<1024;++i) CHECK(testState.apertureCpu[i]==0xabc01234);
+        successfulRegisterReads=testState.apertureRegisterReads;
+        for(const auto &e:testState.apertureEvents) if(e.operation!='n') ++successfulCoreEvents;
+        d.service.stop(&d.pci); CHECK(d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+        CHECK(!d.service.strings.count("CobaltSurvey,ApertureStatus"));
+    }
+    for(const char *arg:{"", "0", "2", "-1", "true", "1x"}) {
+        Device d; apertureDevice(d); testState.apertureBoot=arg; d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,ApertureStatus")); noApertureWrites();
+        CHECK(testState.openCalls==1); CHECK(testState.stateReads==8); CHECK(testState.consoleCalls==2);
+    }
+    {
+        Device d; apertureDevice(d); testState.apertureBootPresent=false; d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,ApertureStatus")); noApertureWrites();
+    }
+    for(unsigned kind=0;kind<6;++kind) {
+        Device d; apertureDevice(d);
+        if(kind==0) d.pci.subsystem^=1;
+        if(kind==1) d.pci.classRevision^=1;
+        if(kind==2) d.mmio.length=d.mmio.contiguous=0x100000;
+        if(kind==3) d.vram.length=d.vram.contiguous=128ULL<<20;
+        if(kind==4) d.load(stateFixture());
+        if(kind==5) testState.console.v_length=250ULL<<20;
+        d.run("discovery-snapshot-validated"); CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(apertureStatus(d)!="pattern-and-restore-verified"); noApertureWrites();
+        CHECK(!d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+    }
+    for(uint32_t remap:{0u,0x1000u,0x7f001u,0xffffffffu}) {
+        Device d; apertureDevice(d); testState.apertureRemap=remap;
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="hdp-remap-not-whitelisted");
+        CHECK(d.service.numbers.at("CobaltSurvey,ApertureRemapFirstRaw")==remap); noApertureWrites();
+    }
+    {
+        Device d; apertureDevice(d); unsigned reads=0;
+        testState.apertureRegisterRead=[&reads](uint32_t offset,uint32_t value) {
+            return offset==0x3934 && ++reads==2 ? 0u : value;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="hdp-remap-not-whitelisted"); noApertureWrites();
+    }
+    for(unsigned kind=0;kind<8;++kind) {
+        Device d; apertureDevice(d); IOService peer;
+        if(kind==0) d.pci.onOpen=[&d] { if(testState.openCalls==2) d.pci.owner=nullptr; };
+        if(kind==1) testState.onConsole=[&d](unsigned call,PE_Video &) { if(call==3) d.pci.command=0; };
+        if(kind==2) testState.onConsole=[](unsigned call,PE_Video &v) { if(call>=3) ++v.v_scale; };
+        if(kind==3) testState.onConsole=[&d,&peer](unsigned call,PE_Video &) { if(call==3) d.pci.clients.push_back(&peer); };
+        if(kind==4) d.pci.numbers["CobaltSurvey,ApertureAttempt-v1"]=1;
+        if(kind==5) testState.apertureClaimFail=true;
+        if(kind==6) testState.onConsole=[&d](unsigned call,PE_Video &) { if(call==3) d.pci.iteratorInvalid=true; };
+        if(kind==7) d.pci.onClose=[&d] { if(testState.closeCalls==1) d.pci.openBusy=true; };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)!="pattern-and-restore-verified"); noApertureWrites();
+    }
+    // Every new mapping failure must precede the persistent attempt and all
+    // new selector, CPU and flush writes. Four baseline maps precede six new.
+    for(unsigned request=5;request<=10;++request) {
+        Device d; apertureDevice(d); testState.failMapRequest=request;
+        d.run("discovery-snapshot-validated"); noApertureWrites();
+        CHECK(!d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+        CHECK(apertureStatus(d)!="pattern-and-restore-verified");
+    }
+    for(unsigned request=5;request<=10;++request) for(unsigned fault=0;fault<13;++fault) {
+        Device d; apertureDevice(d);
+        auto corrupt=[&](IODeviceMemory &memory) {
+            if(testState.mapRequests!=request) return;
+            if(fault==0) memory.mapTruncated=true;
+            if(fault==1) memory.mapWrongPhysical=true;
+            if(fault==2) memory.mapCached=true;
+            if(fault==3) memory.mapNullAddress=true;
+            if(fault==4) memory.mapMisalignedAddress=true;
+            if(fault==5) memory.mapWrongDescriptor=true;
+            if(fault==6) memory.mapFragmented=true;
+            if(fault==7) memory.mapDescriptorWrongLength=true;
+            if(fault==8) memory.mapDescriptorWrongPhysical=true;
+            if(fault==9) memory.mapDescriptorFragmented=true;
+            if(fault==10) memory.mapDescriptorWrongSegment=true;
+            if(fault==11) memory.mapSegmentWrongPhysical=true;
+            if(fault==12) { if(request<=7) memory.mapWritable=true; else memory.mapForceReadOnly=true; }
+        };
+        d.mmio.onMap=[&] { corrupt(d.mmio); }; d.vram.onMap=[&] { corrupt(d.vram); };
+        d.run("discovery-snapshot-validated"); noApertureWrites();
+        CHECK(apertureStatus(d)!="pattern-and-restore-verified");
+        CHECK(!d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+    }
+    for(unsigned at=8;at<16;++at) {
+        Device d; apertureDevice(d); const auto read=testState.stateRead;
+        testState.stateRead=[read,at](uint32_t offset,uint32_t value) {
+            const auto actual=read(offset,value); return testState.stateReads==at ? actual^1 : actual;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="fresh-state-changed"); noApertureWrites();
+    }
+    for(unsigned kind=0;kind<7;++kind) {
+        Device d; apertureDevice(d); auto bytes=apertureFixture();
+        const size_t nbif=die+4+6*12, hdp=nbif+20, shiftedGc=gc+44;
+        if(kind==0) bytes[nbif+4]=7;
+        if(kind==1) bytes[nbif+5]=4;
+        if(kind==2) bytes[nbif+6]=2;
+        if(kind==3) bytes[nbif+2]=1;
+        if(kind==4) bytes[hdp+4]=6;
+        if(kind==5) bytes[hdp+2]=1;
+        if(kind==6) put16(bytes,hdp,108);
+        put16(bytes,prefix+14,sum(bytes,ipds,ipds+ipdsSize+44));
+        put16(bytes,prefix+22,sum(bytes,shiftedGc,shiftedGc+gcSize));
+        put16(bytes,prefix+8,sum(bytes,prefix+10,shiftedGc+gcSize)); d.load(bytes);
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="aperture-ip-proof-unavailable"); noApertureWrites();
+    }
+    for(unsigned at=0;at<8;++at) {
+        Device d; apertureDevice(d);
+        testState.apertureDataRead=[at](unsigned read,uint32_t value) { return read==at ? value^1 : value; };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="original-read-mismatch");
+        CHECK(testState.apertureCpuWrites==0); CHECK(testState.apertureFlushWrites==0);
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureSelectorCleanup")=="restored-observed");
+    }
+    for(unsigned at=8;at<12;++at) {
+        Device d; apertureDevice(d);
+        testState.apertureDataRead=[at](unsigned read,uint32_t value) { return read==at ? value^1 : value; };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="pattern-read-mismatch");
+        CHECK(testState.apertureCpuWrites==8); CHECK(testState.apertureFlushWrites==2);
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureVramCleanup")=="restored-observed");
+    }
+    for(unsigned at=0;at<12;++at) {
+        Device d; apertureDevice(d);
+        testState.apertureCpuRead=[at](unsigned read,uint32_t value) { return read==at ? value^1 : value; };
+        d.run("discovery-snapshot-validated");
+        CHECK(apertureStatus(d)==(at<8 ? "original-read-mismatch" : "pattern-read-mismatch"));
+        CHECK(testState.apertureCpuWrites==(at<8 ? 0u : 8u));
+        CHECK(testState.apertureFlushWrites==(at<8 ? 0u : 2u));
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureSelectorCleanup")=="restored-observed");
+    }
+    for(unsigned at=0;at<4;++at) {
+        Device d; apertureDevice(d); unsigned reads=0;
+        testState.selectorRead=[&](uint32_t,uint32_t value) {
+            return aperturePhase() && reads++==at ? UINT32_MAX : value;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="selectors-unreadable-or-unstable");
+        noApertureWrites(); CHECK(!d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+    }
+    {
+        Device d; apertureDevice(d);
+        testState.onMmio=[&d](const MmioEvent &e) {
+            if(aperturePhase() && e.operation=='w' && testState.selectorWrites==5158)
+                d.mmio.selectorStorage[6]^=1;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="cleanup-unverified");
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureVramCleanup")=="restored-observed");
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureSelectorCleanup")=="restore-skipped-or-unverified");
+    }
+    for(unsigned at=12;at<16;++at) {
+        Device d; apertureDevice(d);
+        testState.apertureDataRead=[at](unsigned read,uint32_t value) { return read==at ? value^1 : value; };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="cleanup-unverified");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureVramCleanup")=="restore-skipped-or-unverified");
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureSelectorCleanup")=="restored-observed");
+    }
+    // At every fixed access event, make the PCI/BAR/ownership or NBIF context
+    // stale. After the event no further write through the old maps is allowed.
+    for(unsigned kind=0;kind<8;++kind) for(unsigned at=1;at<=successfulCoreEvents;++at) {
+        Device d; apertureDevice(d); IOService peer; unsigned core=0,writesAtFault=0; bool fault=false;
+        testState.onAperture=[&](const MmioEvent &e) {
+            if(e.operation=='n') return;
+            if(++core!=at) return;
+            fault=true; writesAtFault=testState.selectorWrites+testState.apertureCpuWrites+testState.apertureFlushWrites;
+            if(kind==0) d.pci.command=0;
+            if(kind==1) d.pci.bars[0]+=4096;
+            if(kind==2) d.pci.inactive=true;
+            if(kind==3) d.pci.clients.push_back(&peer);
+            if(kind==4) testState.apertureRemap=0;
+            if(kind==5) testState.apertureMemsize=1;
+            if(kind==6) d.pci.owner=nullptr;
+            if(kind==7) d.vram.physical+=4096;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(fault);
+        CHECK(testState.selectorWrites+testState.apertureCpuWrites+testState.apertureFlushWrites==writesAtFault);
+        CHECK(apertureStatus(d)!="pattern-and-restore-verified"); CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+    }
+    {
+        Device d; apertureDevice(d); testState.failApertureSchema=true;
+        d.run("discovery-snapshot-validated"); CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(apertureStatus(d)=="metadata-publication-failed");
+        CHECK(d.service.strings.at("CobaltSurvey,ApertureVramCleanup")=="restored-observed");
+    }
+    {
+        Device d; apertureDevice(d); d.run("discovery-snapshot-validated");
+        const unsigned cpuWrites=testState.apertureCpuWrites, flushWrites=testState.apertureFlushWrites;
+        d.service.stop(&d.pci);
+        // Removing the independent discovery attempt only in this test proves
+        // the aperture marker itself survives stop/restart and refuses retry.
+        d.pci.removeProperty("CobaltSurvey,IndexedAttempt-v1");
+        // The fixture distinguishes discovery from aperture MM_DATA by session.
+        testState.openCalls=0; testState.closeCalls=0;
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="already-attempted");
+        CHECK(testState.apertureCpuWrites==cpuWrites); CHECK(testState.apertureFlushWrites==flushWrites);
+        CHECK(d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+    }
+    // One-shot bad remap/memsize samples return to normal immediately. Once
+    // observed, context loss remains latched, including cleanup's posted read.
+    for(unsigned at=3;at<=successfulRegisterReads;++at) {
+        Device d; apertureDevice(d); unsigned reads=0,writesAtFault=0; bool fault=false;
+        testState.apertureRegisterRead=[&](uint32_t,uint32_t value) {
+            if(++reads!=at) return value;
+            fault=true; writesAtFault=testState.selectorWrites+testState.apertureCpuWrites+testState.apertureFlushWrites;
+            return 0u;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(fault);
+        CHECK(testState.selectorWrites+testState.apertureCpuWrites+testState.apertureFlushWrites==writesAtFault);
+        CHECK(apertureStatus(d)!="pattern-and-restore-verified");
+    }
+    for(const char *name:{"ApertureAttempted","ApertureSelectorWritesIssued","ApertureDataReads",
+        "ApertureVramWritesIssued","ApertureFlushWritesIssued","ApertureCleanup","ApertureVramCleanup",
+        "ApertureSelectorCleanup","ApertureStatus","ApertureWindowOffset","ApertureWindowBytes",
+        "ApertureMcAddress","ApertureRemapFirstRaw","ApertureRemapSecondRaw","ApertureReadOnly","AperturePlanReason"}) {
+        Device d; apertureDevice(d); testState.propertyFailKey=std::string("CobaltSurvey,")+name;
+        d.run("discovery-snapshot-validated"); CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+        CHECK(!d.service.numbers.count("CobaltSurvey,ApertureMcAddress"));
+        CHECK(d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+        if(std::string(name)!="ApertureSelectorCleanup")
+            CHECK(d.service.strings.at("CobaltSurvey,ApertureSelectorCleanup")=="restored-observed");
+        if(std::string(name)!="ApertureStatus") CHECK(apertureStatus(d)=="metadata-publication-failed");
+    }
+    for(const char *name:{"ReadOnly","AccessMode"}) {
+        Device d; apertureDevice(d);
+        testState.onConsole=[name](unsigned call,PE_Video &) {
+            if(call==4) testState.propertyFailKey=std::string("CobaltSurvey,")+name;
+        };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="metadata-publication-failed");
+        noApertureWrites(); CHECK(d.pci.getProperty("CobaltSurvey,ApertureAttempt-v1"));
+        CHECK(d.service.numbers.at("CobaltSurvey,ApertureAttempted")==1);
+    }
+    {
+        Device d; apertureDevice(d); d.pci.onClose=[&d] { if(testState.closeCalls==2) d.pci.command=0; };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="device-context-changed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+    }
+    {
+        Device d; apertureDevice(d); testState.onAperturePublication=[&d](const std::string &) { d.pci.command=0; };
+        d.run("discovery-snapshot-validated"); CHECK(apertureStatus(d)=="device-context-changed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
+    }
+    std::cout << "Aperture exhaustive register/core fault positions: " << successfulRegisterReads << "/" << successfulCoreEvents << "\n";
+}
+
 int main() {
     try {
         gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
         revalidation(); parserAndPublication();
         indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState(); passiveConsoleTests();
+        apertureTests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"; return 1;

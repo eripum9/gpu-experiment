@@ -43,8 +43,25 @@ struct TestState {
     bool indexedBootPresent = false, claimFail = false;
     std::string stateBoot = "1";
     bool stateBootPresent = false;
+    std::string apertureBoot = "1";
+    bool apertureBootPresent = false, apertureClaimFail = false, apertureClaimed = false;
+    uint64_t apertureOffset = 64ULL << 20;
+    uint32_t apertureRemap = 0x7f000, apertureMemsize = 16304;
+    unsigned apertureRegisterReads = 0, apertureDataReads = 0, apertureCpuReads = 0;
+    unsigned apertureCpuWrites = 0, apertureFlushWrites = 0, apertureFences = 0;
+    bool probeMapLive = false, flushMapLive = false;
+    volatile uint32_t *probePage = nullptr, *flushPage = nullptr;
+    const volatile uint32_t *nbifPage = nullptr;
+    std::vector<uint32_t> apertureCpu = std::vector<uint32_t>(1024, 0xabc01234);
+    std::vector<uint32_t> apertureGpu = std::vector<uint32_t>(4, 0xabc01234);
+    std::vector<uint32_t> apertureFlush = std::vector<uint32_t>(1024);
+    std::vector<MmioEvent> apertureEvents;
+    std::function<void(const MmioEvent &)> onAperture;
+    std::function<uint32_t(uint32_t, uint32_t)> apertureRegisterRead;
+    std::function<uint32_t(unsigned, uint32_t)> apertureDataRead, apertureCpuRead;
+    std::function<void(const std::string &)> onAperturePublication;
     std::string propertyFailKey;
-    bool platformAvailable = false, failConsoleSchema = false;
+    bool platformAvailable = false, failConsoleSchema = false, failApertureSchema = false;
     unsigned platformCalls = 0, consoleCalls = 0;
     PE_Video console;
     IOReturn consoleResult = kIOReturnSuccess;
@@ -76,6 +93,14 @@ struct TestState {
     std::function<void(unsigned)> onMemsize;
 };
 inline TestState testState;
+inline bool aperturePhase() {
+    return testState.apertureBootPresent && testState.openCalls >= 2 && testState.openLive == 1;
+}
+inline void apertureEvent(char operation, uint32_t offset, uint32_t value) {
+    const MmioEvent event {operation, offset, value};
+    testState.apertureEvents.push_back(event);
+    if (testState.onAperture) testState.onAperture(event);
+}
 
 #define OSDeclareDefaultStructors(T) public: T() = default; ~T() override = default;
 #define OSDefineMetaClassAndStructors(T, B)
@@ -130,6 +155,13 @@ public:
     virtual void stop(IOService *) { ++stopCalls; }
     static IOPlatformExpert *getPlatform();
     void consolePublication(const char *key) {
+        if (std::string(key).find("CobaltSurvey,Aperture") == 0 &&
+            std::string(key) != "CobaltSurvey,ApertureAttempt-v1") {
+            if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
+                testState.openLive || testState.iteratorsLive)
+                throw std::runtime_error("GPU resources retained at aperture publication");
+            if (testState.onAperturePublication) testState.onAperturePublication(key);
+        }
         if (std::string(key).find("CobaltSurvey,Console") != 0) return;
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
             testState.openLive || testState.iteratorsLive)
@@ -144,6 +176,7 @@ public:
     bool setProperty(const char *key, uint64_t value, unsigned) {
         consolePublication(key);
         if (testState.failConsoleSchema && std::string(key)=="CobaltSurvey,Schema" && value==4) return false;
+        if (testState.failApertureSchema && std::string(key)=="CobaltSurvey,Schema" && value==5) return false;
         if (testState.propertyFailKey == key) return false;
         numbers[key] = value; return true;
     }
@@ -151,6 +184,8 @@ public:
         consolePublication(key);
         if (testState.propertyFailKey == key) return false;
         if (std::string(key) == "CobaltSurvey,IndexedAttempt-v1" && testState.claimFail) return false;
+        if (std::string(key) == "CobaltSurvey,ApertureAttempt-v1" && testState.apertureClaimFail) return false;
+        if (std::string(key) == "CobaltSurvey,ApertureAttempt-v1") testState.apertureClaimed = true;
         numbers[key] = value ? 1 : 0; return true;
     }
     OSObject *getProperty(const char *key) {
@@ -180,7 +215,7 @@ class IOPlatformExpert {
 public:
     IOReturn getConsoleInfo(PE_Video *video) {
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
-            testState.openLive || testState.iteratorsLive)
+            (testState.openLive && !aperturePhase()) || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at console API");
         ++testState.consoleCalls;
         *video = testState.console;
@@ -205,6 +240,7 @@ public:
     IOByteCount descriptorOffset = 0;
     bool fragmented = false, wrongSegment = false;
     bool indexedMapping = false;
+    bool probeMapping = false, flushMapping = false;
     std::function<void()> onAddress;
     IOMemoryMap() { ++testState.mapsLive; }
     ~IOMemoryMap() override;
@@ -222,6 +258,7 @@ public:
     std::vector<uint32_t> storage; // aligned backing for the mapped test window only
     bool mapFail = false, mapTruncated = false, mapWrongPhysical = false;
     bool mapWritable = false, mapCached = false, mapNullAddress = false;
+    bool mapForceReadOnly = false, mapMisalignedAddress = false;
     bool mapWrongDescriptor = false, mapFragmented = false;
     bool mapOriginalDescriptor = false, mapDescriptorWrongLength = false;
     bool mapDescriptorWrongPhysical = false, mapDescriptorFragmented = false;
@@ -251,13 +288,21 @@ public:
         ++testState.mapRequests; ++requests;
         const bool indexed = offset == 0 && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const bool probe = aperturePhase() && physical == 0x1000000000ULL &&
+            offset == testState.apertureOffset && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const bool flush = aperturePhase() && physical == 0xc0000000 && offset == 0x7f000 && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const bool stateMap = testState.stateBootPresent && n == 4096 && offset != 0x3000 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
         if (stateMap) {
             testState.stateMapRequests.emplace_back(offset, options);
             testState.stateMapBases.emplace_back(offset, reinterpret_cast<uintptr_t>(storage.data()));
         }
-        if (task != kernel_task || address != 0 || (!indexed && !stateMap &&
+        if (aperturePhase() && physical == 0xc0000000 && offset == 0x3000 && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))
+            testState.nbifPage = storage.data();
+        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !probe && !flush &&
             (offset != expectedOffset || n != expectedLength ||
              options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
@@ -273,6 +318,7 @@ public:
         map->wrongSegment = mapSegmentWrongPhysical;
         map->options = options & ~(mapWritable ? kIOMapReadOnly : 0u);
         if (indexed && indexedMapReadOnly) map->options |= kIOMapReadOnly;
+        if (mapForceReadOnly) map->options |= kIOMapReadOnly;
         if (mapCached) map->options &= ~kIOMapCacheMask;
         // Reproduce XNU makeMapping's unique-physical branch: withAddressRange
         // creates a separate exact-length descriptor; the map offset is zero.
@@ -295,11 +341,21 @@ public:
             }
         }
         map->address = mapNullAddress ? 0 : reinterpret_cast<uintptr_t>(
-            indexed ? selectorStorage.data() : storage.data());
+            indexed ? selectorStorage.data() : probe ? testState.apertureCpu.data() :
+                flush ? testState.apertureFlush.data() : storage.data());
+        if (mapMisalignedAddress && map->address) ++map->address;
         if (indexed) {
             map->indexedMapping = true;
             testState.indexedMapLive = true;
             testState.indexedPage = selectorStorage.data();
+        }
+        if (probe) {
+            map->probeMapping = true; testState.probeMapLive = true;
+            testState.probePage = testState.apertureCpu.data();
+        }
+        if (flush) {
+            map->flushMapping = true; testState.flushMapLive = true;
+            testState.flushPage = testState.apertureFlush.data();
         }
         map->onAddress = onAddress;
         return map;
@@ -307,6 +363,8 @@ public:
 };
 inline IOMemoryMap::~IOMemoryMap() {
     if (indexedMapping) testState.indexedMapLive = false;
+    if (probeMapping) testState.probeMapLive = false;
+    if (flushMapping) testState.flushMapLive = false;
     if (ownsDescriptor) descriptor->release();
     --testState.mapsLive; ++testState.mapReleases;
     if (testState.onMapRelease) testState.onMapRelease(testState.mapReleases);
@@ -322,6 +380,7 @@ using IODeviceMemory = IOMemoryDescriptor;
 class IOPCIDevice : public IOService {
 public:
     IOService *owner = nullptr;
+    IOService *successfulOpenClient = nullptr;
     bool openBusy = false, iteratorFail = false, iteratorInvalid = false;
     std::vector<OSObject *> clients;
     std::function<void()> onOpen, onClose, onCensus;
@@ -329,13 +388,14 @@ public:
         if (options != 0) throw std::runtime_error("nonzero provider open flags");
         ++testState.openCalls;
         if (openBusy || owner) return false;
-        owner = client; ++testState.openLive; testState.indexedOwner = client;
+        owner = successfulOpenClient = client; ++testState.openLive; testState.indexedOwner = client;
         if (onOpen) onOpen();
         return true;
     }
     void close(IOService *client, IOOptionBits options) {
-        if (options != 0 || owner != client) throw std::runtime_error("invalid provider close");
-        owner = nullptr; --testState.openLive; ++testState.closeCalls;
+        if (options != 0 || successfulOpenClient != client) throw std::runtime_error("invalid provider close");
+        if (owner == client) owner = nullptr;
+        successfulOpenClient = nullptr; --testState.openLive; ++testState.closeCalls;
         if (onClose) onClose();
     }
     bool isOpen(const IOService *client) const { return owner == client; }
@@ -390,12 +450,22 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
     } else if (offset == 4) {
         const uint32_t low = testState.indexedPage[0], high = testState.indexedPage[6];
         const uint64_t pos = (uint64_t(high) << 31) | (low & 0x7fffffffu);
+        if (aperturePhase()) {
+            if (!testState.probeMapLive || !(low & 0x80000000u) || (pos & 3) ||
+                pos < testState.apertureOffset || pos >= testState.apertureOffset + 16)
+                throw std::runtime_error("aperture MM_DATA outside fixed sixteen bytes");
+            value = testState.apertureGpu[static_cast<size_t>((pos-testState.apertureOffset)/4)];
+            if (testState.apertureDataRead) value = testState.apertureDataRead(testState.apertureDataReads, value);
+            ++testState.apertureDataReads;
+            apertureEvent('d', static_cast<uint32_t>(pos-testState.apertureOffset), value);
+        } else {
         if (!(low & 0x80000000u) || (pos & 3) || pos < testState.discoveryOffset ||
             pos + 4 > testState.discoveryOffset + 10240 || testState.discovery.size() != 10240)
             throw std::runtime_error("MM_DATA read outside fixed discovery range");
         std::memcpy(&value, testState.discovery.data() + (pos - testState.discoveryOffset), 4);
         if (testState.dataRead) value = testState.dataRead(testState.indexedDataReads, value);
         ++testState.indexedDataReads;
+        }
     } else throw std::runtime_error("unexpected register read");
     const MmioEvent event {'r', offset, value}; testState.mmioEvents.push_back(event);
     if (testState.onMmio) testState.onMmio(event);
@@ -428,18 +498,76 @@ inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t
     if (offset != 0 && offset != 0x18) throw std::runtime_error("write outside selectors");
     *address = value; ++testState.selectorWrites;
     const MmioEvent event {'w', offset, value}; testState.mmioEvents.push_back(event);
+    if (aperturePhase()) {
+        if (!testState.apertureClaimed)
+            throw std::runtime_error("aperture selector write before persistent claim");
+        apertureEvent('s', offset, value);
+    }
     if (testState.onMmio) testState.onMmio(event);
+}
+
+inline void apertureIoOwnership() {
+    if (!aperturePhase() || !testState.indexedOwner ||
+        !testState.apertureClaimed ||
+        testState.indexedOwner->numbers.at("CobaltSurvey,ReadOnly") != 0 ||
+        testState.indexedOwner->numbers.at("CobaltSurvey,Ready") != 0)
+        throw std::runtime_error("aperture access without owned explicit attempt");
+}
+inline uint32_t cobaltSurveyTestApertureRegisterRead(const volatile uint32_t *address, uint32_t offset) {
+    if (!aperturePhase() || !testState.nbifPage || (offset != 0x3934 && offset != 0x378c) ||
+        address != testState.nbifPage + (offset & 0xfff)/4)
+        throw std::runtime_error("aperture register read outside proven NBIF allowlist");
+    uint32_t value = offset == 0x3934 ? testState.apertureRemap : testState.apertureMemsize;
+    if (testState.apertureRegisterRead) value = testState.apertureRegisterRead(offset, value);
+    ++testState.apertureRegisterReads;
+    apertureEvent('n', offset, value);
+    return value;
+}
+inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
+    apertureIoOwnership();
+    if (!testState.probeMapLive || address < testState.probePage || address >= testState.probePage+4)
+        throw std::runtime_error("CPU read outside fixed sixteen bytes");
+    uint32_t value = *address;
+    if (testState.apertureCpuRead) value = testState.apertureCpuRead(testState.apertureCpuReads, value);
+    ++testState.apertureCpuReads;
+    apertureEvent('c', static_cast<uint32_t>(address-testState.probePage)*4, value);
+    return value;
+}
+inline void cobaltSurveyTestApertureCpuWrite(volatile uint32_t *address, uint32_t value) {
+    apertureIoOwnership();
+    if (!testState.probeMapLive || address < testState.probePage || address >= testState.probePage+4)
+        throw std::runtime_error("CPU write outside fixed sixteen bytes");
+    *address = value; ++testState.apertureCpuWrites;
+    apertureEvent('v', static_cast<uint32_t>(address-testState.probePage)*4, value);
+}
+inline void cobaltSurveyTestApertureFence() {
+    apertureIoOwnership();
+    ++testState.apertureFences;
+    apertureEvent('f', 0, 0);
+}
+inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
+    apertureIoOwnership();
+    if (!testState.flushMapLive || address != testState.flushPage ||
+        testState.apertureFences != testState.apertureFlushWrites+1)
+        throw std::runtime_error("HDP flush outside fixed page or without fence");
+    *address = 0;
+    for (unsigned i=0; i<4; ++i) testState.apertureGpu[i] = testState.apertureCpu[i];
+    ++testState.apertureFlushWrites;
+    apertureEvent('h', 0, 0);
 }
 
 inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool indexed = std::string(key) == "cobalt-survey-indexed";
     const bool state = std::string(key) == "cobalt-survey-state";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state) throw std::runtime_error("unexpected boot argument");
-    if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent : !testState.bootPresent) return false;
+    const bool aperture = std::string(key) == "cobalt-survey-aperture";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture) throw std::runtime_error("unexpected boot argument");
+    if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
+        aperture ? !testState.apertureBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : testState.boot;
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot :
+        aperture ? testState.apertureBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
     const auto numeric = std::strtoll(token.c_str(), &end, 0);

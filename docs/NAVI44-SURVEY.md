@@ -4,8 +4,8 @@
 It does not enable Navi 44 in `Navi48Bringup`, run that driver's startup
 ladder, upload firmware, or provide graphics acceleration. A successful boot
 with this survey will still have the current basic display performance.
-Its default mode is read-only. A separately gated indexed-discovery experiment
-permits a bounded set of address-selector writes, described below.
+Its default mode is read-only. Separately gated experiments permit bounded
+address-selector writes and a 16-byte VRAM transport test, described below.
 
 ## What the test measures
 
@@ -155,11 +155,71 @@ remaining alignment bits are refused; it does not clear an arbitrary page's
 worth of low bits. Nonzero console offsets are still not guessed.
 
 This describes a console interval, not a reserved firmware buffer. It does
-not select a scratch address, prove all firmware/display reservations, establish
-BAR0-to-GPU address translation, or authorize a firmware upload. Those remain
-separate initialization prerequisites. The API and scalar layout follow
+not prove all firmware/display reservations, establish BAR0-to-GPU address
+translation, or authorize a firmware upload. The separate aperture experiment
+uses the interval as one of its exclusion checks. The API and scalar layout follow
 [XNU's platform expert](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOPlatformExpert.cpp)
 and [x86 console implementation](https://github.com/apple-oss-distributions/xnu/blob/main/pexpert/i386/pe_init.c).
+
+### Bounded aperture transport experiment
+
+`cobalt-survey-aperture=1` requests one additional, finite write experiment.
+It requires all three existing survey, indexed and state flags set to numeric
+`1`, validated discovery and state, and a stable, interpretable physical
+console interval. Omitting the new flag preserves the previous modes.
+The candidate still contains no GPU firmware and keeps `Ready=false`.
+
+This first checkpoint is restricted to PCI `1002:7590`, revision `c0`,
+subsystem `1eae:8601`, with a 256 MiB BAR0 and a 512 KiB BAR5. It requires
+unique NBIF 6.3.1 and HDP 7.0.0 discovery records. It uses a conservative
+516 MiB firmware reserve for that board profile, excludes the first 64 MiB,
+and leaves at least 16 MiB after the observed console. A pure checked-arithmetic
+planner selects a 1 MiB interval aligned to 1 MiB inside the aperture, usable
+VRAM and observed MC range. Only its first 4 KiB is mapped, and only its first
+four dwords can be written. These margins are experimental policy; they do
+not prove that firmware has no other VRAM users or establish an allocation
+contract for a general graphics driver.
+
+Before any new selector or VRAM write, the service opens the provider,
+checks for other direct clients, rechecks the console and PSP/MMHUB state,
+and validates all mappings. NBIF's memory-size and HDP-flush-remap register
+offsets are resolved from the validated discovery segment. Two remap reads
+must agree and equal exactly `0x7f000`. An absent, different or changing
+remap refuses the experiment; the service never programs the remap register.
+The offset and segment pairs follow Linux v6.19's
+[NBIF header](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/include/asic_reg/nbif/nbif_6_3_1_offset.h).
+
+The writable mappings are restricted to the existing selector page, one
+VRAM page, and the single 4 KiB HDP flush page. The only HDP write is zero
+to the page's first dword. A CPU memory barrier precedes that write; a
+read of NBIF's memory-size register posts it. This sequence follows Linux's
+[aperture access](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c)
+and [HDP flush](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_hdp.c)
+paths. It does not infer a valid remap from the HDP version alone.
+
+A separate persistent provider attempt marker is claimed before the first
+new selector write. Two CPU and indexed samples must agree on the original
+16 bytes. The transaction then writes a bounded test pattern, flushes it,
+and compares CPU and indexed readbacks. It restores the original bytes,
+flushes them and verifies both read paths before restoring the selectors.
+There is no arbitrary address interface, firmware upload, mailbox command,
+queue startup, display programming or automatic retry.
+
+Identity, active state, BAR configuration and descriptors, ownership,
+peer clients, memory size and remap guards apply throughout the transaction
+and cleanup. If a guard changes, further writes through that context are
+skipped and incomplete cleanup is reported. A failed pattern comparison
+with valid guards still attempts restoration. A matching readback reports
+an observation, not a guarantee against concurrent firmware access or reset.
+The provider-open contract has the same limitations as indexed discovery.
+
+Aperture operation counters and VRAM/selector cleanup results are separate
+from the discovery counters. No original VRAM contents are published.
+Maps are released and the provider is closed before the result is published.
+A complete successful result uses schema 5; refusals and failures preserve
+the independently valid discovery/state/console observations. `Ready` stays
+false even when the roundtrip succeeds. Hardware success would establish a
+small transport checkpoint, not PSP startup or graphics acceleration.
 
 ### Installing the selected diagnostic mode
 
@@ -181,6 +241,11 @@ build. Leave the existing BAR settings in place. The extra argument permits
 the selector writes described above; omitting it preserves the default
 read-only behavior. The ordinary collector works for either mode.
 
+An aperture test additionally adds `cobalt-survey-state=1` and
+`cobalt-survey-aperture=1` after source review, host fault tests and the native
+build pass. Keep the same working EFI backup and BAR settings. Inspect its
+reported result in Windows before progressing to a firmware-load test.
+
 Copy the packaged `collect-gpu-survey.sh` to the root of a writable FAT32
 USB volume named TAHOE. In the installed macOS environment, open Terminal:
 
@@ -199,8 +264,8 @@ Keep the captured output private. Bring the USB report back to Windows
 for review before progressing to initialization or acceleration tests.
 To remove the survey, restore the saved EFI or remove its Kernel/Add entry,
 bundle, and `cobalt-survey=1` argument. No internal ESP changes are required.
-Remove `cobalt-survey-indexed=1` and `cobalt-survey-state=1` as well when
-disabling those experiments.
+Remove `cobalt-survey-indexed=1`, `cobalt-survey-state=1` and
+`cobalt-survey-aperture=1` as well when disabling those experiments.
 
 ## Build
 
