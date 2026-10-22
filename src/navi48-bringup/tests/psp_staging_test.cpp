@@ -206,7 +206,7 @@ static void invalidRequestTests() {
         CHECK(!window.zero(kBase, StagingWindow::kBytes - 1));
         assertError(window, StagingError::InvalidRequest); CHECK(bus.events.empty());
     }
-    for (const size_t length : {size_t(0), StagingWindow::kBytes + 1}) {
+    for (const size_t length : {size_t(0), size_t(StagingWindow::kBytes + 1)}) {
         MemoryBus bus; StagingWindow window(bus, kBase); const Bytes source = pattern(8);
         CHECK(window.zero(kBase, StagingWindow::kBytes));
         const auto oldCalls = bus.events.size();
