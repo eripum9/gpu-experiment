@@ -36,6 +36,33 @@ the images. The dependency fetcher separately pins complete firmware blobs by
 size and SHA-256. No register sequence, firmware-loading order, profile gate,
 or standalone survey behavior changes as part of this integration.
 
+## Pre-SOS protocol checks
+
+The pre-SOS loader additionally requires an explicitly configured 1 MiB staging
+offset and a fresh successful preflight before one chain attempt. Parsing or
+reconfiguring the offset invalidates that authorization, and every attempt
+consumes it. An invalid offset clears its configuration rather than retaining
+a previous location. Explicit offset zero is an input, not a default grant of
+permission to overwrite the boot framebuffer.
+
+Preflight validates the complete selected chain against the parsed container,
+including all component sizes, before any image is staged. The loader repeats
+that check before the first write; its public inspection slots cannot replace
+the parsed pointer, length or version. MC address addition, the complete staging
+extent and the address representation accepted by the mailbox are checked.
+
+The host protocol test executes the production `PspLoader` with a simulated
+`HwAccess`. It checks command order, addresses, staging data, readiness polling,
+secure-OS sign-of-life transitions and failures. CI also supplies both pinned
+PSP packages to this simulation after fetching them. These checks exercise CPU
+code and a simulated bus; they do not execute GPU firmware.
+
+The caller still owns the source buffer's lifetime, the device and mappings,
+the exclusion of console/firmware reservations, BAR0-to-MC translation and
+visibility of CPU writes to the PSP. A posted MC window and a bootloader-ready
+bit do not establish those requirements. Navi 44 remains disabled in the main
+driver while its memory policy and hardware adapter are being prepared.
+
 ## Next reuse boundary
 
 [tinygrad's AM driver](https://github.com/tinygrad/tinygrad/blob/042156664964dd594fa7caed3bacdc2384995a9b/docs/developer/am.md)

@@ -794,7 +794,7 @@ static void passiveState() {
 
 static void consoleFixture(Device &d) {
     d.load(stateFixture()); testState.stateBootPresent=true; testState.platformAvailable=true;
-    testState.console.v_baseAddr=d.vram.physical+(2ULL<<20);
+    testState.console.v_baseAddr=(d.vram.physical+(2ULL<<20))|1ULL;
     testState.console.v_rowBytes=4096; testState.console.v_width=1024;
     testState.console.v_height=768; testState.console.v_depth=32;
     testState.console.v_display=1; testState.console.v_scale=1;
@@ -808,13 +808,46 @@ static void noConsoleRaw(const Device &d) {
     CHECK(d.service.strings.at("CobaltSurvey,StateStatus")=="observed-stable");
 }
 static void passiveConsoleTests() {
+    // XNU's live-console address is virtual unless its physical tag is set.
+    // An address resembling BAR0 is insufficient evidence without that tag.
+    for(uint64_t raw : {0x1000200000ULL,0xffff800000200000ULL,0x1000200002ULL}) {
+        Device d; consoleFixture(d); testState.console.v_baseAddr=raw;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")=="base-not-tagged-physical");
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==raw);
+        CHECK(!d.service.numbers.count("CobaltSurvey,ConsoleVramOffset"));
+        CHECK(testState.stateReads==8); CHECK(testState.consoleCalls==2);
+    }
+    for(uint64_t tag : {1ULL,3ULL}) {
+        Device d; consoleFixture(d);
+        testState.console.v_baseAddr=(d.vram.physical+(2ULL<<20))|tag;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")=="inside-bar0-observed");
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleVramOffset")==2ULL<<20);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==testState.console.v_baseAddr);
+    }
+    {
+        // Regression for a physical-tagged boot display at the start of a
+        // small BAR0; evaluates the observed geometry without touching a GPU.
+        Device d; consoleFixture(d); d.indexed();
+        d.vram.physical=0x830000000ULL; d.pci.bars[0]=0x3000000c; d.pci.bars[1]=8;
+        auto &v=testState.console;
+        v.v_baseAddr=0x830000001ULL; v.v_rowBytes=13824; v.v_width=3440;
+        v.v_height=1440; v.v_depth=32; v.v_scale=2;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==0x830000001ULL);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleVramOffset")==0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleSpanBytes")==19906560);
+        CHECK(testState.stateReads==8); CHECK(testState.consoleCalls==2);
+        CHECK(testState.selectorWrites==5124); CHECK(testState.mapRequests==4);
+    }
     {
         Device d; consoleFixture(d); d.run("discovery-snapshot-validated");
         CHECK(testState.platformCalls==1); CHECK(testState.consoleCalls==2);
         CHECK(testState.stateReads==8); CHECK(testState.mapRequests==4);
         CHECK(testState.selectorWrites==0); CHECK(testState.openCalls==0);
         CHECK(d.service.numbers.at("CobaltSurvey,Schema")==4);
-        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==d.vram.physical+(2ULL<<20));
+        CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")==((d.vram.physical+(2ULL<<20))|1ULL));
         CHECK(d.service.numbers.at("CobaltSurvey,ConsoleBaseRaw")>UINT32_MAX);
         CHECK(d.service.numbers.at("CobaltSurvey,ConsoleRowBytes")==4096);
         CHECK(d.service.numbers.at("CobaltSurvey,ConsoleWidth")==1024);
@@ -889,7 +922,7 @@ static void passiveConsoleTests() {
         "span-overflow", "span-overflow", "length-too-small", "outside-bar0", "outside-bar0", "outside-bar0"};
     for(unsigned kind=0;kind<16;++kind) {
         Device d; consoleFixture(d); auto &v=testState.console;
-        if(kind==0) v.v_baseAddr|=1;
+        if(kind==0) v.v_baseAddr|=4;
         if(kind==1) v.v_baseAddr=0;
         if(kind==2) v.v_offset=4096;
         if(kind==3) v.v_rotate=1;
@@ -900,10 +933,10 @@ static void passiveConsoleTests() {
         if(kind==8) v.v_width=UINT64_MAX;
         if(kind==9) v.v_rowBytes=UINT64_MAX;
         if(kind==10) { v.v_rowBytes=1ULL<<40; v.v_width=1; v.v_height=1ULL<<40; }
-        if(kind==11) v.v_baseAddr=UINT64_MAX&~0xfffULL;
+        if(kind==11) v.v_baseAddr=(UINT64_MAX&~0xfffULL)|1ULL;
         if(kind==12) v.v_length=1;
-        if(kind==13) v.v_baseAddr=d.vram.physical-4096;
-        if(kind==14) v.v_baseAddr=d.vram.physical+d.vram.length;
+        if(kind==13) v.v_baseAddr=(d.vram.physical-4096)|1ULL;
+        if(kind==14) v.v_baseAddr=(d.vram.physical+d.vram.length)|1ULL;
         if(kind==15) v.v_length=d.vram.length;
         d.run("discovery-snapshot-validated");
         CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")==rangeFailures[kind]);
@@ -924,7 +957,7 @@ static void passiveConsoleTests() {
     }
     for(unsigned extra=0;extra<2;++extra) {
         Device d; consoleFixture(d); auto &v=testState.console;
-        v.v_baseAddr=d.vram.physical+d.vram.length-4096*768;
+        v.v_baseAddr=(d.vram.physical+d.vram.length-4096*768)|1ULL;
         v.v_length=4096*768+extra;
         d.run("discovery-snapshot-validated");
         if(extra) CHECK(d.service.strings.at("CobaltSurvey,ConsoleRangeStatus")=="outside-bar0");

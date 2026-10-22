@@ -44,6 +44,8 @@ static constexpr uint32_t kFbShift = 24;                    // 16 MiB units
 
 // ---- container parse ----------------------------------------------------------
 bool PspLoader::parseContainer(const uint8_t *fw, size_t fwSize) {
+	preflightOK = false;
+	parsedData = nullptr; parsedSize = 0;
 	kdb = spl = sys = sos = soc = intf = dbg = ras = ipkey = toc = rl = spdm = SubBin{};
 	cobalt::psp::Package package{};
 	if (!cobalt::psp::parse(fw, fwSize, package)) {
@@ -65,15 +67,48 @@ bool PspLoader::parseContainer(const uint8_t *fw, size_t fwSize) {
 	PSPLOG("parse: KDB %u SPL %u SYS %u SOC %u INTF %u DBG %u RAS %u IPKEY %u SOS %u bytes (SOS ver 0x%08x)",
 	       kdb.size, spl.size, sys.size, soc.size, intf.size, dbg.size, ras.size, ipkey.size,
 	       sos.size, sos.version);
+	parsedData = fw; parsedSize = fwSize;
 	return true;
 }
 
 bool PspLoader::setFwPriOffset(uint64_t vramOffset) {
-	if (vramOffset & (kFwPriSize - 1)) {
-		PSPLOG("fw_pri offset 0x%llx is not 1 MiB aligned (C2PMSG_36 carries addr>>20)", vramOffset);
+	preflightOK = false;
+	fwPriConfigured = false;
+	fwPriOff = 0;
+	if ((vramOffset & (kFwPriSize - 1)) || vramOffset > UINT64_MAX - kFwPriSize) {
+		PSPLOG("fw_pri offset 0x%llx is unaligned or its 1 MiB extent overflows", vramOffset);
 		return false;
 	}
 	fwPriOff = vramOffset;
+	fwPriConfigured = true;
+	return true;
+}
+
+// Validate the public inspection slots against the parser-owned views again.
+// They do not become arbitrary caller-supplied pointers after parsing.
+bool PspLoader::chainValid() const {
+	cobalt::psp::Package package{};
+	if (!parsedData || !cobalt::psp::parse(parsedData, parsedSize, package)) return false;
+	const SubBin *slots[] = {&kdb, &spl, &sys, &soc, &intf, &dbg, &ras, &ipkey, &sos};
+	const cobalt::psp::Part parts[] = {cobalt::psp::Kdb, cobalt::psp::Spl, cobalt::psp::SysDrv,
+		cobalt::psp::SocDrv, cobalt::psp::IntfDrv, cobalt::psp::DbgDrv, cobalt::psp::RasDrv,
+		cobalt::psp::IpKeyMgrDrv, cobalt::psp::Sos};
+	for (unsigned i = 0; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+		const auto &expected = package.part[parts[i]];
+		const SubBin &actual = *slots[i];
+		if (actual.data != expected.data || actual.size != expected.size ||
+			actual.version != expected.version || actual.size > kFwPriSize) return false;
+	}
+	return sos.present() && sys.present();
+}
+
+bool PspLoader::windowValid() const {
+	if (!fwPriConfigured || (fwPriOff & (kFwPriSize - 1)) ||
+		vramMcBase == 0 || vramMcTop <= vramMcBase ||
+		fwPriOff > UINT64_MAX - vramMcBase) return false;
+	const uint64_t mc = vramMcBase + fwPriOff;
+	if (mc >= vramMcTop || kFwPriSize > vramMcTop - mc ||
+		mc > UINT64_MAX - kFwPriSize || (mc >> 20) > UINT32_MAX) return false;
 	return true;
 }
 
@@ -101,6 +136,11 @@ bool PspLoader::waitBootloader(uint32_t budgetMs, uint32_t *lastValue) {
 
 bool PspLoader::preflight() {
 	lastStepName = "preflight";
+	preflightOK = false;
+	vramMcBase = vramMcTop = 0;
+	if (!fwPriConfigured || !chainValid()) {
+		PSPLOG("preflight: explicit staging window and valid bounded chain required"); return false;
+	}
 	const uint32_t bl  = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
 	const uint32_t fbBase = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, kMmhubFbLocationBase);
@@ -131,17 +171,16 @@ bool PspLoader::preflight() {
 		       "(BAR0 offset == MC offset is hardware-proven on this card by RDNA4FB)",
 		       fbOff & kFbMask, fbBase & kFbMask);
 
-	const uint64_t mc = vramMcBase + fwPriOff;
-	if (mc + kFwPriSize > vramMcTop) {
-		PSPLOG("preflight: fw_pri MC 0x%llx outside VRAM [0x%llx, 0x%llx); refusing", mc, vramMcBase, vramMcTop);
-		return false;
+	if (!windowValid()) {
+		PSPLOG("preflight: staging window outside MC range or not representable; refusing"); return false;
 	}
+	const uint64_t mc = vramMcBase + fwPriOff;
 	PSPLOG("preflight: VRAM MC [0x%llx, 0x%llx) = %llu MiB; fw_pri at vram+0x%llx = MC 0x%llx (C2PMSG_36 will be 0x%08x)",
 	       vramMcBase, vramMcTop, (vramMcTop - vramMcBase) >> 20, fwPriOff, mc, (uint32_t)(mc >> 20));
 
-	if (sol != 0)        { PSPLOG("preflight: SOS already alive — nothing to load"); return true; }
+	if (sol != 0)        { PSPLOG("preflight: SOS already alive — nothing to load"); preflightOK = true; return true; }
 	if (!(bl & n48::kPspBootReadyBit)) { PSPLOG("preflight: bootloader not ready; refusing"); return false; }
-	if (!sos.present())  { PSPLOG("preflight: container not parsed; refusing"); return false; }
+	preflightOK = true;
 	return true;
 }
 
@@ -149,7 +188,9 @@ bool PspLoader::loadComponent(const char *name, const SubBin &bin, uint32_t blCm
 	lastStepName = name;
 	if (!bin.present()) { PSPLOG("%s: not in container, skipping", name); return true; }
 	if (bin.size > kFwPriSize) { PSPLOG("%s: %u bytes exceeds fw_pri", name, bin.size); return false; }
-	if (sosAlive()) { PSPLOG("%s: SOS already alive, bootloader window closed — skip", name); return true; }
+	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("%s: SOS register unreadable", name); return false; }
+	if (sol != 0) { PSPLOG("%s: SOS already alive, skip", name); return true; }
 
 	uint32_t st;
 	if (!waitBootloader(10000, &st)) { PSPLOG("%s: bootloader not ready (0x%08x)", name, st); return false; }
@@ -173,7 +214,9 @@ bool PspLoader::loadComponent(const char *name, const SubBin &bin, uint32_t blCm
 
 bool PspLoader::loadSOS() {
 	lastStepName = "SOS";
-	if (sosAlive()) { PSPLOG("SOS: already alive"); return true; }
+	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("SOS: register unreadable"); return false; }
+	if (sol != 0) { PSPLOG("SOS: already alive"); return true; }
 	if (sos.size > kFwPriSize) { PSPLOG("SOS: %u bytes exceeds fw_pri", sos.size); return false; }
 	uint32_t st;
 	if (!waitBootloader(10000, &st)) { PSPLOG("SOS: bootloader not ready (0x%08x)", st); return false; }
@@ -182,6 +225,7 @@ bool PspLoader::loadSOS() {
 	if (!hw.vramWrite(fwPriOff, sos.data, sos.size)) return false;
 
 	const uint32_t solBefore = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+	if (solBefore == UINT32_MAX) { lastStatus = solBefore; PSPLOG("SOS: register unreadable after staging"); return false; }
 	const uint64_t mc = vramMcBase + fwPriOff;
 	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20)) ||
 	    !hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, BlCmd::LoadSOSDrv)) {
@@ -193,6 +237,7 @@ bool PspLoader::loadSOS() {
 	// nonzero. Normally well under a second; allow 5 s.
 	for (uint32_t ms = 0; ms < 5000; ms++) {
 		uint32_t v = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+		if (v == UINT32_MAX) { lastStatus = v; PSPLOG("SOS: sign-of-life read failed"); return false; }
 		if (v != solBefore && v != 0 && v != 0xFFFFFFFF) {
 			PSPLOG("SOS ALIVE — C2PMSG_81 0x%08x -> 0x%08x after ~%u ms", solBefore, v, ms + 20);
 			lastStatus = v;
@@ -206,7 +251,15 @@ bool PspLoader::loadSOS() {
 }
 
 bool PspLoader::runChain() {
-	if (sosAlive()) { PSPLOG("chain: SOS already alive, skipping"); return true; }
+	const bool authorized = preflightOK;
+	preflightOK = false; // Success and failure both consume the one-shot authorization.
+	if (!authorized || !chainValid() || !windowValid()) {
+		lastStepName = "preflight-required";
+		PSPLOG("chain: fresh successful preflight and unchanged bounded chain required"); return false;
+	}
+	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+	if (sol == UINT32_MAX) { lastStepName = "sos-unreadable"; lastStatus = sol; return false; }
+	if (sol != 0) { PSPLOG("chain: SOS already alive, skipping"); return true; }
 	struct Step { const char *name; const SubBin *bin; uint32_t cmd; } steps[] = {
 		// Order from Linux psp_hw_start; identical to mac-amdgpu's proven
 		// psp_load_sos_package (no SPDM_DRV: psp_14_0_3 ships none).

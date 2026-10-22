@@ -391,8 +391,14 @@ void consoleScalars(const PE_Video &video, uint64_t (&values)[kConsoleScalarCoun
 
 const char *consoleRange(ConsoleObservation &result, const Aperture &vram) {
     const uint64_t *v = result.values;
-    // Do not guess which low bits, if any, are flags. Retain the raw base.
-    if (!v[0] || (v[0] & 0xfff)) return "base-unaligned-or-zero";
+    // XNU xnu-12377.1.9 osfmk/console/video_console.c:2678-2686:
+    // with VM running, bit0 marks a physical address; otherwise it is virtual.
+    // XNU obtains the physical address by clearing the low TWO bits. Keep the
+    // original scalar intact and refuse any remaining non-page-aligned bits.
+    if (!v[0]) return "base-unaligned-or-zero";
+    if (!(v[0] & 1ULL)) return "base-not-tagged-physical";
+    const uint64_t physical = v[0] & ~3ULL;
+    if (!physical || (physical & 0xfff)) return "base-unaligned-or-zero";
     if (v[6] != 0) return "offset-unsupported";
     if (v[8] != 0) return "rotation-unsupported";
     // x86 pexpert/i386/boot.h: GRAPHICS_MODE=1, FB_TEXT_MODE=2.
@@ -404,9 +410,9 @@ const char *consoleRange(ConsoleObservation &result, const Aperture &vram) {
     const uint64_t visible = v[1] * v[3];
     const uint64_t span = v[7] ? v[7] : visible;
     if (span < visible) return "length-too-small";
-    if (span > UINT64_MAX - v[0]) return "span-overflow";
-    if (v[0] < vram.physical) return "outside-bar0";
-    const uint64_t offset = v[0] - vram.physical;
+    if (span > UINT64_MAX - physical) return "span-overflow";
+    if (physical < vram.physical) return "outside-bar0";
+    const uint64_t offset = physical - vram.physical;
     if (offset >= vram.length || span > vram.length - offset) return "outside-bar0";
     result.offset = offset; result.span = span;
     return "inside-bar0-observed";

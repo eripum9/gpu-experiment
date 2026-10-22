@@ -18,9 +18,9 @@
 //  MC addressing (hardware-proven on this card by RDNA4FB's cursor readback):
 //  BAR0 byte offset x is VRAM offset x is MC address FB_LOCATION_BASE<<24 + x.
 //
-//  Safety: the bootloader validates every image's signature; a bad address or
-//  image yields an error status / timeout, not damage. This is the sequence
-//  every Linux boot performs. Still: gated, preflighted, tested on hardware.
+//  Image authentication belongs to the PSP. This module validates its source
+//  views and address arithmetic; the caller must establish VRAM ownership,
+//  BAR/MC translation, device lifetime, and write visibility independently.
 //
 #ifndef Navi48_psp_hpp
 #define Navi48_psp_hpp
@@ -56,22 +56,31 @@ public:
 	static constexpr uint32_t kFwPriSize = 1024u * 1024u;   // PSP_1_MEG
 
 	explicit PspLoader(HwAccess &hw) : hw(hw) {}
+	PspLoader(const PspLoader &) = delete;
+	PspLoader &operator=(const PspLoader &) = delete;
+	PspLoader(PspLoader &&) = delete;
+	PspLoader &operator=(PspLoader &&) = delete;
 
 	// Parse the sos.bin container (header v2.0/v2.1). Returns false on a
-	// malformed container. Keeps pointers into `fw`; caller owns it.
+	// malformed container. Keeps pointers into `fw`; caller owns it and must keep
+	// it alive through runChain. Every parse attempt invalidates prior preflight.
 	bool parseContainer(const uint8_t *fw, size_t fwSize);
 
 	// Where in VRAM (byte offset, 1 MiB aligned) the 1 MiB fw_pri staging
-	// window lives. The kext picks a spot clear of the boot framebuffer.
+	// window lives. The kext picks a spot clear of the boot framebuffer and other
+	// reserved memory. Every call invalidates preflight; failure unconfigures it.
 	bool setFwPriOffset(uint64_t vramOffset);
 	uint64_t fwPriOffset() const { return fwPriOff; }
 
 	// Read-only preflight: MP0 bootloader ready? SOS already alive? MMHUB FB
-	// location posted and fw_pri inside it? Returns true if a load may proceed.
+	// location posted and fw_pri inside it? Source views and all selected sizes
+	// must also be valid. Success authorizes one runChain attempt; this is not
+	// proof that the staging window is free or correctly mapped by the caller.
 	bool preflight();
 
 	// Run the full pre-SOS chain then load SOS. Returns true when SOS reports
-	// alive (C2PMSG_81 nonzero). Only call after preflight() returned true.
+	// alive (C2PMSG_81 nonzero). Refuses without a successful preflight, consumes
+	// that authorization once, and revalidates all selected views before writes.
 	bool runChain();
 
 	// State / report
@@ -86,6 +95,8 @@ public:
 	SubBin kdb, spl, sys, sos, soc, intf, dbg, ras, ipkey, toc, rl, spdm;
 
 private:
+	bool chainValid() const;
+	bool windowValid() const;
 	bool waitBootloader(uint32_t budgetMs, uint32_t *lastValue);
 	bool loadComponent(const char *name, const SubBin &bin, uint32_t blCmd);
 	bool loadSOS();
@@ -94,6 +105,10 @@ private:
 	uint64_t vramMcBase { 0 };      // MC address of VRAM offset 0
 	uint64_t vramMcTop  { 0 };      // MC address one past the last VRAM byte
 	uint64_t fwPriOff   { 0 };      // VRAM byte offset of fw_pri
+	bool fwPriConfigured { false };
+	bool preflightOK { false };
+	const uint8_t *parsedData { nullptr };
+	size_t parsedSize { 0 };
 	uint32_t lastStatus { 0 };
 	const char *lastStepName { "none" };
 };

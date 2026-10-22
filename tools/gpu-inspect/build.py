@@ -70,6 +70,25 @@ def test_smu_transport(cxx):
     run([output, ROOT])
 
 
+def test_psp_protocol(cxx, firmware):
+    # Execute the production pre-SOS loader with only a simulated HwAccess bus.
+    output = BUILD / ("psp-protocol-test.exe" if os.name == "nt" else "psp-protocol-test")
+    sources = [TESTS / "psp_protocol_test.cpp", SRC / "psp.cpp"]
+    if Path(cxx).stem.lower() in ("cl", "clang-cl"):
+        objects = []
+        for source in sources:
+            obj = BUILD / f"psp-protocol_{source.stem}.obj"
+            run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX",
+                 f"/I{TESTS / 'pspshim'}", f"/I{SRC}", "/c", source, f"/Fo{obj}"])
+            objects.append(obj)
+        run([cxx, "/nologo", *objects, f"/Fe{output}"])
+    else:
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-O1",
+             "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+             "-I", TESTS / "pspshim", "-I", SRC, *sources, "-o", output])
+    run([output, *firmware])
+
+
 def test_psp_containers(cxx):
     parser_test = compile_host(cxx, "psp-container-test", [TESTS / "psp_container_test.cpp"])
     # Firmware is optional in host-only checkouts. CI repeats these executables
@@ -101,6 +120,7 @@ def test_psp_containers(cxx):
              "-DPSP_ADAPTER_TEST", "-I", TESTS / "pspshim", "-I", SRC,
              *sources, "-o", output])
     run([output, *firmware])
+    test_psp_protocol(cxx, firmware)
 
 
 def main():

@@ -139,14 +139,20 @@ console metadata uses schema 4; a state result without console metadata
 retains schema 3. The collector captures either result without additional
 privileges or commands.
 
-A derived BAR0-relative interval is reported only for a page-aligned raw
-address, zero console offset and rotation, graphics display mode, consistent
+A derived BAR0-relative interval is reported only for a physical-tagged
+address whose decoded base is page-aligned, zero console offset and rotation,
+graphics display mode, consistent
 nonzero geometry, checked arithmetic, and a complete interval inside the same
 validated BAR0 descriptor. A zero
 explicit length uses row bytes times height; a nonzero explicit length must
 cover that span and is included in the containment check. Other stable console
-descriptions retain their raw fields with a refusal reason. In particular,
-address low bits are not silently masked and nonzero offsets are not guessed.
+descriptions retain their raw fields with a refusal reason. With VM running,
+[XNU's console implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/osfmk/console/video_console.c#L2678-L2686)
+uses bit 0 to distinguish a physical address from a virtual address and clears
+the low two bits to obtain that physical address. The survey follows that
+decoding while preserving the original raw scalar. Untagged addresses and
+remaining alignment bits are refused; it does not clear an arbitrary page's
+worth of low bits. Nonzero console offsets are still not guessed.
 
 This describes a console interval, not a reserved firmware buffer. It does
 not select a scratch address, prove all firmware/display reservations, establish
