@@ -33,7 +33,9 @@ class SurveyPackageTests(unittest.TestCase):
                 "IOPCIPrimaryMatch": "0x75901002", "IOMatchCategory": "CobaltNavi44Survey"}},
         }
         for relative in ("tools/navi44-survey/collect-survey.sh", "docs/NAVI44-SURVEY.md",
-                         "src/navi48-bringup/LICENSE", "src/navi48-bringup/NOTICE"):
+                         "src/navi48-bringup/LICENSE", "src/navi48-bringup/NOTICE",
+                         "src/navi48-bringup/firmware/LICENSE.amdgpu",
+                         "third-party/THIRD-PARTY-LICENSES.txt"):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"fixture\n")
@@ -46,15 +48,25 @@ class SurveyPackageTests(unittest.TestCase):
         (self.kext / "Contents/Info.plist").write_bytes(plistlib.dumps(self.info))
         return PACKAGE.payload()
 
-    def test_payload_contains_manifest_and_no_firmware(self):
+    def test_payload_contains_manifest_and_firmware_license(self):
         files = self.payload()
         self.assertIn("collect-gpu-survey.sh", files)
         self.assertIn("SHA256SUMS.txt", files)
+        self.assertEqual(len(files), 11)
+        self.assertEqual(files["licenses/LICENSE.amdgpu"], b"fixture\n")
+        self.assertIn("licenses/THIRD-PARTY-LICENSES.txt", files)
+        self.assertIn(b"Contains embedded AMD firmware", files["BUILD-INFO.txt"])
+        self.assertNotIn(b"Contains no GPU firmware", files["BUILD-INFO.txt"])
         self.assertNotIn("Navi48Bringup", " ".join(files))
         manifest = files["SHA256SUMS.txt"].decode()
         for name, data in files.items():
             if name != "SHA256SUMS.txt":
                 self.assertIn(f"{PACKAGE.hashlib.sha256(data).hexdigest()}  {name}\n", manifest)
+
+    def test_missing_firmware_license_refuses_packaging(self):
+        (self.root / "src/navi48-bringup/firmware/LICENSE.amdgpu").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.payload()
 
     def test_wrong_bundle_architecture_and_personality_are_rejected(self):
         self.info["CFBundleIdentifier"] = "com.navi48.bringup"

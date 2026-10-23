@@ -4,8 +4,9 @@
 Windows: run in a VS developer shell and pass --cxx cl.
 macOS/Linux: defaults to CXX or clang++/g++/c++.
 The fake API instruments provider ownership, fixed-purpose selector and HDP
-flush accesses, and bounded synthetic staging-window transfers. It deliberately
-has no PCI/config writes, MM_DATA writes, DMA, IRQ, or GPU activation APIs.
+flush accesses, bounded synthetic staging-window transfers, and the two
+allowlisted PSP C2P mailbox writes. It has no general PCI/config-write,
+MM_DATA-write, DMA, IRQ, or GPU activation APIs.
 """
 import argparse
 import os
@@ -28,18 +29,24 @@ def run(parts):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cxx", default=os.environ.get("CXX"))
+    parser.add_argument("--kdb-only", action="store_true", help="run only focused KDB service-host checks")
     args = parser.parse_args()
     cxx = args.cxx or next((name for name in ("clang++", "g++", "c++", "cl") if shutil.which(name)), None)
     if not cxx:
         parser.error("No host C++17 compiler found; use --cxx in a compiler developer shell.")
     BUILD.mkdir(parents=True, exist_ok=True)
-    sources = [SERVICE / "hosttest/service_test.cpp", SERVICE / "src/CobaltNavi44Survey.cpp", SHARED / "ipdiscovery.cpp"]
+    sources = [
+        ("survey_host_service", SERVICE / "hosttest/service_test.cpp"),
+        ("survey_host_adapter", SERVICE / "src/CobaltNavi44Survey.cpp"),
+        ("survey_host_ipdiscovery", SHARED / "ipdiscovery.cpp"),
+        ("survey_host_psp", SHARED / "psp.cpp"),
+    ]
     includes = [SERVICE / "hosttest/shim", SERVICE / "src", SHARED]
     executable = BUILD / ("survey-service-test.exe" if os.name == "nt" else "survey-service-test")
     if Path(cxx).stem.lower() in ("cl", "clang-cl"):
         objects = []
-        for source in sources:
-            obj = BUILD / (source.stem + ".obj")
+        for object_name, source in sources:
+            obj = BUILD / (object_name + ".obj")
             run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/Zc:__cplusplus",
                  "/DCOBALT_SURVEY_HOSTTEST=1", *[f"/I{path}" for path in includes], "/c", source, f"/Fo{obj}"])
             objects.append(obj)
@@ -47,8 +54,10 @@ def main():
     else:
         run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1", "-DCOBALT_SURVEY_HOSTTEST=1",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
-             *[part for path in includes for part in ("-I", path)], *sources, "-o", executable])
-    run([executable])
+             *[part for path in includes for part in ("-I", path)], *[source for _, source in sources], "-o", executable])
+    run([executable, "--kdb-only"] if args.kdb_only else [executable])
+    if args.kdb_only:
+        return
 
     # Keep the pure aperture planner check independent from the service test:
     # it needs no IOKit shims and is safe to run on ordinary host toolchains.

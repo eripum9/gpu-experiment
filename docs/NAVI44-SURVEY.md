@@ -2,11 +2,59 @@
 
 `CobaltNavi44Survey.kext` is a separate diagnostic for `1002:7590`.
 It does not enable Navi 44 in `Navi48Bringup`, run that driver's startup
-ladder, upload firmware, or provide graphics acceleration. A successful boot
+ladder or provide graphics acceleration. A successful boot
 with this survey will still have the current basic display performance.
 Its default mode is read-only. Separately gated experiments permit bounded
 address-selector writes, a 16-byte VRAM transport test, and a full 1 MiB
-synthetic staging test, described below.
+synthetic staging test, described below. Version 0.7.0 additionally includes
+a separately armed one-command KDB firmware diagnostic. Embedding firmware
+does not activate that mode.
+
+## One-command KDB checkpoint (0.7.0)
+
+`cobalt-survey-kdb=1` requires all five existing flags to equal numeric 1:
+`cobalt-survey`, `cobalt-survey-indexed`, `cobalt-survey-state`,
+`cobalt-survey-aperture`, and `cobalt-survey-staging`. It selects the KDB
+checkpoint instead of either synthetic VRAM experiment. The diagnostic
+calls the shared `PspLoader::runKeyDatabase()` API with the immutable pinned
+PSP 14.0.2 container. Only its 6,816-byte KDB component is submitted; the
+remaining firmware chain and SOS startup are excluded.
+
+The existing aperture policy selects a 1 MiB window at least 64 MiB into VRAM,
+outside the observed console and conservative protected intervals. CPU and
+indexed readback tests establish transport consistency. They do not reserve
+that window exclusively or prove that the PSP sees the same GPU address.
+This is an experimental firmware transaction, with possible hangs or resets.
+
+Before mutation, two matching six-register observations must show the
+expected posted memory window, matching low 24-bit MMHUB/DCN framebuffer
+bases, an idle boot mailbox and SOS down. FB offset is recorded and pinned
+separately. Stable PCI, BAR, ownership, remap and framebuffer observations
+are guarded independently of the intentionally changing boot mailbox.
+Unusable context is latched; it cannot recover permission to write.
+The provider records a persistent attempt before new selector writes.
+
+The staging helper clears the full window, copies exactly the KDB component,
+flushes through the validated HDP endpoint, and verifies the full CPU window
+plus indexed page-edge samples before the two allowed mailbox stores.
+Only the calculated address and KDB command `0x00080000` are allowed, once
+each. Attempt state is committed before each store.
+
+Before a command store is attempted, original VRAM may be restored only
+through a still-valid context. After any command attempt, staging is preserved
+even on timeout or a failed post-store check. There is no command retry,
+mailbox rollback, automatic reset, later firmware component, or SOS startup.
+Any mailbox attempt or unverified cleanup reports a required cold reset. Selector restoration is
+separately bounded and may be skipped after context loss or an SOS change.
+Do not repeat a firmware test without a full cold reset.
+
+KDB properties contain scalar observations and counts, never firmware or
+saved VRAM bytes. Schema 7 means the command returned the ready bit while
+SOS was observed down. It does not prove firmware authentication, GPU DMA,
+execution, display support, or Metal acceleration. `Ready` remains false.
+The embedded package is distributed under the included AMD firmware license.
+If discovery, passive state, or console publication fails first, the existing
+failure status is retained and no KDB transaction or KDB result is produced.
 
 ## What the test measures
 
@@ -168,7 +216,7 @@ and [x86 console implementation](https://github.com/apple-oss-distributions/xnu/
 It requires all three existing survey, indexed and state flags set to numeric
 `1`, validated discovery and state, and a stable, interpretable physical
 console interval. Omitting the new flag preserves the previous modes.
-The candidate still contains no GPU firmware and keeps `Ready=false`.
+This mode submits no GPU firmware and keeps `Ready=false`.
 
 This first checkpoint is restricted to PCI `1002:7590`, revision `c0`,
 subsystem `1eae:8601`, with a 256 MiB BAR0 and a 512 KiB BAR5. It requires
@@ -337,18 +385,22 @@ for review before progressing to initialization or acceleration tests.
 To remove the survey, restore the saved EFI or remove its Kernel/Add entry,
 bundle, and `cobalt-survey=1` argument. No internal ESP changes are required.
 Remove `cobalt-survey-indexed=1`, `cobalt-survey-state=1` and
-`cobalt-survey-aperture=1` as well when disabling those experiments.
+`cobalt-survey-aperture=1`, `cobalt-survey-staging=1`, and
+`cobalt-survey-kdb=1` as well when disabling those experiments.
 
 ## Build
 
-With the same pinned MacKernelSDK as the main compile check:
+With the same pinned MacKernelSDK and firmware as the main compile check:
 
 ```
 python3 tools/navi44-survey/build.py
 python3 -m unittest discover -s tools/navi44-survey -p 'test_*.py' -v
+python3 tools/ci/fetch_deps.py
 make -C src/navi44-survey MKSDK="$PWD/build/ci-deps/MacKernelSDK" all
 python3 tools/ci/package_survey_artifact.py --output build/CobaltNavi44Survey-hardware-test.tar.gz
 ```
 
-This standalone target embeds no firmware. CI compiles and signs the bundle;
-it cannot test the desktop's GPU hardware.
+This standalone target embeds the pinned PSP 14.0.2 SOS container. Its generator
+verifies the exact package size and SHA-256 before writing generated C++ into
+the ignored build directory. The artifact includes `licenses/LICENSE.amdgpu`.
+CI compiles and signs the bundle; it cannot test the desktop's GPU hardware.

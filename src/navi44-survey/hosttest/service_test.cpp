@@ -1,6 +1,7 @@
 #include "CobaltNavi44Survey.hpp"
 #include <FakeIOKit.hpp>
 #include "ipdiscovery.hpp"
+#include "psp_firmware.hpp"
 #include <iostream>
 
 static unsigned checks = 0;
@@ -9,6 +10,38 @@ static unsigned checks = 0;
 using Bytes = std::vector<uint8_t>;
 static void put16(Bytes &b, size_t p, uint16_t v) { b[p] = uint8_t(v); b[p+1] = uint8_t(v >> 8); }
 static void put32(Bytes &b, size_t p, uint32_t v) { for (unsigned i=0; i<4; ++i) b[p+i] = uint8_t(v >> (8*i)); }
+static cobalt::survey::FirmwareView firmwareOverride {};
+static const Bytes &syntheticPspFirmware() {
+    static const Bytes firmware = [] {
+        const uint32_t payloadOffset = 256;
+        const uint32_t kdbBytes = 6816;
+        const uint32_t types[] = {3,5,2,7,8,9,10,11,1,4,6};
+        const uint32_t payloadBytes = kdbBytes + 10 * 16;
+        Bytes result(payloadOffset + payloadBytes);
+        put32(result, 0, static_cast<uint32_t>(result.size()));
+        put32(result, 4, 36); put32(result, 8, 2);
+        put32(result, 20, payloadBytes); put32(result, 24, payloadOffset);
+        put32(result, 32, static_cast<uint32_t>(sizeof(types) / sizeof(types[0])));
+        uint32_t cursor = 0;
+        for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+            const uint32_t length = i == 0 ? kdbBytes : 16;
+            const size_t descriptor = 36 + i * 16;
+            put32(result, descriptor, types[i]);
+            put32(result, descriptor + 4, types[i] == 3 ? 0x703b0001u : 0x140200 + types[i]);
+            put32(result, descriptor + 8, cursor); put32(result, descriptor + 12, length);
+            for (uint32_t n = 0; n < length; ++n)
+                result[payloadOffset + cursor + n] = static_cast<uint8_t>((n * 29u + types[i] * 17u) & 0xffu);
+            cursor += length;
+        }
+        return result;
+    }();
+    return firmware;
+}
+cobalt::survey::FirmwareView cobalt::survey::psp1402Firmware() {
+    if (firmwareOverride.data || firmwareOverride.size) return firmwareOverride;
+    const auto &firmware = syntheticPspFirmware();
+    return {firmware.data(), firmware.size()};
+}
 static uint16_t sum(const Bytes &b, size_t begin, size_t end) {
     uint16_t n=0; for (size_t i=begin; i<end; ++i) n=uint16_t(n+b[i]); return n;
 }
@@ -1034,6 +1067,25 @@ static Bytes apertureFixture(uint32_t nbifSegmentBase=0xd20) {
     put16(b,prefix+8,sum(b,prefix+10,shiftedGc+gcSize)); b.resize(10240);
     return b;
 }
+static Bytes kdbDiscoveryFixture() {
+    Bytes b = apertureFixture();
+    const size_t dmu = die + 4 + 4 * 12;
+    // The existing synthetic DMU entry has one base. KDB proof requires the
+    // real segment-2 register base, so insert two additional base dwords.
+    b[dmu + 3] = 3;
+    b.insert(b.begin() + static_cast<std::ptrdiff_t>(dmu + 12), 8, 0);
+    put32(b, dmu + 12, 0x1600); put32(b, dmu + 16, 0x1700);
+    const size_t shiftedGc = gc + 52;
+    put16(b, prefix + 10, uint16_t(shiftedGc + gcSize - prefix));
+    put16(b, prefix + 16, uint16_t(ipdsSize + 52));
+    put16(b, prefix + 20, uint16_t(shiftedGc - prefix));
+    put16(b, ipds + 6, uint16_t(ipdsSize + 52));
+    put16(b, prefix + 14, sum(b, ipds, ipds + ipdsSize + 52));
+    put16(b, prefix + 22, sum(b, shiftedGc, shiftedGc + gcSize));
+    put16(b, prefix + 8, sum(b, prefix + 10, shiftedGc + gcSize));
+    b.resize(10240);
+    return b;
+}
 static void apertureDevice(Device &d, bool nativeRoute=false, uint32_t nbifSegmentBase=0xd20) {
     consoleFixture(d); d.load(apertureFixture(nbifSegmentBase)); d.indexed();
     d.mmio.length=d.mmio.contiguous=0x80000; d.pci.subsystem=0x86011eae;
@@ -1050,6 +1102,237 @@ static void apertureDevice(Device &d, bool nativeRoute=false, uint32_t nbifSegme
         if(offset==0xa954) return 0x83fbu;
         throw std::runtime_error("unexpected aperture state offset");
     };
+}
+static void kdbDevice(Device &d, bool nativeRoute=false) {
+    apertureDevice(d, nativeRoute);
+    d.load(kdbDiscoveryFixture());
+    testState.kdbBootPresent = true;
+    testState.kdbBoot = "1";
+    testState.stagingBootPresent = true;
+    testState.stagingBoot = "1";
+    testState.kdbAddressByteOffset = 0x4590;
+    testState.kdbCommandByteOffset = 0x458c;
+    testState.kdbStateOffsets = {0x458c, 0x4644, 0xa950, 0xa954, 0xa71c, 0x6dd4};
+    testState.stateRead = [](uint32_t offset, uint32_t) {
+        if (offset == 0x458c) return 0x80000000u;
+        if (offset == 0x4644) return 0u;
+        if (offset == 0xa950 || offset == 0x6dd4) return 0x8000u;
+        if (offset == 0xa954) return 0x83fbu;
+        if (offset == 0xa71c) return 0x1234u;
+        throw std::runtime_error("unexpected KDB state offset");
+    };
+}
+static void noKdbWrites() {
+    CHECK(testState.kdbWrites == 0);
+    CHECK(testState.apertureCpuWrites == 0);
+    CHECK(testState.apertureFlushWrites == 0);
+}
+static void kdbTests() {
+    for (bool nativeRoute : {false, true}) {
+        Device d; kdbDevice(d, nativeRoute);
+        bool rejectedWrongEndpoint = false;
+        testState.onKdb = [&rejectedWrongEndpoint](const TestState::KdbEvent &event) {
+            try {
+                cobaltSurveyTestKdbWrite32(testState.apertureCpu.data(), event.value, event.offset);
+            } catch (const std::runtime_error &) {
+                rejectedWrongEndpoint = true;
+            }
+        };
+        try { d.run("discovery-snapshot-validated"); }
+        catch (const std::exception &e) {
+            throw std::runtime_error(std::string("KDB service run failed: ") + e.what() +
+                " mailbox=" + std::to_string(testState.kdbWrites) +
+                " cpuWrites=" + std::to_string(testState.apertureCpuWrites) +
+                " selectorWrites=" + std::to_string(testState.selectorWrites) +
+                " maps=" + std::to_string(testState.mapsLive) +
+                " open=" + std::to_string(testState.openLive));
+        }
+        if (!d.service.strings.count("CobaltSurvey,KdbStatus")) {
+            std::string detail = "KDB telemetry absent; status=" + d.service.strings["CobaltSurvey,Status"] +
+                " state=" + d.service.strings["CobaltSurvey,StateStatus"] + " kdbEnabled=" +
+                std::to_string(testState.kdbEnabled) + " stateReads=" + std::to_string(testState.stateReads) +
+                " kdbWrites=" + std::to_string(testState.kdbWrites) + " strings:";
+            for (const auto &entry : d.service.strings) detail += " " + entry.first;
+            throw std::runtime_error(detail);
+        }
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "kdb-ready-observed-reset-required");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 7);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbAddressAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbCommandAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbReadyObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbResetRequired") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbStagingPreserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbZeroVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbCopyVerified") == 1);
+        CHECK(testState.kdbEvents.size() == 2);
+        CHECK(testState.kdbEvents[0].offset == testState.kdbAddressByteOffset);
+        CHECK(testState.kdbEvents[0].value == d.service.numbers.at("CobaltSurvey,KdbMcAddress") >> 20);
+        CHECK(testState.kdbEvents[1].offset == testState.kdbCommandByteOffset);
+        CHECK(testState.kdbEvents[1].value == 0x80000);
+        CHECK(rejectedWrongEndpoint);
+        CHECK(testState.apertureCpuWrites == (1u << 18) + (6816u / 4));
+        const auto fw = cobalt::survey::psp1402Firmware();
+        CHECK(fw.data && fw.size > 256 + 6816);
+        uint32_t payloadFirst = 0, payloadLast = 0;
+        std::memcpy(&payloadFirst, fw.data + 256, sizeof(payloadFirst));
+        std::memcpy(&payloadLast, fw.data + 256 + 6812, sizeof(payloadLast));
+        CHECK(testState.apertureGpu[0] == payloadFirst);
+        CHECK(testState.apertureGpu[6816 / 4 - 1] == payloadLast);
+        CHECK(testState.apertureGpu[6816 / 4] == 0);
+        CHECK(d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+        CHECK(testState.closeCalls == testState.openCalls);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbCommandWritesIssued") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbAddressWritesIssued") == 1);
+        const auto writes = testState.apertureCpuWrites;
+        d.service.stop(&d.pci);
+        CobaltNavi44Survey replay; d.pci.clients = {&replay};
+        CHECK(replay.start(&d.pci));
+        CHECK(replay.strings.at("CobaltSurvey,Status") == "indexed-already-attempted");
+        CHECK(testState.kdbWrites == 2 && testState.apertureCpuWrites == writes);
+    }
+    {
+        Device d; kdbDevice(d); testState.boot = "0";
+        CobaltNavi44Survey direct; d.pci.clients = {&direct};
+        CHECK(!direct.start(&d.pci));
+        noKdbWrites();
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+    }
+    for (unsigned missing = 1; missing < 5; ++missing) {
+        Device d; kdbDevice(d);
+        if (missing == 1) testState.indexedBoot = "0";
+        if (missing == 2) testState.stateBoot = "0";
+        if (missing == 3) testState.apertureBoot = "0";
+        if (missing == 4) testState.stagingBoot = "0";
+        d.run(missing == 1 ? "discovery-aperture-too-small" : "discovery-snapshot-validated"); noKdbWrites();
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,KdbCommandAttempted") ||
+            d.service.numbers.at("CobaltSurvey,KdbCommandAttempted") == 0);
+    }
+    {
+        Device d; kdbDevice(d); testState.kdbBoot = "0";
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,KdbStatus"));
+        CHECK(d.service.strings.at("CobaltSurvey,StagingStatus") == "synthetic-zero-copy-and-restore-verified");
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        CHECK(testState.kdbWrites == 0);
+    }
+    {
+        Device d; kdbDevice(d);
+        Bytes malformed = syntheticPspFirmware();
+        put32(malformed, 40, 0xdeadbeefu);
+        firmwareOverride = {malformed.data(), malformed.size()};
+        d.run("discovery-snapshot-validated");
+        firmwareOverride = {};
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "firmware-package-invalid");
+        CHECK(!d.service.numbers.at("CobaltSurvey,KdbAttempted"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        noKdbWrites();
+    }
+    {
+        Device d; kdbDevice(d); d.pci.numbers["CobaltSurvey,KdbAttempt-v1"] = 1;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "already-attempted");
+        noKdbWrites();
+    }
+    for (unsigned failAt = 1; failAt <= 2; ++failAt) {
+        Device d; kdbDevice(d);
+        testState.onKdb = [&d, failAt](const TestState::KdbEvent &event) {
+            if (testState.kdbWrites == failAt) d.pci.command = 0;
+            (void)event;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.kdbWrites == failAt);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbResetRequired") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbStagingPreserved") == (failAt == 2 ? 1u : 0u));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbRestoreBytesIssued") == 0);
+        CHECK(testState.apertureCpuWrites == (1u << 18) + 6816u / 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbCommandWritesIssued") == (failAt == 2 ? 1u : 0u));
+        CHECK(testState.openLive == 0 && testState.mapsLive == 0 && testState.allocations == 0);
+    }
+    {
+        Device d; kdbDevice(d); bool armed = false, transientBad = false;
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &armed, &transientBad](uint32_t offset, uint32_t observed) {
+            const uint32_t actual = read(offset, observed);
+            if (armed && !transientBad && offset == 0x4644) {
+                transientBad = true; return 1u;
+            }
+            return actual;
+        };
+        testState.onAperture = [&armed](const MmioEvent &event) {
+            if (!armed && event.operation == 'v' && testState.apertureCpuWrites == 1024) armed = true;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(transientBad);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbContextLost") == 1);
+        CHECK(testState.kdbWrites == 0);
+        CHECK(testState.apertureCpuWrites == 1024);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbResetRequired") == 1);
+    }
+    {
+        Device d; kdbDevice(d); bool commandIssued = false; unsigned postCommandReads = 0;
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &commandIssued, &postCommandReads](uint32_t offset, uint32_t observed) {
+            if (offset == 0x458c && commandIssued) {
+                ++postCommandReads;
+                return postCommandReads < 30 ? 0u : 0x80000000u;
+            }
+            return read(offset, observed);
+        };
+        testState.onKdb = [&commandIssued](const TestState::KdbEvent &event) {
+            if (event.offset == testState.kdbCommandByteOffset) commandIssued = true;
+        };
+        d.run("discovery-snapshot-validated");
+        if (postCommandReads < 3 || testState.sleepCalls < 1)
+            throw std::runtime_error("KDB busy-ready transition missing reads=" + std::to_string(postCommandReads) +
+                " sleeps=" + std::to_string(testState.sleepCalls) + " status=" + d.service.strings["CobaltSurvey,KdbStatus"]);
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "kdb-ready-observed-reset-required");
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbReadyObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbCommandWritesIssued") == 1);
+    }
+    {
+        Device d; kdbDevice(d); bool commandIssued = false; unsigned postCommandReads = 0;
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &commandIssued, &postCommandReads](uint32_t offset, uint32_t observed) {
+            if (offset == 0x458c && commandIssued) { ++postCommandReads; return 0u; }
+            return read(offset, observed);
+        };
+        testState.onKdb = [&commandIssued](const TestState::KdbEvent &event) {
+            if (event.offset == testState.kdbCommandByteOffset) commandIssued = true;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(postCommandReads >= 10000 && testState.sleepCalls == 10000);
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "kdb-protocol-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbResetRequired") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbStagingPreserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbRestoreBytesIssued") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbCommandWritesIssued") == 1);
+        CHECK(testState.kdbWrites == 2);
+        CHECK(testState.apertureCpuWrites == (1u << 18) + 6816u / 4);
+    }
+    for (const bool failFallback : {false, true}) {
+        Device d; kdbDevice(d);
+        testState.propertyFailKey = "CobaltSurvey,KdbFlushRoute";
+        testState.onAperturePublication = [&d, failFallback](const std::string &key) {
+            if (key == "CobaltSurvey,KdbFlushRoute") {
+                d.service.numbers["CobaltSurvey,Schema"] = 7;
+                // Arm after the prerequisite schema-4 publication. Even if
+                // fallback publication now fails, stale schema 7 must vanish.
+                testState.failConsoleSchema = failFallback;
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "metadata-publication-failed");
+        if (failFallback) CHECK(!d.service.numbers.count("CobaltSurvey,Schema"));
+        else CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbResetRequired") == 1);
+        CHECK(testState.mapsLive == 0 && testState.openLive == 0 && testState.allocations == 0);
+    }
 }
 static const std::string &apertureStatus(const Device &d) {
     return d.service.strings.at("CobaltSurvey,ApertureStatus");
@@ -1806,14 +2089,20 @@ static void stagingTests() {
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--kdb-only") {
+            kdbTests();
+            std::cout << "CobaltNavi44Survey KDB host checks passed: " << checks << "\n";
+            return 0;
+        }
         gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
         revalidation(); parserAndPublication();
         indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState(); passiveConsoleTests();
         apertureTests();
         nativeApertureTests();
         stagingTests();
+        kdbTests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"; return 1;

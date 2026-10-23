@@ -55,6 +55,8 @@ def payload() -> dict[str, bytes]:
         "SURVEY-TEST.md": ROOT / "docs/NAVI44-SURVEY.md",
         "licenses/LICENSE": ROOT / "src/navi48-bringup/LICENSE",
         "licenses/NOTICE": ROOT / "src/navi48-bringup/NOTICE",
+        "licenses/LICENSE.amdgpu": ROOT / "src/navi48-bringup/firmware/LICENSE.amdgpu",
+        "licenses/THIRD-PARTY-LICENSES.txt": ROOT / "third-party/THIRD-PARTY-LICENSES.txt",
     }
     for name, path in extras.items():
         files[name] = path.read_bytes()
@@ -66,7 +68,8 @@ def payload() -> dict[str, bytes]:
         "Scope: default read-only PCI/direct-memory survey; separately gated indexed VRAM reads permit address-selector writes; optional passive PSP/MMHUB state and console observations; separately gated 16-byte aperture or full 1 MiB synthetic staging experiment permits bounded VRAM and HDP flush writes through an existing isolated or discovery-derived native NBIF route, with saved-original restoration checks\n"
         "Hardware validation: not yet loaded on the target GPU\n"
         "Acceleration: unavailable; Navi 44 bring-up remains disabled\n"
-        "Contains no GPU firmware or Navi48Bringup executable\n"
+        "Optional cobalt-survey-kdb=1: one PSP KDB command using embedded pinned PSP 14.0.2 firmware; requires all five prior survey flags; no remaining firmware chain or SOS startup\n"
+        "Contains embedded AMD firmware under licenses/LICENSE.amdgpu; no Navi48Bringup executable\n"
     ).encode("utf-8")
     files["SHA256SUMS.txt"] = "".join(
         f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(files.items())

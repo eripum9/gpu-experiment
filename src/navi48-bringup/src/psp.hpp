@@ -76,8 +76,9 @@ public:
 
 	// Read-only preflight: MP0 bootloader ready? SOS already alive? MMHUB FB
 	// location posted and fw_pri inside it? Source views and all selected sizes
-	// must also be valid. Success authorizes one runChain attempt; this is not
-	// proof that the staging window is free or correctly mapped by the caller.
+	// must also be valid. Success authorizes one attempt through either entry
+	// point; this does not prove that the staging window is free or correctly
+	// mapped by the caller.
 	bool preflight();
 
 	// Run the full pre-SOS chain then load SOS. Returns true when SOS reports
@@ -85,7 +86,7 @@ public:
 	// that authorization once, and revalidates all selected views before writes.
 	bool runChain();
 
-	// Bounded protocol probe (currently host-tested, unwired): issue only KDB 0x80000
+	// Bounded protocol probe: issue only KDB 0x80000
 	// and wait for bootloader-ready with SOS observed down throughout. Returns
 	// true only when that command was issued and readiness was observed; it does
 	// not claim authentication, GPU execution, or MC mapping correctness.

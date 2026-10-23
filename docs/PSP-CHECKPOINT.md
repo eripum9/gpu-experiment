@@ -1,9 +1,9 @@
 # One-command PSP checkpoint
 
-`n48::PspLoader::runKeyDatabase()` is a protocol entry point for an eventual
-isolated first-command test. It is host-tested and is not called by either
-kext. This change adds no hardware boot argument, firmware embedding or USB
-update. The existing full-chain entry point remains separate.
+`n48::PspLoader::runKeyDatabase()` is the protocol entry point for an isolated
+first-command test. The standalone survey's separately armed 0.7.0 KDB mode
+uses it through a bounded hardware adapter; see [the survey documentation](NAVI44-SURVEY.md).
+The existing full-chain entry point remains separate.
 
 The method consumes the same fresh preflight authorization as `runChain()`.
 Success or rejection prevents another invocation of either method from using
@@ -24,7 +24,7 @@ A busy sample is not required because completion may precede the first poll.
 The raw status must be retained. A returned ready bit is not interpreted here
 as proof of authentication, correct GPU MC translation or GPU execution.
 
-The future hardware adapter still needs discovered and whitelisted register
+The hardware adapter requires discovered and whitelisted register
 endpoints, fresh six-register preflight, validated live mappings, the bounded
 staging and HDP visibility path, and one persistent provider attempt marker.
 Its stable-resource guards must be separate from the PSP protocol state that
