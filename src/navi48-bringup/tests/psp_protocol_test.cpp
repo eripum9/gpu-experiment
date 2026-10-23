@@ -23,6 +23,7 @@ static unsigned checks=0;
 using Bytes=std::vector<uint8_t>;
 static constexpr uint32_t kReady=0x80000000, kSosCmd=0x20000, kAddressReg=0x64, kCommandReg=0x63, kSosReg=0x91;
 static constexpr uint64_t kOffset=32ULL<<20;
+static constexpr uint64_t kSplOffset=kOffset+n48::PspLoader::kFwPriSize;
 static void put32(Bytes &b,size_t off,uint32_t value) { for(unsigned n=0;n<4;++n)b[off+n]=uint8_t(value>>(8*n)); }
 static Bytes package(bool all=true, unsigned oversizeType=0) {
     const std::vector<uint32_t> types=all ? std::vector<uint32_t>{3,5,2,7,8,9,10,11,1,4,6} : std::vector<uint32_t>{2,1};
@@ -47,8 +48,11 @@ struct Bus final:n48::HwAccess {
     unsigned commandReads=0;
     unsigned solDelay=0;
     bool issuedSos=false;
+    bool dualWindow=false, mailboxAttempted=false;
+    uint64_t splOffset=kSplOffset;
     std::vector<Event> events;
     Bytes window=Bytes(n48::PspLoader::kFwPriSize,0xa5);
+    Bytes splWindow=Bytes(n48::PspLoader::kFwPriSize,0xa5);
     std::function<uint32_t(unsigned,uint32_t)> onSolRead;
     std::function<uint32_t(unsigned,uint32_t)> onCommandRead;
     uint32_t regReadIp(uint16_t h,uint8_t inst,uint8_t seg,uint32_t reg) override {
@@ -79,21 +83,26 @@ struct Bus final:n48::HwAccess {
     bool regWriteIp(uint16_t h,uint8_t inst,uint8_t seg,uint32_t reg,uint32_t value) override {
         CHECK(h==IpDiscovery::HwMp0 && inst==0 && seg==0);
         CHECK(reg==kAddressReg || reg==kCommandReg);
+        mailboxAttempted=true; // Includes a failed address-store attempt.
         if(!allow('W',reg,value,4))return false;
         if(reg==kCommandReg && value==kSosCmd)issuedSos=true;
         return true;
     }
     bool vramWrite(uint64_t off,const void *src,size_t len) override {
-        CHECK(off==expectedOffset);CHECK(src && len && len<=window.size());
+        CHECK(!dualWindow || !mailboxAttempted);
+        CHECK(off==expectedOffset || (dualWindow && off==splOffset));CHECK(src && len && len<=window.size());
         const bool permitted=allow('C',off,0,len);
         events.back().source=src;
         if(!permitted)return false;
-        std::memcpy(window.data(),src,len);return true;
+        auto &target=off==expectedOffset?window:splWindow;
+        std::memcpy(target.data(),src,len);return true;
     }
     bool vramMemset(uint64_t off,uint8_t value,size_t len) override {
-        CHECK(off==expectedOffset);CHECK(value==0 && len==window.size());
+        CHECK(!dualWindow || !mailboxAttempted);
+        CHECK(off==expectedOffset || (dualWindow && off==splOffset));CHECK(value==0 && len==window.size());
         if(!allow('Z',off,value,len))return false;
-        std::fill(window.begin(),window.end(),value);return true;
+        auto &target=off==expectedOffset?window:splWindow;
+        std::fill(target.begin(),target.end(),value);return true;
     }
     std::vector<Event> writeEvents() const { std::vector<Event> out;for(const auto &e:events)if(e.op!='R')out.push_back(e);return out; }
 };
@@ -260,6 +269,175 @@ static void keyDatabaseTests(const Bytes &good) {
         CHECK(!p.runChain());CHECK(b.writes==expected);
     }
 }
+static void consumed(n48::PspLoader &p,const Bus &b) {
+    const size_t count=b.events.size();
+    CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(!p.runKeyDatabase());CHECK(!p.runChain());
+    CHECK(b.events.size()==count);
+}
+static void stagedPair(const Bus &b,const Bytes &source) {
+    cobalt::psp::Package pkg{};CHECK(cobalt::psp::parse(source.data(),source.size(),pkg));
+    const Bytes *windows[]={&b.window,&b.splWindow};
+    const auto parts={cobalt::psp::Kdb,cobalt::psp::Spl};unsigned at=0;
+    for(const auto part:parts) {
+        const auto &bin=pkg.part[part];const auto &window=*windows[at++];
+        CHECK(bin.data && bin.size);
+        CHECK(std::equal(window.begin(),window.begin()+bin.size,bin.data));
+        CHECK(std::all_of(window.begin()+bin.size,window.end(),[](uint8_t v){return v==0;}));
+    }
+}
+static void checkPair(const Bus &b,const Bytes &source) {
+    cobalt::psp::Package pkg{};CHECK(cobalt::psp::parse(source.data(),source.size(),pkg));
+    const auto events=b.writeEvents();CHECK(events.size()==8);
+    const auto &kdb=pkg.part[cobalt::psp::Kdb], &spl=pkg.part[cobalt::psp::Spl];
+    CHECK(events[0].op=='Z' && events[0].offset==b.expectedOffset && events[0].size==n48::PspLoader::kFwPriSize);
+    CHECK(events[1].op=='C' && events[1].offset==b.expectedOffset && events[1].size==kdb.size && events[1].source==kdb.data);
+    CHECK(events[2].op=='Z' && events[2].offset==b.splOffset && events[2].size==n48::PspLoader::kFwPriSize);
+    CHECK(events[3].op=='C' && events[3].offset==b.splOffset && events[3].size==spl.size && events[3].source==spl.data);
+    for(unsigned i=0;i<2;++i) {
+        const auto &address=events[4+i*2], &command=events[5+i*2];
+        const uint64_t offset=i==0?b.expectedOffset:b.splOffset;
+        CHECK(address.op=='W' && address.offset==kAddressReg && address.value==(((uint64_t(b.base)<<24)+offset)>>20));
+        CHECK(command.op=='W' && command.offset==kCommandReg && command.value==(i==0?0x80000u:0x10000000u));
+    }
+    CHECK(events[4].value!=events[6].value);CHECK(!b.issuedSos);
+    stagedPair(b,source);
+}
+static void keyDatabaseAndSplPrerequisites() {
+    const auto good=package();
+    { Bus b;n48::PspLoader p(b);CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.events.empty()); }
+    { Bus b;n48::PspLoader p(b);parsed(p,good);CHECK(p.setFwPriOffset(kOffset));
+      CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.events.empty()); }
+    const uint64_t invalid[]={kOffset,kOffset+1,kOffset+n48::PspLoader::kFwPriSize-1,1,
+        UINT64_MAX,UINT64_MAX&~uint64_t(n48::PspLoader::kFwPriSize-1),
+        UINT64_MAX-((1ULL<<21)-1),1ULL<<52,(uint64_t(0x83fb+1-0x8000)<<24)};
+    for(uint64_t off:invalid) {
+        Bus b;n48::PspLoader p(b);prepare(p,good);const auto reads=b.events.size();
+        CHECK(!p.runKeyDatabaseAndSpl(off));CHECK(b.events.size()==reads);noWrites(b);consumed(p,b);
+    }
+    // Each required component is independently absent in an otherwise valid package.
+    for(unsigned descriptor:{0u,1u}) {
+        auto source=good;put32(source,36+descriptor*16,0);
+        Bus b;n48::PspLoader p(b);prepare(p,source);const auto reads=b.events.size();
+        CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.events.size()==reads);noWrites(b);consumed(p,b);
+    }
+    // Revalidate the whole selected chain, including components this probe will not dispatch.
+    for(unsigned slot=0;slot<9;++slot)for(unsigned field=0;field<3;++field) {
+        Bus b;n48::PspLoader p(b);prepare(p,good);
+        n48::SubBin *slots[]={&p.kdb,&p.spl,&p.sys,&p.soc,&p.intf,&p.dbg,&p.ras,&p.ipkey,&p.sos};
+        if(field==0)++slots[slot]->data;
+        if(field==1)++slots[slot]->size;
+        if(field==2)++slots[slot]->version;
+        const auto reads=b.events.size();CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));
+        CHECK(b.events.size()==reads);noWrites(b);consumed(p,b);
+    }
+    for(unsigned kind=0;kind<5;++kind) {
+        auto source=good;Bus b;n48::PspLoader p(b);prepare(p,source);
+        if(kind==0)put32(source,0,0);
+        if(kind==1)parsed(p,source);
+        if(kind==2)CHECK(!p.parseContainer(nullptr,0));
+        if(kind==3)CHECK(p.setFwPriOffset(kOffset));
+        if(kind==4)CHECK(!p.setFwPriOffset(1));
+        const auto reads=b.events.size();CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));
+        CHECK(b.events.size()==reads);noWrites(b);consumed(p,b);
+    }
+    for(unsigned type:{1u,2u,3u,5u,7u,8u,9u,10u,11u}) {
+        const auto bad=package(true,type);Bus b;n48::PspLoader p(b);parsed(p,bad);CHECK(p.setFwPriOffset(kOffset));
+        CHECK(!p.preflight());const auto reads=b.events.size();CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));
+        CHECK(b.events.size()==reads);noWrites(b);
+    }
+    // A fresh token used by any API cannot subsequently authorize any other API.
+    for(unsigned first=0;first<3;++first) {
+        Bus b;b.dualWindow=first==2;n48::PspLoader p(b);prepare(p,good);
+        CHECK(first==0?p.runChain():first==1?p.runKeyDatabase():p.runKeyDatabaseAndSpl(kSplOffset));consumed(p,b);
+    }
+    // Either physical order and the upper posted boundary are legal when disjoint.
+    for(unsigned layout=0;layout<3;++layout) {
+        Bus b;b.dualWindow=true;
+        b.expectedOffset=layout==0?0:layout==1?kSplOffset:kOffset;
+        b.splOffset=layout==0?n48::PspLoader::kFwPriSize:layout==1?kOffset:
+            (uint64_t(b.top+1-b.base)<<24)-n48::PspLoader::kFwPriSize;
+        n48::PspLoader p(b);prepare(p,good,b.expectedOffset);
+        CHECK(p.runKeyDatabaseAndSpl(b.splOffset));checkPair(b,good);consumed(p,b);
+    }
+}
+// Number of writes before the nth occurrence of a particular register read.
+static unsigned writesBeforeRead(const Bus &b,uint32_t reg,unsigned nth) {
+    unsigned writes=0,reads=0;
+    for(const auto &event:b.events) {
+        if(event.op!='R')++writes;
+        else if(event.offset==reg && ++reads==nth)return writes;
+    }
+    throw std::runtime_error("missing reference read");
+}
+static void keyDatabaseAndSplTests(const Bytes &good) {
+    Bus reference;reference.dualWindow=true;n48::PspLoader successful(reference);prepare(successful,good);
+    CHECK(successful.runKeyDatabaseAndSpl(kSplOffset));checkPair(reference,good);
+    CHECK(std::string(successful.lastStep())=="SPL");CHECK(successful.lastBootloaderStatus()==kReady);consumed(successful,reference);
+    // Every failing staging/address/command attempt terminates at exactly that prefix.
+    for(unsigned fail=1;fail<=8;++fail) {
+        Bus b;b.dualWindow=true;b.failWrite=fail;n48::PspLoader p(b);prepare(p,good);
+        CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.writes==fail);
+        const auto actual=b.writeEvents(),expected=reference.writeEvents();
+        for(unsigned i=0;i<fail;++i) {
+            CHECK(actual[i].op==expected[i].op && actual[i].offset==expected[i].offset &&
+                actual[i].value==expected[i].value && actual[i].size==expected[i].size && actual[i].source==expected[i].source);
+        }
+        if(fail>=5)stagedPair(b,good);
+        consumed(p,b);
+    }
+    // Exercise every strict SOS checkpoint before, between, and after components.
+    for(unsigned phase=2;phase<=reference.solReads;++phase)for(uint32_t state:{0x55u,UINT32_MAX}) {
+        Bus b;b.dualWindow=true;n48::PspLoader p(b);prepare(p,good);
+        b.onSolRead=[phase,state](unsigned at,uint32_t value){return at==phase?state:value;};
+        CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.solReads==phase);
+        CHECK(b.writes==writesBeforeRead(reference,kSosReg,phase));
+        if(state==UINT32_MAX)CHECK(p.lastBootloaderStatus()==UINT32_MAX);
+        if(b.writes>=4)stagedPair(b,good);
+        consumed(p,b);
+    }
+    // The first unreadable status is terminal at every readiness poll.
+    for(unsigned phase=2;phase<=reference.commandReads;++phase) {
+        Bus b;b.dualWindow=true;n48::PspLoader p(b);prepare(p,good);
+        b.onCommandRead=[phase](unsigned at,uint32_t value){return at==phase?UINT32_MAX:value;};
+        CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.commandReads==phase);
+        CHECK(b.writes==writesBeforeRead(reference,kCommandReg,phase));CHECK(p.lastBootloaderStatus()==UINT32_MAX);
+        if(b.writes>=4)stagedPair(b,good);
+        consumed(p,b);
+    }
+    // Every staging and mailbox operation has a direct ready check. An
+    // unexpected busy read there must fail immediately, even if the next read
+    // would be ready; only the explicit initial/completion waits may poll.
+    unsigned commandRead=0,latestRead=0;
+    for(const auto &event:reference.events) {
+        if(event.op=='R' && event.offset==kCommandReg)latestRead=++commandRead;
+        if(event.op=='R')continue;
+        Bus b;b.dualWindow=true;n48::PspLoader p(b);prepare(p,good);
+        b.onCommandRead=[latestRead](unsigned at,uint32_t value){return at==latestRead?0u:value;};
+        CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.commandReads==latestRead);
+        CHECK(b.writes==writesBeforeRead(reference,kCommandReg,latestRead));CHECK(p.lastBootloaderStatus()==0);
+        if(b.writes>=4)stagedPair(b,good);
+        consumed(p,b);
+    }
+    // Each wait also permits busy-low followed by ready, including after each command.
+    { Bus b;b.dualWindow=true;n48::PspLoader p(b);prepare(p,good);
+      bool initial=false,kdb=false,spl=false;
+      b.onCommandRead=[&](unsigned,uint32_t value){
+          bool *seen=b.writes==0?&initial:b.writes==6?&kdb:b.writes==8?&spl:nullptr;
+          if(seen && !*seen) {*seen=true;return 0u;}return value;
+      };
+      CHECK(p.runKeyDatabaseAndSpl(kSplOffset));CHECK(initial && kdb && spl);
+      CHECK(b.commandReads==reference.commandReads+3);checkPair(b,good); }
+    // Unready before preparation/dispatch, then completion timeouts at KDB/SPL.
+    for(unsigned threshold:{0u,4u,6u,8u}) {
+        Bus b;b.dualWindow=true;n48::PspLoader p(b);prepare(p,good);
+        b.onCommandRead=[&b,threshold](unsigned,uint32_t value){return b.writes>=threshold?0u:value;};
+        CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(b.writes==threshold);CHECK(p.lastBootloaderStatus()==0);
+        if(threshold>=4)stagedPair(b,good);
+        if(threshold==6)CHECK(std::string(p.lastStep())=="KDB");
+        if(threshold==8)CHECK(std::string(p.lastStep())=="SPL");
+        consumed(p,b);
+    }
+}
 static void unreadableSosTests() {
     const auto good=package(false);
     { Bus b;b.sol=UINT32_MAX;n48::PspLoader p(b);parsed(p,good);CHECK(p.setFwPriOffset(kOffset));
@@ -279,10 +457,18 @@ static void unreadableSosTests() {
 int main(int argc,char **argv) {
     try {
         prerequisiteTests();addressTests();unreadableSosTests();protocolTests(package());protocolTests(package(false));keyDatabaseTests(package());
+        keyDatabaseAndSplPrerequisites();keyDatabaseAndSplTests(package());
         for(int i=1;i<argc;++i) {
             std::ifstream f(argv[i],std::ios::binary);CHECK(f.good());
             const Bytes bytes((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
-            protocolTests(bytes);keyDatabaseTests(bytes);std::printf("Validated actual PSP protocol with package: %s\n",argv[i]);
+            if(std::string(argv[i]).find("14_0_2")!=std::string::npos) {
+                cobalt::psp::Package pinned{};CHECK(cobalt::psp::parse(bytes.data(),bytes.size(),pinned));
+                const auto &spl=pinned.part[cobalt::psp::Spl], &kdb=pinned.part[cobalt::psp::Kdb];
+                CHECK(spl.version==0x01003b00 && spl.size==832 && spl.data-bytes.data()==0x66a20);
+                CHECK(kdb.size==6816 && kdb.data-bytes.data()==256);
+            }
+            protocolTests(bytes);keyDatabaseTests(bytes);keyDatabaseAndSplTests(bytes);
+            std::printf("Validated actual PSP protocol with package: %s\n",argv[i]);
         }
         std::printf("Actual PSP loader protocol checks passed: %u\n",checks);
     } catch(const std::exception &e) {std::fprintf(stderr,"%s\n",e.what());return 1;}

@@ -64,7 +64,7 @@ public:
 
 	// Parse the sos.bin container (header v2.0/v2.1). Returns false on a
 	// malformed container. Keeps pointers into `fw`; caller owns it and must keep
-	// it alive through runChain or runKeyDatabase. Every parse attempt invalidates
+	// it alive through any run entry point. Every parse attempt invalidates
 	// prior preflight.
 	bool parseContainer(const uint8_t *fw, size_t fwSize);
 
@@ -76,7 +76,7 @@ public:
 
 	// Read-only preflight: MP0 bootloader ready? SOS already alive? MMHUB FB
 	// location posted and fw_pri inside it? Source views and all selected sizes
-	// must also be valid. Success authorizes one attempt through either entry
+	// must also be valid. Success authorizes one attempt through any run entry
 	// point; this does not prove that the staging window is free or correctly
 	// mapped by the caller.
 	bool preflight();
@@ -92,6 +92,15 @@ public:
 	// not claim authentication, GPU execution, or MC mapping correctness.
 	bool runKeyDatabase();
 
+	// Offline bounded protocol checkpoint: prepare KDB at fwPriOffset() and SPL
+	// at splOffset in distinct, complete 1 MiB windows before either mailbox is
+	// attempted. Both windows must remain reserved and preserved through cold reset;
+	// the caller establishes their mapping, ownership, and globally visible writes.
+	// Consumes the shared fresh preflight even on failure. Returns true only for
+	// KDB then SPL commands issued and ready observed with SOS down throughout;
+	// this does not establish authentication, execution, or MC mapping correctness.
+	bool runKeyDatabaseAndSpl(uint64_t splOffset);
+
 	// State / report
 	bool     sosAlive() const;                 // live register check
 	uint64_t mcBase() const { return vramMcBase; }         // FB_LOCATION_BASE << 24
@@ -106,6 +115,7 @@ public:
 private:
 	bool chainValid() const;
 	bool windowValid() const;
+	bool windowValid(uint64_t vramOffset) const;
 	bool waitBootloader(uint32_t budgetMs, uint32_t *lastValue, bool strictSosDown = false);
 	bool loadComponent(const char *name, const SubBin &bin, uint32_t blCmd, bool strictSosDown = false);
 	bool loadSOS();

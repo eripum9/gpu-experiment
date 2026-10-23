@@ -105,10 +105,14 @@ bool PspLoader::chainValid() const {
 }
 
 bool PspLoader::windowValid() const {
-	if (!fwPriConfigured || (fwPriOff & (kFwPriSize - 1)) ||
+	return fwPriConfigured && windowValid(fwPriOff);
+}
+
+bool PspLoader::windowValid(uint64_t vramOffset) const {
+	if ((vramOffset & (kFwPriSize - 1)) || vramOffset > UINT64_MAX - kFwPriSize ||
 		vramMcBase == 0 || vramMcTop <= vramMcBase ||
-		fwPriOff > UINT64_MAX - vramMcBase) return false;
-	const uint64_t mc = vramMcBase + fwPriOff;
+		vramOffset > UINT64_MAX - vramMcBase) return false;
+	const uint64_t mc = vramMcBase + vramOffset;
 	if (mc >= vramMcTop || kFwPriSize > vramMcTop - mc ||
 		mc > UINT64_MAX - kFwPriSize || (mc >> 20) > UINT32_MAX) return false;
 	return true;
@@ -326,6 +330,62 @@ bool PspLoader::runKeyDatabase() {
 	// Deliberately stop after this single command. This proves only that the
 	// command reached an observed bootloader-ready state while SOS stayed down.
 	return loadComponent("KDB", kdb, BlCmd::LoadKeyDatabase, true);
+}
+
+bool PspLoader::runKeyDatabaseAndSpl(uint64_t splOffset) {
+	const bool authorized = preflightOK;
+	preflightOK = false; // All run entry points share this one-shot authorization.
+	if (!authorized || !chainValid() || !kdb.present() || !spl.present() ||
+		!windowValid() || !windowValid(splOffset) ||
+		!(fwPriOff + kFwPriSize <= splOffset || splOffset + kFwPriSize <= fwPriOff)) {
+		lastStepName = "preflight-required";
+		PSPLOG("KDB+SPL probe: fresh preflight, unchanged chain, both images, and distinct bounded windows required\n");
+		return false;
+	}
+	auto requireSosDown = [&]() -> bool {
+		const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+		if (sol == 0) return true;
+		lastStatus = sol;
+		PSPLOG("%s: strict probe requires readable SOS-down state (0x%08x)\n", lastStepName, sol);
+		return false;
+	};
+	auto requireReady = [&]() -> bool {
+		const uint32_t bl = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
+		lastStatus = bl;
+		if (bl == UINT32_MAX || !(bl & n48::kPspBootReadyBit)) {
+			PSPLOG("%s: expected readable bootloader-ready state (0x%08x)\n", lastStepName, bl);
+			return false;
+		}
+		return requireSosDown();
+	};
+	uint32_t st;
+	lastStepName = "KDB+SPL-prepare";
+	if (!requireSosDown() || !waitBootloader(10000, &st, true)) return false;
+
+	// Each hardware call completes globally visible writes before returning.
+	// Prepare both independent windows before any mailbox attempt: after that
+	// point either window may be PSP-owned, including on an uncertain failure.
+	lastStepName = "KDB-stage";
+	if (!requireReady() || !hw.vramMemset(fwPriOff, 0, kFwPriSize) ||
+		!requireReady() || !hw.vramWrite(fwPriOff, kdb.data, kdb.size)) return false;
+	lastStepName = "SPL-stage";
+	if (!requireReady() || !hw.vramMemset(splOffset, 0, kFwPriSize) ||
+		!requireReady() || !hw.vramWrite(splOffset, spl.data, spl.size)) return false;
+
+	// Deliberately contains no staging, cleanup, retry, or chain continuation.
+	auto dispatch = [&](const char *name, uint64_t offset, uint32_t cmd) -> bool {
+		lastStepName = name;
+		if (!requireReady()) return false;
+		const uint64_t mc = vramMcBase + offset;
+		if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20)) ||
+			!requireReady() ||
+			!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, cmd)) return false;
+		if (!waitBootloader(10000, &st, true) || !requireSosDown()) return false;
+		PSPLOG("%s: command 0x%x issued, bootloader-ready observed (0x%08x)\n", name, cmd, st);
+		return true;
+	};
+	return dispatch("KDB", fwPriOff, BlCmd::LoadKeyDatabase) &&
+		dispatch("SPL", splOffset, BlCmd::LoadTosSPLTable);
 }
 
 } // namespace n48

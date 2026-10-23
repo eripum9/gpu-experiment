@@ -1,4 +1,4 @@
-# One-command PSP checkpoint
+# Bounded PSP checkpoints
 
 `n48::PspLoader::runKeyDatabase()` is the protocol entry point for an isolated
 first-command test. The standalone survey's separately armed 0.7.0 KDB mode
@@ -32,8 +32,36 @@ the command intentionally changes. Conservative console and firmware-memory
 exclusions do not constitute an exclusive VRAM allocation.
 
 Once a command has been dispatched, a timeout or failed read can leave PSP
-access to the staging data unresolved. The adapter must not overwrite that
-window, replay the command, continue into the chain, restore mailboxes or
+access to the staging data unresolved. The one-command adapter must not
+overwrite that window, replay the command, continue into the chain, restore mailboxes or
 reset the GPU automatically. Such a result needs recorded diagnostics and a
 known reset boundary before another hardware attempt. The protocol API alone
 cannot enforce that provider lifetime or recovery policy.
+
+## Offline KDB and SPL checkpoint
+
+`runKeyDatabaseAndSpl(splOffset)` prepares the next bounded sequence. It is
+host-tested protocol code only: the 0.7.0 survey does not call it, and this
+change adds no firmware boot flag or hardware deployment.
+
+The configured `fw_pri` offset selects the KDB window. `splOffset` must select
+a second disjoint, aligned, complete 1 MiB window inside the validated MC
+range, with a representable mailbox address. All source views and both windows
+are validated before preparation. Entry consumes the same one-use preflight
+authorization as the KDB-only and full-chain methods, including on refusal.
+
+Both windows are cleared and their exact component views copied before the
+first mailbox store. The method then sends KDB `0x00080000`, waits for ready
+with SOS down, sends SPL `0x10000000` using the second window's address, and
+waits for ready again. It issues no VRAM writes after the first mailbox
+attempt, including on a timeout or an unreadable register. It never enters
+SYS, another component, or SOS, and does not retry either command.
+
+Keeping separate buffers avoids overwriting data already handed to the PSP.
+The pinned PSP 14.0.2 SPL component is 832 bytes, version `0x01003b00`, at
+package offset `0x66a20`. A successful return reports two ready observations;
+it does not prove authentication or GPU execution. A future hardware adapter
+still needs separate bounded mappings, ownership and visibility checks for
+both buffers, a single persistent attempt marker, and preservation of both
+buffers after dispatch. The KDB-only hardware result does not supply those
+new proofs or establish an exclusive allocation for either window.
