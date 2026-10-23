@@ -69,6 +69,7 @@ def payload() -> dict[str, bytes]:
         "Hardware validation: not yet loaded on the target GPU\n"
         "Acceleration: unavailable; Navi 44 bring-up remains disabled\n"
         "Optional cobalt-survey-kdb=1: one PSP KDB command using embedded pinned PSP 14.0.2 firmware; requires all five prior survey flags; no remaining firmware chain or SOS startup\n"
+        "Optional cobalt-survey-spl=1: prepare two separate 1 MiB windows, then issue only KDB and SPL; requires all six prior survey flags; preserves both windows after any mailbox attempt; no SYS or SOS startup\n"
         "Contains embedded AMD firmware under licenses/LICENSE.amdgpu; no Navi48Bringup executable\n"
     ).encode("utf-8")
     files["SHA256SUMS.txt"] = "".join(

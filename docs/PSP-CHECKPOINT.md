@@ -38,11 +38,12 @@ reset the GPU automatically. Such a result needs recorded diagnostics and a
 known reset boundary before another hardware attempt. The protocol API alone
 cannot enforce that provider lifetime or recovery policy.
 
-## Offline KDB and SPL checkpoint
+## KDB and SPL checkpoint
 
-`runKeyDatabaseAndSpl(splOffset)` prepares the next bounded sequence. It is
-host-tested protocol code only: the 0.7.0 survey does not call it, and this
-change adds no firmware boot flag or hardware deployment.
+`runKeyDatabaseAndSpl(splOffset)` implements the next bounded sequence. The
+standalone 0.8.0 survey calls it only through the separately armed
+`cobalt-survey-spl=1` adapter described in [the survey documentation](NAVI44-SURVEY.md).
+The KDB-only hardware result does not establish that this pair works on hardware.
 
 The configured `fw_pri` offset selects the KDB window. `splOffset` must select
 a second disjoint, aligned, complete 1 MiB window inside the validated MC
@@ -60,8 +61,11 @@ SYS, another component, or SOS, and does not retry either command.
 Keeping separate buffers avoids overwriting data already handed to the PSP.
 The pinned PSP 14.0.2 SPL component is 832 bytes, version `0x01003b00`, at
 package offset `0x66a20`. A successful return reports two ready observations;
-it does not prove authentication or GPU execution. A future hardware adapter
-still needs separate bounded mappings, ownership and visibility checks for
-both buffers, a single persistent attempt marker, and preservation of both
-buffers after dispatch. The KDB-only hardware result does not supply those
-new proofs or establish an exclusive allocation for either window.
+it does not prove authentication or GPU execution. The 0.8.0 adapter adds
+separate bounded mappings, ownership and visibility checks for both buffers,
+and a persistent attempt marker that excludes the KDB-only mode. After any
+mailbox attempt, including an address-only failure, it preserves both buffers
+without further CPU writes or flushes until a cold reset. Direct protocol
+reads must observe KDB ready followed by SOS down before SPL is allowed;
+resource-guard reads cannot advance that phase. These guards do not establish
+an exclusive allocation or verified PSP translation for either window.

@@ -8,6 +8,7 @@ namespace {
 
 using cobalt::survey::Inputs;
 using cobalt::survey::Plan;
+using cobalt::survey::FirmwarePairPlan;
 constexpr std::uint64_t MiB = 1ULL << 20;
 constexpr std::uint64_t GiB = 1ULL << 30;
 constexpr std::uint64_t kReserve = 516ULL * MiB;
@@ -37,6 +38,15 @@ bool rejectedAndCleared(const Inputs &input, const char *label) {
                   "failure outputs are cleared");
 }
 
+bool pairRejectedAndCleared(const Inputs &input, const char *label) {
+    const FirmwarePairPlan result = cobalt::survey::planFirmwarePair(input);
+    return expect(!result.ok, label) && expect(result.reason != nullptr, "pair failure reason is present") &&
+           expect(!result.kdb.ok && result.kdb.windowOffset == 0 && result.kdb.windowBytes == 0 &&
+                  result.kdb.mcAddress == 0 && !result.spl.ok && result.spl.windowOffset == 0 &&
+                  result.spl.windowBytes == 0 && result.spl.mcAddress == 0,
+                  "pair failure clears both plans");
+}
+
 } // namespace
 
 int main() {
@@ -50,11 +60,26 @@ int main() {
     ok &= expect(expected.windowOffset + expected.windowBytes <= base.bar0Bytes,
                  "sample window fits BAR0");
 
+    Inputs hardwareInputs = base;
+    hardwareInputs.mcBase = 0x8000000000ULL;
+    hardwareInputs.mcEnd = hardwareInputs.mcBase + hardwareInputs.usableVramBytes;
+    const FirmwarePairPlan pair = cobalt::survey::planFirmwarePair(hardwareInputs);
+    ok &= expect(pair.ok && pair.kdb.windowOffset == 64 * MiB && pair.spl.windowOffset == 65 * MiB,
+                 "hardware sample selects adjacent 64 MiB and 65 MiB windows");
+    ok &= expect(pair.kdb.mcAddress == 0x8004000000ULL && pair.spl.mcAddress == 0x8004100000ULL,
+                 "hardware sample computes the expected KDB and SPL MC addresses");
+    ok &= expect(pair.kdb.windowBytes == MiB && pair.spl.windowBytes == MiB,
+                 "each pair window remains exactly 1 MiB");
+
     Inputs movedConsole = base;
     movedConsole.consolePhysical += 80 * MiB;
     const Plan moved = cobalt::survey::planAperture(movedConsole);
     ok &= expect(moved.ok && moved.windowOffset > 80 * MiB,
                  "nonzero console offset moves the window past console plus guard");
+    const FirmwarePairPlan movedPair = cobalt::survey::planFirmwarePair(movedConsole);
+    ok &= expect(movedPair.ok && movedPair.kdb.windowOffset == moved.windowOffset &&
+                 movedPair.spl.windowOffset == moved.windowOffset + MiB,
+                 "pair follows a moved console and remains adjacent");
     Inputs largeConsole = base;
     largeConsole.consoleBytes = 60 * MiB;
     const Plan large = cobalt::survey::planAperture(largeConsole);
@@ -65,6 +90,42 @@ int main() {
     ok &= expect(repeated.ok == expected.ok && repeated.windowOffset == expected.windowOffset &&
                  repeated.windowBytes == expected.windowBytes && repeated.mcAddress == expected.mcAddress,
                  "planning is deterministic");
+    const FirmwarePairPlan repeatedPair = cobalt::survey::planFirmwarePair(hardwareInputs);
+    ok &= expect(repeatedPair.ok && repeatedPair.kdb.windowOffset == pair.kdb.windowOffset &&
+                 repeatedPair.kdb.mcAddress == pair.kdb.mcAddress &&
+                 repeatedPair.spl.windowOffset == pair.spl.windowOffset &&
+                 repeatedPair.spl.mcAddress == pair.spl.mcAddress,
+                 "pair planning is deterministic");
+
+    // The first window can fit at 255 MiB while its adjacent partner cannot.
+    Inputs pairBoundary = base;
+    pairBoundary.consolePhysical = kBar0 + 238 * MiB;
+    pairBoundary.consoleBytes = MiB;
+    const Plan lastBarWindow = cobalt::survey::planAperture(pairBoundary);
+    ok &= expect(lastBarWindow.ok && lastBarWindow.windowOffset == 255 * MiB,
+                 "boundary fixture leaves the first window inside BAR0");
+    ok &= pairRejectedAndCleared(pairBoundary, "second window crossing BAR0 is refused");
+
+    pairBoundary = base;
+    pairBoundary.usableVramBytes = 66 * MiB;
+    pairBoundary.firmwareReserveBytes = MiB;
+    pairBoundary.mcEnd = pairBoundary.mcBase + pairBoundary.usableVramBytes;
+    pairBoundary.consolePhysical = kBar0;
+    pairBoundary.consoleBytes = MiB;
+    const Plan lastSafeWindow = cobalt::survey::planAperture(pairBoundary);
+    ok &= expect(lastSafeWindow.ok && lastSafeWindow.windowOffset == 64 * MiB,
+                 "boundary fixture leaves the first window before the reserve");
+    ok &= pairRejectedAndCleared(pairBoundary, "second window crossing firmware reserve is refused");
+
+    pairBoundary = base;
+    pairBoundary.mcBase = 0xFFFFFFFF00000ULL - 64 * MiB;
+    pairBoundary.mcEnd = pairBoundary.mcBase + pairBoundary.usableVramBytes;
+    ok &= pairRejectedAndCleared(pairBoundary, "second mailbox address beyond 32-bit MiB field is refused");
+
+    pairBoundary = base;
+    pairBoundary.bar0Physical = 0xFFFFFFFFF0000000ULL;
+    pairBoundary.bar0ConfigPhysical = pairBoundary.bar0Physical;
+    ok &= pairRejectedAndCleared(pairBoundary, "BAR0 end arithmetic overflow clears both pair plans");
 
     Inputs input = base; input.consolePhysical = 0;
     ok &= rejectedAndCleared(input, "unknown console is refused");

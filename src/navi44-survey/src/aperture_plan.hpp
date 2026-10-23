@@ -24,6 +24,13 @@ struct Plan {
     uint64_t mcAddress;
 };
 
+struct FirmwarePairPlan {
+    bool ok;
+    const char *reason;
+    Plan kdb;
+    Plan spl;
+};
+
 // Conservative experimental policy, not a guarantee that GPU firmware or
 // another client leaves this region unused. The caller must establish
 // ownership before any access to the planned aperture.
@@ -105,6 +112,43 @@ inline Plan planAperture(const Inputs &in) {
 
     result = Plan{true, "ok", offset, kApertureWindowBytes, mcAddress};
     return result;
+}
+
+// Plan adjacent KDB and SPL apertures. The first aperture retains the
+// existing conservative selection policy; the second must fit every bound
+// independently as part of the same 2 MiB region.
+inline FirmwarePairPlan planFirmwarePair(const Inputs &in) {
+    constexpr uint64_t max = UINT64_MAX;
+    const Plan first = planAperture(in);
+    const auto fail = [](const char *reason) {
+        const Plan cleared{false, reason, 0, 0, 0};
+        return FirmwarePairPlan{false, reason, cleared, cleared};
+    };
+    if (!first.ok) return fail(first.reason);
+    if (first.windowOffset > max - kApertureWindowBytes)
+        return fail("second window offset overflows");
+
+    const uint64_t secondOffset = first.windowOffset + kApertureWindowBytes;
+    constexpr uint64_t pairBytes = 2 * kApertureWindowBytes;
+    if (first.windowOffset > in.bar0Bytes || pairBytes > in.bar0Bytes - first.windowOffset)
+        return fail("firmware pair does not fit BAR0");
+    const uint64_t safeVramBytes = in.usableVramBytes - in.firmwareReserveBytes;
+    if (first.windowOffset > safeVramBytes || pairBytes > safeVramBytes - first.windowOffset)
+        return fail("firmware pair reaches reserved or unavailable VRAM");
+    const uint64_t mcBytes = in.mcEnd - in.mcBase;
+    if (first.windowOffset > mcBytes || pairBytes > mcBytes - first.windowOffset)
+        return fail("firmware pair does not fit the MC range");
+    if (in.mcBase > max - secondOffset)
+        return fail("second MC address overflows");
+    const uint64_t secondMcAddress = in.mcBase + secondOffset;
+    if (secondMcAddress > max - kApertureWindowBytes ||
+        secondMcAddress + kApertureWindowBytes > in.mcEnd)
+        return fail("second MC address range overflows or exceeds MC end");
+    if ((secondMcAddress >> 20) > UINT32_MAX)
+        return fail("SPL MC address cannot be represented in the hardware register");
+
+    const Plan second{true, "ok", secondOffset, kApertureWindowBytes, secondMcAddress};
+    return FirmwarePairPlan{true, "ok", first, second};
 }
 
 } // namespace cobalt::survey

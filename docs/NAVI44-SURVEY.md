@@ -8,7 +8,8 @@ Its default mode is read-only. Separately gated experiments permit bounded
 address-selector writes, a 16-byte VRAM transport test, and a full 1 MiB
 synthetic staging test, described below. Version 0.7.0 additionally includes
 a separately armed one-command KDB firmware diagnostic. Embedding firmware
-does not activate that mode.
+does not activate that mode. Version 0.8.0 adds a separately armed KDB and SPL
+diagnostic using two buffers.
 
 ## One-command KDB checkpoint (0.7.0)
 
@@ -55,6 +56,51 @@ execution, display support, or Metal acceleration. `Ready` remains false.
 The embedded package is distributed under the included AMD firmware license.
 If discovery, passive state, or console publication fails first, the existing
 failure status is retained and no KDB transaction or KDB result is produced.
+
+## KDB and SPL checkpoint (0.8.0)
+
+`cobalt-survey-spl=1` requires all six earlier survey flags, including
+`cobalt-survey-kdb=1`, to equal numeric 1. It selects this pair instead of
+the KDB-only or synthetic staging tests. Missing prerequisites refuse the pair
+without falling through to an earlier write experiment.
+
+The checked planner selects two adjacent, distinct 1 MiB windows. Both must
+fit the CPU aperture, conservative usable-VRAM exclusions and posted MC range.
+The second window is checked in full; space for the first alone is insufficient.
+This extends the existing experimental placement policy, without establishing
+an exclusive VRAM allocation or PSP address translation.
+
+Both originals are read twice and cross-checked through indexed page-edge
+samples before mutation. The actual shared `runKeyDatabaseAndSpl()` method
+then clears and copies both payloads, with full CPU and indexed verification,
+before any mailbox store. KDB uses the first window and SPL the second. The
+pinned components are respectively 6,816 and 832 bytes; no later firmware
+component or SOS is started.
+
+Only four mailbox stores are allowed: KDB address and command, then SPL
+address and command. SPL requires a KDB-ready observation from direct protocol
+reads followed by SOS down. Resource-guard reads alone cannot authorize it.
+Each attempt is recorded before its store, so a failed post-store check cannot
+authorize a retry. Readable boot-ready and SOS-down checks precede each store;
+device, framebuffer, console, remap and ownership guards remain active.
+
+After **any mailbox attempt**, including an address-only failure, neither
+window may be written, flushed or restored. Both are preserved until a cold
+reset. Before that boundary, dirty originals may be restored only through a
+valid guarded context and with verification. Selector cleanup is separate and
+may be skipped after context loss. A mailbox attempt or unverified cleanup
+requires a full cold reset. The KDB-only and pair attempt markers exclude each
+other for the lifetime of the provider.
+
+Results use the separate `KdbSpl` property prefix. Schema 8 records a completely
+published two-command ready observation with verified staging and cleanup;
+`Ready` remains false. Refusals or failures retain the earlier console schema.
+If discovery, state or console collection fails before this mode can run,
+that earlier failure is retained and no pair transaction is attempted.
+An unreadable or changed context permanently revokes writes, even if a later
+sample looks valid. The result does not establish authentication, GPU execution,
+display support or Metal acceleration. Repeat attempts require review and a
+cold reset; the ordinary boot configuration should be restored after capture.
 
 ## What the test measures
 
@@ -386,7 +432,7 @@ To remove the survey, restore the saved EFI or remove its Kernel/Add entry,
 bundle, and `cobalt-survey=1` argument. No internal ESP changes are required.
 Remove `cobalt-survey-indexed=1`, `cobalt-survey-state=1` and
 `cobalt-survey-aperture=1`, `cobalt-survey-staging=1`, and
-`cobalt-survey-kdb=1` as well when disabling those experiments.
+`cobalt-survey-kdb=1` and `cobalt-survey-spl=1` as well when disabling those experiments.
 
 ## Build
 

@@ -5,6 +5,7 @@
 #include <iostream>
 
 static unsigned checks = 0;
+static const char *activeTestPhase = "startup";
 #define CHECK(expression) do { ++checks; if (!(expression)) throw std::runtime_error( \
     std::string("line ") + std::to_string(__LINE__) + ": " #expression); } while (0)
 using Bytes = std::vector<uint8_t>;
@@ -16,7 +17,12 @@ static const Bytes &syntheticPspFirmware() {
         const uint32_t payloadOffset = 256;
         const uint32_t kdbBytes = 6816;
         const uint32_t types[] = {3,5,2,7,8,9,10,11,1,4,6};
-        const uint32_t payloadBytes = kdbBytes + 10 * 16;
+        // Keep the pinned container file layout: SPL begins at file offset
+        // 0x66a20 (payload-relative 0x66920), with deterministic synthetic
+        // padding and no real firmware bytes.
+        const uint32_t splPayloadOffset = 0x66920;
+        const uint32_t splBytes = 832;
+        const uint32_t payloadBytes = splPayloadOffset + splBytes + 10 * 16;
         Bytes result(payloadOffset + payloadBytes);
         put32(result, 0, static_cast<uint32_t>(result.size()));
         put32(result, 4, 36); put32(result, 8, 2);
@@ -24,10 +30,11 @@ static const Bytes &syntheticPspFirmware() {
         put32(result, 32, static_cast<uint32_t>(sizeof(types) / sizeof(types[0])));
         uint32_t cursor = 0;
         for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
-            const uint32_t length = i == 0 ? kdbBytes : 16;
+            const uint32_t length = i == 0 ? kdbBytes : types[i] == 5 ? splBytes : 16;
+            if (types[i] == 5) cursor = splPayloadOffset;
             const size_t descriptor = 36 + i * 16;
             put32(result, descriptor, types[i]);
-            put32(result, descriptor + 4, types[i] == 3 ? 0x703b0001u : 0x140200 + types[i]);
+            put32(result, descriptor + 4, types[i] == 3 ? 0x703b0001u : types[i] == 5 ? 0x01003b00u : 0x140200 + types[i]);
             put32(result, descriptor + 8, cursor); put32(result, descriptor + 12, length);
             for (uint32_t n = 0; n < length; ++n)
                 result[payloadOffset + cursor + n] = static_cast<uint8_t>((n * 29u + types[i] * 17u) & 0xffu);
@@ -1334,6 +1341,370 @@ static void kdbTests() {
         CHECK(testState.mapsLive == 0 && testState.openLive == 0 && testState.allocations == 0);
     }
 }
+
+static void kdbSplDevice(Device &d, bool nativeRoute=true) {
+    kdbDevice(d, nativeRoute);
+    testState.splBootPresent = true;
+    testState.splBoot = "1";
+    testState.splAddressByteOffset = testState.kdbAddressByteOffset;
+    testState.splCommandByteOffset = testState.kdbCommandByteOffset;
+}
+static void kdbSplTests() {
+    for (bool nativeRoute : {false, true}) {
+        activeTestPhase = nativeRoute ? "kdbSplTests.native-success" : "kdbSplTests.isolated-success";
+        Device d; kdbSplDevice(d, nativeRoute);
+        bool sawSplWindowWrite = false;
+        testState.onAperture = [&sawSplWindowWrite](const MmioEvent &event) {
+            if (event.operation == 'v' && event.offset >= (1u << 20)) sawSplWindowWrite = true;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "kdb-spl-ready-observed-reset-required");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 8);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSharedApiUsed") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplPhase") == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplAddressWritesIssued") == 2);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCommandWritesIssued") == 2);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplResetRequired") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplStagingPreserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbWindowOffset") == (64ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplWindowOffset") == (65ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbMcAddress") == 0x8004000000ULL);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplMcAddress") == 0x8004100000ULL);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbZeroVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbCopyVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplZeroVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplCopyVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCpuReadBytes") == (8ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCpuReadChunks") == 2048);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplDataReads") == 3072);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSelectorWritesIssued") == 6146);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplVramWritesIssued") == 526200);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplFlushWritesIssued") == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplZeroBytesIssued") == (2ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCopyBytesIssued") == 7648);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplZeroChunksIssued") == 512);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCopyChunksIssued") == 3);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,AccessMode") == "indexed-and-kdb-spl-commands");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplFlushRoute") == (nativeRoute ? "native-nbif" : "isolated-remap"));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbPayloadBytes") == 6816);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplPayloadBytes") == 832);
+        CHECK(testState.kdbWrites == 2 && testState.splWrites == 2);
+        CHECK(testState.kdbEvents.size() == 2 && testState.splEvents.size() == 2);
+        CHECK(testState.kdbEvents[1].value == 0x80000);
+        CHECK(testState.splEvents[1].value == 0x10000000);
+        CHECK(testState.apertureCpuWrites == 526200);
+        CHECK(sawSplWindowWrite);
+        CHECK(testState.apertureFlushWrites == 4);
+        CHECK(testState.apertureCpuReads == 2097152);
+        CHECK(testState.apertureDataReads == 3072);
+        CHECK(testState.selectorWrites == 11270);
+        uint32_t kdbFirst = 0, splFirst = 0;
+        const auto firmware = cobalt::survey::psp1402Firmware();
+        std::memcpy(&kdbFirst, firmware.data + 256, sizeof(kdbFirst));
+        std::memcpy(&splFirst, firmware.data + 0x66a20, sizeof(splFirst));
+        CHECK(testState.apertureGpu[0] == kdbFirst);
+        CHECK(testState.splGpu[0] == splFirst);
+        CHECK(testState.apertureGpu[6816 / 4] == 0);
+        CHECK(testState.splGpu[832 / 4] == 0);
+        bool kdbImageMatches = true, splImageMatches = true;
+        for (size_t word = 0; word < testState.apertureCpu.size(); ++word) {
+            uint32_t expectedKdb = 0, expectedSpl = 0;
+            if (word * 4 < 6816) std::memcpy(&expectedKdb, firmware.data + 256 + word * 4, 4);
+            if (word * 4 < 832) std::memcpy(&expectedSpl, firmware.data + 0x66a20 + word * 4, 4);
+            kdbImageMatches = kdbImageMatches && testState.apertureCpu[word] == expectedKdb &&
+                testState.apertureGpu[word] == expectedKdb;
+            splImageMatches = splImageMatches && testState.splCpu[word] == expectedSpl &&
+                testState.splGpu[word] == expectedSpl;
+        }
+        CHECK(kdbImageMatches && splImageMatches);
+        CHECK(d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    {
+        activeTestPhase = "kdbSplTests.busy-ready-success";
+        Device d; kdbSplDevice(d);
+        unsigned protocolStage = 0, stageSleepBaseline = 0;
+        const auto armStage = [&protocolStage, &stageSleepBaseline](const TestState::KdbEvent &event, unsigned stage) {
+            if (event.offset == testState.kdbCommandByteOffset) {
+                protocolStage = stage;
+                stageSleepBaseline = testState.sleepCalls;
+            }
+        };
+        testState.onKdb = [&armStage](const TestState::KdbEvent &event) { armStage(event, 1); };
+        testState.onSpl = [&armStage](const TestState::KdbEvent &event) { armStage(event, 2); };
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &protocolStage, &stageSleepBaseline](uint32_t offset, uint32_t value) {
+            if (protocolStage && offset == 0x458c && testState.sleepCalls - stageSleepBaseline < 2) return 0u;
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "kdb-spl-ready-observed-reset-required");
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbReadyObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplReadyObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplAddressWritesIssued") == 2);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCommandWritesIssued") == 2);
+        CHECK(testState.sleepCalls >= stageSleepBaseline + 2);
+        CHECK(testState.kdbWrites == 2 && testState.splWrites == 2);
+        CHECK(testState.apertureCpuWrites == 526200 && testState.apertureFlushWrites == 4);
+    }
+    for (unsigned failedStore = 1; failedStore <= 4; ++failedStore) {
+        Device d; kdbSplDevice(d); unsigned stores = 0;
+        const auto loseAt = [&d, failedStore, &stores](const TestState::KdbEvent &) {
+            if (++stores == failedStore) d.pci.command = 0;
+        };
+        testState.onKdb = loseAt; testState.onSpl = loseAt;
+        d.run("discovery-snapshot-validated");
+        CHECK(stores == failedStore);
+        CHECK(testState.kdbWrites + testState.splWrites == failedStore);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplResetRequired") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplContextLost") == 1);
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplVramCleanup") == "preserved-until-cold-reset");
+        CHECK(testState.apertureCpuWrites == 526200 && testState.apertureFlushWrites == 4);
+        CHECK(testState.openLive == 0 && testState.mapsLive == 0 && testState.allocations == 0);
+    }
+    {
+        // A single direct boot-ready read reports busy after the SPL address.
+        // The next simulated sample is ready again, but context loss is sticky.
+        Device d; kdbSplDevice(d); bool armed = false, injected = false; unsigned afterSplAddress = 0;
+        const auto read = testState.stateRead;
+        testState.onSpl = [&armed](const TestState::KdbEvent &event) {
+            if (event.offset == testState.splAddressByteOffset) armed = true;
+        };
+        testState.stateRead = [read, &armed, &injected, &afterSplAddress](uint32_t offset, uint32_t value) {
+            const uint32_t actual = read(offset, value);
+            if (armed && offset == 0x458c && !injected) {
+                if (++afterSplAddress == 3) { injected = true; return 0u; }
+            }
+            return actual;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(injected);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplContextLost") == 1);
+        CHECK(testState.kdbWrites + testState.splWrites == 3);
+        CHECK(testState.apertureCpuWrites == 526200 && testState.apertureFlushWrites == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCommandWritesIssued") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+        CHECK(testState.openLive == 0 && testState.mapsLive == 0 && testState.allocations == 0);
+    }
+    {
+        // An unreadable direct SOS sample after the SPL address also latches
+        // context loss and prevents its command store.
+        Device d; kdbSplDevice(d); bool armed = false, injected = false; unsigned afterSplAddress = 0;
+        const auto read = testState.stateRead;
+        testState.onSpl = [&armed](const TestState::KdbEvent &event) {
+            if (event.offset == testState.splAddressByteOffset) armed = true;
+        };
+        testState.stateRead = [read, &armed, &injected, &afterSplAddress](uint32_t offset, uint32_t value) {
+            const uint32_t actual = read(offset, value);
+            if (armed && offset == 0x4644 && !injected && ++afterSplAddress == 5) {
+                injected = true; return UINT32_MAX;
+            }
+            return actual;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(injected);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplContextLost") == 1);
+        CHECK(testState.kdbWrites + testState.splWrites == 3);
+        CHECK(testState.apertureCpuWrites == 526200 && testState.apertureFlushWrites == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+    }
+    {
+        // If KDB never returns ready, SPL must not be attempted.
+        activeTestPhase = "kdbSplTests.kdb-timeout";
+        Device d; kdbSplDevice(d); bool commandSent = false, sawGuardReady = false, sawDirectBusy = false;
+        unsigned afterCommandReads = 0;
+        testState.onKdb = [&commandSent](const TestState::KdbEvent &event) {
+            if (event.offset == testState.kdbCommandByteOffset) commandSent = true;
+        };
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &commandSent, &afterCommandReads, &sawGuardReady, &sawDirectBusy](uint32_t offset, uint32_t value) {
+            if (commandSent && offset == 0x458c) {
+                if (++afterCommandReads % 3 == 0) { sawDirectBusy = true; return 0u; }
+                sawGuardReady = true;
+            }
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(commandSent);
+        CHECK(sawGuardReady && sawDirectBusy);
+        CHECK(testState.kdbWrites == 2 && testState.splWrites == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbCommandAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplAddressAttempted") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+        CHECK(testState.apertureCpuWrites == 526200 && testState.apertureFlushWrites == 4);
+    }
+    {
+        activeTestPhase = "kdbSplTests.spl-timeout";
+        Device d; kdbSplDevice(d); bool splCommandSent = false; unsigned protocolReads = 0;
+        testState.onSpl = [&splCommandSent](const TestState::KdbEvent &event) {
+            if (event.offset == testState.splCommandByteOffset) splCommandSent = true;
+        };
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &splCommandSent, &protocolReads](uint32_t offset, uint32_t value) {
+            if (splCommandSent && offset == 0x458c) { ++protocolReads; return 0u; }
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(splCommandSent && protocolReads >= 3);
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "kdb-spl-protocol-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbReadyObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplReadyObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplAddressWritesIssued") == 2);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplCommandWritesIssued") == 2);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplResetRequired") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+        CHECK(testState.kdbWrites == 2 && testState.splWrites == 2);
+        CHECK(testState.apertureCpuWrites == 526200 && testState.apertureFlushWrites == 4);
+    }
+    {
+        // Preparation failure after modifying KDB but before any mailbox store
+        // must restore the dirty window while the guarded context is intact.
+        Device d; kdbSplDevice(d);
+        testState.apertureCpuRead = [](unsigned read, uint32_t value) {
+            return read == 1572864 ? value ^ 1u : value;
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.kdbWrites == 0 && testState.splWrites == 0);
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1") || d.service.numbers.at("CobaltSurvey,KdbSplAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == (2ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplKdbRestoreVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplSplRestoreVerified") == 1);
+        CHECK(testState.apertureCpuWrites == 262144 + (6816 / 4) + 262144 + 524288);
+        CHECK(testState.apertureFlushWrites == 5);
+        CHECK(testState.apertureCpu == std::vector<uint32_t>(262144, 0xabc01234));
+        CHECK(testState.splCpu == std::vector<uint32_t>(262144, 0xdef05678));
+        CHECK(testState.apertureGpu == testState.apertureCpu);
+        CHECK(testState.splGpu == testState.splCpu);
+    }
+    {
+        Device d; kdbSplDevice(d); bool changed = false;
+        testState.onAperture = [&d, &changed](const MmioEvent &event) {
+            if (!changed && event.operation == 'v' && testState.apertureCpuWrites == 1024) {
+                changed = true; d.pci.command = 0;
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(changed && d.service.numbers.at("CobaltSurvey,KdbSplContextLost") == 1);
+        CHECK(testState.kdbWrites == 0 && testState.splWrites == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,KdbSplRestoreBytesIssued") == 0);
+        CHECK(testState.apertureCpuWrites == 1024 && testState.apertureFlushWrites == 0);
+    }
+    {
+        Device d; kdbSplDevice(d); testState.boot = "0";
+        CHECK(!d.service.start(&d.pci));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.kdbWrites == 0 && testState.splWrites == 0);
+    }
+    {
+        activeTestPhase = "kdbSplTests.indexed-gate";
+        Device d; kdbSplDevice(d); testState.indexedBoot = "0";
+        d.run("discovery-aperture-too-small");
+        CHECK(!d.service.strings.count("CobaltSurvey,KdbSplStatus"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        CHECK(testState.kdbWrites == 0 && testState.splWrites == 0);
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+    }
+    for (unsigned missing = 0; missing < 4; ++missing) {
+        Device d; kdbSplDevice(d);
+        if (missing == 0) testState.stateBoot = "0";
+        if (missing == 1) testState.apertureBoot = "0";
+        if (missing == 2) testState.stagingBoot = "0";
+        if (missing == 3) testState.kdbBoot = "0";
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.kdbWrites == 0 && testState.splWrites == 0);
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(!d.service.strings.count("CobaltSurvey,KdbStatus"));
+    }
+    {
+        Device d; kdbSplDevice(d);
+        const auto read = testState.stateRead;
+        testState.stateRead = [read](uint32_t offset, uint32_t value) {
+            return offset == 0xa954 ? 0x83f0u : read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "window-plan-refused");
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+    }
+    {
+        Device d; kdbSplDevice(d); testState.splBoot = "0";
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.strings.count("CobaltSurvey,KdbSplStatus"));
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "kdb-ready-observed-reset-required");
+        CHECK(d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+    }
+    {
+        Device d; kdbSplDevice(d); testState.failAllocationCall = 3;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "kdb-spl-allocation-failed");
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(testState.allocations == 0 && testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+    }
+    {
+        Device d; kdbSplDevice(d);
+        d.vram.onMap = [&d] { if (d.vram.requests == 2) d.vram.mapFail = true; };
+        d.run("discovery-snapshot-validated");
+        if (d.service.strings.at("CobaltSurvey,KdbSplStatus") != "kdb-spl-map-failed")
+            throw std::runtime_error("map status=" + d.service.strings.at("CobaltSurvey,KdbSplStatus") +
+                " vram requests=" + std::to_string(d.vram.requests) + " all maps=" + std::to_string(testState.mapRequests));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+    }
+    {
+        Device d; kdbSplDevice(d); Bytes malformed = syntheticPspFirmware();
+        put32(malformed, 56, 0xdeadbeefu);
+        firmwareOverride = {malformed.data(), malformed.size()};
+        d.run("discovery-snapshot-validated");
+        firmwareOverride = {};
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "firmware-package-invalid");
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+    }
+    {
+        Device d; kdbSplDevice(d); d.pci.numbers["CobaltSurvey,KdbAttempt-v1"] = 1;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "already-attempted");
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+    }
+    {
+        activeTestPhase = "kdbSplTests.reciprocal-marker";
+        Device d; kdbSplDevice(d); testState.splBoot = "0";
+        d.pci.numbers["CobaltSurvey,KdbSplAttempt-v1"] = 1;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,KdbStatus") == "already-attempted");
+        CHECK(!d.service.strings.count("CobaltSurvey,KdbSplStatus"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,KdbAttempt-v1"));
+        CHECK(testState.kdbWrites == 0 && testState.splWrites == 0);
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+    }
+    {
+        Device d; kdbSplDevice(d);
+        testState.onAperturePublication = [&d](const std::string &key) {
+            if (key == "CobaltSurvey,KdbSplStatus") {
+                d.service.numbers["CobaltSurvey,Schema"] = 8;
+                testState.propertyFailKey = "CobaltSurvey,Schema";
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.numbers.count("CobaltSurvey,Schema"));
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,KdbSplStatus") == "metadata-publication-failed");
+        CHECK(d.pci.getProperty("CobaltSurvey,KdbSplAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+}
 static const std::string &apertureStatus(const Device &d) {
     return d.service.strings.at("CobaltSurvey,ApertureStatus");
 }
@@ -2096,16 +2467,31 @@ int main(int argc, char **argv) {
             std::cout << "CobaltNavi44Survey KDB host checks passed: " << checks << "\n";
             return 0;
         }
-        gates(); pciGuards(); mappingFailures(); memsizeGuards(); apertureGuards();
-        revalidation(); parserAndPublication();
-        indexedGatesAndPreflight(); indexedExactTransfer(); indexedFaults(); passiveState(); passiveConsoleTests();
-        apertureTests();
-        nativeApertureTests();
-        stagingTests();
-        kdbTests();
+        if (argc == 2 && std::string(argv[1]) == "--spl-only") {
+            kdbSplTests();
+            std::cout << "CobaltNavi44Survey KDB-to-SPL host checks passed: " << checks << "\n";
+            return 0;
+        }
+        activeTestPhase = "gates"; gates();
+        activeTestPhase = "pciGuards"; pciGuards();
+        activeTestPhase = "mappingFailures"; mappingFailures();
+        activeTestPhase = "memsizeGuards"; memsizeGuards();
+        activeTestPhase = "apertureGuards"; apertureGuards();
+        activeTestPhase = "revalidation"; revalidation();
+        activeTestPhase = "parserAndPublication"; parserAndPublication();
+        activeTestPhase = "indexedGatesAndPreflight"; indexedGatesAndPreflight();
+        activeTestPhase = "indexedExactTransfer"; indexedExactTransfer();
+        activeTestPhase = "indexedFaults"; indexedFaults();
+        activeTestPhase = "passiveState"; passiveState();
+        activeTestPhase = "passiveConsoleTests"; passiveConsoleTests();
+        activeTestPhase = "apertureTests"; apertureTests();
+        activeTestPhase = "nativeApertureTests"; nativeApertureTests();
+        activeTestPhase = "stagingTests"; stagingTests();
+        activeTestPhase = "kdbTests"; kdbTests();
+        activeTestPhase = "kdbSplTests"; kdbSplTests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
-        std::cerr << e.what() << "\n"; return 1;
+        std::cerr << "phase=" << activeTestPhase << ": " << e.what() << "\n"; return 1;
     }
     return 0;
 }
