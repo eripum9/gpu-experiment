@@ -515,7 +515,11 @@ static void keyDatabaseSplAndSysTests(const Bytes &good) {
     for(unsigned slot=0;slot<9;++slot)for(unsigned field=0;field<3;++field) {
         Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
         n48::SubBin *slots[]={&p.kdb,&p.spl,&p.sys,&p.soc,&p.intf,&p.dbg,&p.ras,&p.ipkey,&p.sos};
-        if(field==0)++slots[slot]->data;if(field==1)++slots[slot]->size;if(field==2)++slots[slot]->version;
+        // Optional images may be absent in a real package. Inject a valid but
+        // incorrect source pointer instead of doing arithmetic on nullptr.
+        if(field==0)slots[slot]->data=slots[slot]->data?slots[slot]->data+1:good.data();
+        if(field==1)++slots[slot]->size;
+        if(field==2)++slots[slot]->version;
         const size_t reads=b.events.size();CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));
         CHECK(b.events.size()==reads);noWrites(b);consumedTriple(p,b);
     }
@@ -618,6 +622,13 @@ int main(int argc,char **argv) {
         prerequisiteTests();addressTests();unreadableSosTests();protocolTests(package());protocolTests(package(false));keyDatabaseTests(package());
         keyDatabaseAndSplPrerequisites();keyDatabaseAndSplTests(package());
         keyDatabaseSplAndSysTests(package());
+        // Exercise missing optional images before downloading real firmware,
+        // so sanitizers also cover this case in the first offline CI step.
+        auto withoutSoc=package();put32(withoutSoc,36+3*16,0);
+        cobalt::psp::Package optionalFixture{};
+        CHECK(cobalt::psp::parse(withoutSoc.data(),withoutSoc.size(),optionalFixture));
+        CHECK(optionalFixture.part[cobalt::psp::SocDrv].data==nullptr);
+        keyDatabaseSplAndSysTests(withoutSoc);
         for(int i=1;i<argc;++i) {
             std::ifstream f(argv[i],std::ios::binary);CHECK(f.good());
             const Bytes bytes((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
