@@ -69,3 +69,32 @@ without further CPU writes or flushes until a cold reset. Direct protocol
 reads must observe KDB ready followed by SOS down before SPL is allowed;
 resource-guard reads cannot advance that phase. These guards do not establish
 an exclusive allocation or verified PSP translation for either window.
+
+## Offline KDB, SPL and SYS_DRV checkpoint
+
+`runKeyDatabaseSplAndSys(splOffset, sysOffset)` is the next protocol-only
+checkpoint. The 0.8.0 survey does not call it; its hardware adapter, flags,
+version and two-window policy remain unchanged.
+
+It requires three complete, aligned, pairwise-disjoint 1 MiB staging windows.
+The configured `fw_pri` window holds KDB; the other two hold SPL and SYS_DRV.
+All source views and address bounds are validated before any write, consuming
+the same fresh, one-use preflight authorization as the other run methods even
+on refusal. All three clears and exact component copies finish before the
+first mailbox attempt.
+
+The permitted sequence is KDB `0x00080000`, SPL `0x10000000`, then SYS_DRV
+`0x00010000`, each with its own address and a bounded bootloader-ready wait.
+Direct readable ready and SOS-down observations precede each staging or
+mailbox write. Completion polling permits busy-to-ready, while an unreadable
+observation or failed guard aborts. There are no VRAM writes after any mailbox
+attempt, no retries, and no SOC_DRV, later component or SOS startup.
+
+In the pinned PSP 14.0.2 package, SYS_DRV is descriptor type 2, version
+`0x003b0f0d`, size 78,272 bytes, at file offset `0x1ba0`. Its place after SPL
+and command follow the same pinned Linux v6.19 implementation cited above.
+Three ready observations would establish only this bounded protocol result.
+A future hardware adapter must separately establish three-window placement,
+mapping, ownership, visibility, preservation and provider-lifetime guards.
+This API supplies none of those hardware proofs and does not establish
+firmware authentication, GPU execution or graphics acceleration.

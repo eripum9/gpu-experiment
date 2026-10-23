@@ -24,6 +24,7 @@ using Bytes=std::vector<uint8_t>;
 static constexpr uint32_t kReady=0x80000000, kSosCmd=0x20000, kAddressReg=0x64, kCommandReg=0x63, kSosReg=0x91;
 static constexpr uint64_t kOffset=32ULL<<20;
 static constexpr uint64_t kSplOffset=kOffset+n48::PspLoader::kFwPriSize;
+static constexpr uint64_t kSysOffset=kSplOffset+n48::PspLoader::kFwPriSize;
 static void put32(Bytes &b,size_t off,uint32_t value) { for(unsigned n=0;n<4;++n)b[off+n]=uint8_t(value>>(8*n)); }
 static Bytes package(bool all=true, unsigned oversizeType=0) {
     const std::vector<uint32_t> types=all ? std::vector<uint32_t>{3,5,2,7,8,9,10,11,1,4,6} : std::vector<uint32_t>{2,1};
@@ -48,11 +49,13 @@ struct Bus final:n48::HwAccess {
     unsigned commandReads=0;
     unsigned solDelay=0;
     bool issuedSos=false;
-    bool dualWindow=false, mailboxAttempted=false;
+	bool dualWindow=false, tripleWindow=false, mailboxAttempted=false;
     uint64_t splOffset=kSplOffset;
+	uint64_t sysOffset=kSysOffset;
     std::vector<Event> events;
     Bytes window=Bytes(n48::PspLoader::kFwPriSize,0xa5);
     Bytes splWindow=Bytes(n48::PspLoader::kFwPriSize,0xa5);
+    Bytes sysWindow=Bytes(n48::PspLoader::kFwPriSize,0xa5);
     std::function<uint32_t(unsigned,uint32_t)> onSolRead;
     std::function<uint32_t(unsigned,uint32_t)> onCommandRead;
     uint32_t regReadIp(uint16_t h,uint8_t inst,uint8_t seg,uint32_t reg) override {
@@ -89,19 +92,19 @@ struct Bus final:n48::HwAccess {
         return true;
     }
     bool vramWrite(uint64_t off,const void *src,size_t len) override {
-        CHECK(!dualWindow || !mailboxAttempted);
-        CHECK(off==expectedOffset || (dualWindow && off==splOffset));CHECK(src && len && len<=window.size());
+		CHECK((!dualWindow && !tripleWindow) || !mailboxAttempted);
+		CHECK(off==expectedOffset || ((dualWindow || tripleWindow) && off==splOffset) || (tripleWindow && off==sysOffset));CHECK(src && len && len<=window.size());
         const bool permitted=allow('C',off,0,len);
         events.back().source=src;
         if(!permitted)return false;
-        auto &target=off==expectedOffset?window:splWindow;
+		auto &target=off==expectedOffset?window:off==splOffset?splWindow:sysWindow;
         std::memcpy(target.data(),src,len);return true;
     }
     bool vramMemset(uint64_t off,uint8_t value,size_t len) override {
-        CHECK(!dualWindow || !mailboxAttempted);
-        CHECK(off==expectedOffset || (dualWindow && off==splOffset));CHECK(value==0 && len==window.size());
+		CHECK((!dualWindow && !tripleWindow) || !mailboxAttempted);
+		CHECK(off==expectedOffset || ((dualWindow || tripleWindow) && off==splOffset) || (tripleWindow && off==sysOffset));CHECK(value==0 && len==window.size());
         if(!allow('Z',off,value,len))return false;
-        auto &target=off==expectedOffset?window:splWindow;
+		auto &target=off==expectedOffset?window:off==splOffset?splWindow:sysWindow;
         std::fill(target.begin(),target.end(),value);return true;
     }
     std::vector<Event> writeEvents() const { std::vector<Event> out;for(const auto &e:events)if(e.op!='R')out.push_back(e);return out; }
@@ -438,6 +441,162 @@ static void keyDatabaseAndSplTests(const Bytes &good) {
         consumed(p,b);
     }
 }
+static void consumedTriple(n48::PspLoader &p,const Bus &b) {
+    const size_t count=b.events.size();
+    CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));
+    CHECK(!p.runKeyDatabaseAndSpl(kSplOffset));CHECK(!p.runKeyDatabase());CHECK(!p.runChain());
+    CHECK(b.events.size()==count);
+}
+static void checkTriple(const Bus &b,const Bytes &source) {
+    cobalt::psp::Package pkg{};CHECK(cobalt::psp::parse(source.data(),source.size(),pkg));
+    const auto events=b.writeEvents();CHECK(events.size()==12);
+    const uint32_t parts[]={cobalt::psp::Kdb,cobalt::psp::Spl,cobalt::psp::SysDrv};
+    const uint64_t offsets[]={b.expectedOffset,b.splOffset,b.sysOffset};
+    const Bytes *windows[]={&b.window,&b.splWindow,&b.sysWindow};
+    for(unsigned i=0;i<3;++i) {
+        const auto &bin=pkg.part[parts[i]];
+        CHECK(bin.data && bin.size);
+        CHECK(events[i*2].op=='Z' && events[i*2].offset==offsets[i] && events[i*2].size==n48::PspLoader::kFwPriSize);
+        CHECK(events[i*2+1].op=='C' && events[i*2+1].offset==offsets[i] && events[i*2+1].size==bin.size && events[i*2+1].source==bin.data);
+        CHECK(std::equal(windows[i]->begin(),windows[i]->begin()+bin.size,bin.data));
+        CHECK(std::all_of(windows[i]->begin()+bin.size,windows[i]->end(),[](uint8_t v){return v==0;}));
+    }
+    const uint32_t commands[]={0x80000,0x10000000,0x10000};
+    for(unsigned i=0;i<3;++i) {
+        const auto &address=events[6+i*2], &command=events[7+i*2];
+        CHECK(address.op=='W' && address.offset==kAddressReg && address.value==(((uint64_t(b.base)<<24)+offsets[i])>>20));
+        CHECK(command.op=='W' && command.offset==kCommandReg && command.value==commands[i]);
+    }
+    CHECK(!b.issuedSos);
+}
+static void keyDatabaseSplAndSysTests(const Bytes &good) {
+    { Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
+      CHECK(p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));checkTriple(b,good);
+      CHECK(std::string(p.lastStep())=="SYS_DRV");CHECK(p.lastBootloaderStatus()==kReady);consumedTriple(p,b); }
+    // The three windows may occupy any of six aligned, disjoint layouts.
+    for(unsigned permutation=0;permutation<6;++permutation) {
+        const uint64_t positions[]={0,n48::PspLoader::kFwPriSize,2ULL*n48::PspLoader::kFwPriSize};
+        static const unsigned perms[6][3]={{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+        Bus b;b.tripleWindow=true;b.expectedOffset=kOffset+positions[perms[permutation][0]];
+        b.splOffset=kOffset+positions[perms[permutation][1]];b.sysOffset=kOffset+positions[perms[permutation][2]];
+        n48::PspLoader p(b);prepare(p,good,b.expectedOffset);
+        CHECK(p.runKeyDatabaseSplAndSys(b.splOffset,b.sysOffset));checkTriple(b,good);
+    }
+    // Adjacent windows and windows ending exactly at the posted top are valid.
+    { Bus b;b.tripleWindow=true;b.expectedOffset=0;b.splOffset=n48::PspLoader::kFwPriSize;
+      b.sysOffset=2ULL*n48::PspLoader::kFwPriSize;n48::PspLoader p(b);prepare(p,good,0);
+      CHECK(p.runKeyDatabaseSplAndSys(b.splOffset,b.sysOffset));checkTriple(b,good); }
+    { Bus b;b.tripleWindow=true;const uint64_t end=(uint64_t(b.top+1-b.base)<<24);
+      b.expectedOffset=end-3ULL*n48::PspLoader::kFwPriSize;b.splOffset=end-2ULL*n48::PspLoader::kFwPriSize;
+      b.sysOffset=end-n48::PspLoader::kFwPriSize;n48::PspLoader p(b);prepare(p,good,b.expectedOffset);
+      CHECK(p.runKeyDatabaseSplAndSys(b.splOffset,b.sysOffset));checkTriple(b,good); }
+    const uint64_t invalid[][2]={{kOffset,kSysOffset},{kOffset+1,kSysOffset},{kSplOffset,kSplOffset},
+        {kOffset,kOffset},{kSysOffset,kSysOffset},{kSysOffset+1,kSplOffset},
+        {UINT64_MAX,kSysOffset},{UINT64_MAX&~uint64_t(n48::PspLoader::kFwPriSize-1),kSysOffset},
+        {1ULL<<52,kSysOffset},{(uint64_t(0x83fb+1-0x8000)<<24),kSysOffset},
+        {kSplOffset,kOffset},{kSplOffset,kOffset+1},{kSplOffset,kSplOffset},
+        {kOffset,kOffset},{kOffset,kSysOffset+1},
+        {kSplOffset,UINT64_MAX},{kSplOffset,UINT64_MAX&~uint64_t(n48::PspLoader::kFwPriSize-1)},
+        {kSplOffset,1ULL<<52},{kSplOffset,(uint64_t(0x83fb+1-0x8000)<<24)}};
+    for(const auto &pair:invalid) {
+        Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);const auto reads=b.events.size();
+        CHECK(!p.runKeyDatabaseSplAndSys(pair[0],pair[1]));CHECK(b.events.size()==reads);noWrites(b);consumedTriple(p,b);
+    }
+    if(good.size()==432) {
+        for(unsigned descriptor:{0u,1u}) {
+            auto source=good;put32(source,36+descriptor*16,0);
+            Bus b;b.tripleWindow=true;n48::PspLoader p(b);parsed(p,source);CHECK(p.setFwPriOffset(kOffset));
+            CHECK(p.preflight());const auto reads=b.events.size();CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));
+            CHECK(b.events.size()==reads);noWrites(b);
+        }
+        auto source=good;put32(source,36+2*16,0);Bus b;n48::PspLoader p(b);
+        CHECK(!p.parseContainer(source.data(),source.size()));CHECK(!p.preflight());noWrites(b);
+    }
+    for(unsigned slot=0;slot<9;++slot)for(unsigned field=0;field<3;++field) {
+        Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
+        n48::SubBin *slots[]={&p.kdb,&p.spl,&p.sys,&p.soc,&p.intf,&p.dbg,&p.ras,&p.ipkey,&p.sos};
+        if(field==0)++slots[slot]->data;if(field==1)++slots[slot]->size;if(field==2)++slots[slot]->version;
+        const size_t reads=b.events.size();CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));
+        CHECK(b.events.size()==reads);noWrites(b);consumedTriple(p,b);
+    }
+    // Every one of the twelve mutating calls is a terminal prefix on failure.
+    Bus reference;reference.tripleWindow=true;n48::PspLoader success(reference);prepare(success,good);
+    CHECK(success.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));checkTriple(reference,good);
+    for(unsigned fail=1;fail<=12;++fail) {
+        Bus b;b.tripleWindow=true;b.failWrite=fail;n48::PspLoader p(b);prepare(p,good);
+        CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));CHECK(b.writes==fail);
+        const auto actual=b.writeEvents(),expected=reference.writeEvents();CHECK(actual.size()==fail);
+        for(unsigned i=0;i<fail;++i) {
+            CHECK(actual[i].op==expected[i].op && actual[i].offset==expected[i].offset &&
+                actual[i].value==expected[i].value && actual[i].size==expected[i].size && actual[i].source==expected[i].source);
+        }
+        consumedTriple(p,b);
+    }
+    // Direct ready reads followed by SOS-down reads immediately before each mutation
+    // abort on busy or unreadable, independently of the polling reads.
+    unsigned cmdRead=0,guardTargets=0;
+    for(size_t i=0;i+2<reference.events.size();++i) {
+        if(reference.events[i].op=='R' && reference.events[i].offset==kCommandReg)++cmdRead;
+        if(reference.events[i].op!='R' || reference.events[i].offset!=kCommandReg ||
+           reference.events[i+1].op!='R' || reference.events[i+1].offset!=kSosReg ||
+           reference.events[i+2].op=='R')continue;
+        ++guardTargets;
+        const unsigned target=cmdRead;
+        for(uint32_t state:{0u,UINT32_MAX}) {
+            Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
+            b.onCommandRead=[target,state](unsigned at,uint32_t value){return at==target?state:value;};
+            CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));
+            CHECK(b.commandReads==target);CHECK(b.writes==writesBeforeRead(reference,kCommandReg,target));
+            CHECK(!p.runChain());
+        }
+    }
+    CHECK(guardTargets==12);
+    // Strict SOS-down checks around preparation, all staging and every dispatch.
+    unsigned sosRead=0;
+    for(size_t i=0;i<reference.events.size();++i) {
+        if(reference.events[i].op!='R' || reference.events[i].offset!=kSosReg)continue;
+        const unsigned target=++sosRead;
+        if(target<=1)continue; // The one preflight SOS read occurs before callback installation.
+        for(uint32_t state:{0x55u,UINT32_MAX}) {
+            Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
+            b.onSolRead=[target,state](unsigned at,uint32_t value){return at==target?state:value;};
+            CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));CHECK(b.solReads==target);
+            CHECK(b.writes==writesBeforeRead(reference,kSosReg,target));CHECK(!p.runChain());
+        }
+    }
+    // Strict completion polls must stop on the first all-ones status read.
+    for(unsigned phase=2;phase<=reference.commandReads;++phase) {
+        Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
+        b.onCommandRead=[phase](unsigned at,uint32_t value){return at==phase?UINT32_MAX:value;};
+        CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));CHECK(b.commandReads==phase);
+        CHECK(b.writes==writesBeforeRead(reference,kCommandReg,phase));CHECK(p.lastBootloaderStatus()==UINT32_MAX);
+    }
+    // Initial and each completion wait may transition from busy to ready.
+    { Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);bool initial=false,kdb=false,spl=false,sys=false;
+      b.onCommandRead=[&](unsigned,uint32_t value){bool *seen=b.writes==0?&initial:b.writes==8?&kdb:
+          b.writes==10?&spl:b.writes==12?&sys:nullptr;if(seen && !*seen){*seen=true;return 0u;}return value;};
+      CHECK(p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));CHECK(initial&&kdb&&spl&&sys);checkTriple(b,good); }
+    // Shared authorization is consumed by every entry point, after success and refusal.
+    for(unsigned first=0;first<4;++first) {
+        Bus b;b.tripleWindow=first!=0;n48::PspLoader p(b);prepare(p,good);
+        const bool result=first==0?p.runChain():first==1?p.runKeyDatabase():first==2?
+            p.runKeyDatabaseAndSpl(kSplOffset):p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset);
+        CHECK(result);const size_t count=b.events.size();consumedTriple(p,b);CHECK(b.events.size()==count);
+    }
+    for(unsigned first=0;first<4;++first) {
+        Bus b;b.dualWindow=first==2;b.tripleWindow=first==3;n48::PspLoader p(b);prepare(p,good);b.failWrite=1;
+        const bool result=first==0?p.runChain():first==1?p.runKeyDatabase():first==2?
+            p.runKeyDatabaseAndSpl(kSplOffset):p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset);
+        CHECK(!result);b.failWrite=0;consumedTriple(p,b);
+    }
+    // Completion timeouts stop after the relevant command, without later mailbox writes.
+    for(unsigned threshold:{6u,8u,10u,12u}) {
+        Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
+        b.onCommandRead=[&b,threshold](unsigned,uint32_t value){return b.writes>=threshold?0u:value;};
+        CHECK(!p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));CHECK(b.writes==threshold);
+        CHECK(!p.runChain());
+    }
+}
 static void unreadableSosTests() {
     const auto good=package(false);
     { Bus b;b.sol=UINT32_MAX;n48::PspLoader p(b);parsed(p,good);CHECK(p.setFwPriOffset(kOffset));
@@ -458,6 +617,7 @@ int main(int argc,char **argv) {
     try {
         prerequisiteTests();addressTests();unreadableSosTests();protocolTests(package());protocolTests(package(false));keyDatabaseTests(package());
         keyDatabaseAndSplPrerequisites();keyDatabaseAndSplTests(package());
+        keyDatabaseSplAndSysTests(package());
         for(int i=1;i<argc;++i) {
             std::ifstream f(argv[i],std::ios::binary);CHECK(f.good());
             const Bytes bytes((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
@@ -466,8 +626,10 @@ int main(int argc,char **argv) {
                 const auto &spl=pinned.part[cobalt::psp::Spl], &kdb=pinned.part[cobalt::psp::Kdb];
                 CHECK(spl.version==0x01003b00 && spl.size==832 && spl.data-bytes.data()==0x66a20);
                 CHECK(kdb.size==6816 && kdb.data-bytes.data()==256);
+                const auto &sys=pinned.part[cobalt::psp::SysDrv];
+                CHECK(sys.version==0x003b0f0d && sys.size==78272 && sys.data-bytes.data()==0x1ba0);
             }
-            protocolTests(bytes);keyDatabaseTests(bytes);keyDatabaseAndSplTests(bytes);
+            protocolTests(bytes);keyDatabaseTests(bytes);keyDatabaseAndSplTests(bytes);keyDatabaseSplAndSysTests(bytes);
             std::printf("Validated actual PSP protocol with package: %s\n",argv[i]);
         }
         std::printf("Actual PSP loader protocol checks passed: %u\n",checks);

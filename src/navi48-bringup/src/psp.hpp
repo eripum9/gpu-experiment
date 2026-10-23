@@ -92,7 +92,7 @@ public:
 	// not claim authentication, GPU execution, or MC mapping correctness.
 	bool runKeyDatabase();
 
-	// Offline bounded protocol checkpoint: prepare KDB at fwPriOffset() and SPL
+	// Bounded protocol checkpoint: prepare KDB at fwPriOffset() and SPL
 	// at splOffset in distinct, complete 1 MiB windows before either mailbox is
 	// attempted. Both windows must remain reserved and preserved through cold reset;
 	// the caller establishes their mapping, ownership, and globally visible writes.
@@ -100,6 +100,14 @@ public:
 	// KDB then SPL commands issued and ready observed with SOS down throughout;
 	// this does not establish authentication, execution, or MC mapping correctness.
 	bool runKeyDatabaseAndSpl(uint64_t splOffset);
+
+	// Offline, unwired SYS_DRV checkpoint. The caller must own, map, and reserve
+	// all three complete windows (KDB at fwPriOffset(), SPL at splOffset, SYS_DRV
+	// at sysOffset) and preserve them until cold reset. Consumes the shared fresh
+	// preflight even on refusal. Stops after KDB, SPL, and SYS_DRV each report
+	// bootloader-ready with SOS down; this does not establish authentication,
+	// execution, or MC mapping correctness.
+	bool runKeyDatabaseSplAndSys(uint64_t splOffset, uint64_t sysOffset);
 
 	// State / report
 	bool     sosAlive() const;                 // live register check

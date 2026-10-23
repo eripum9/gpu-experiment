@@ -388,4 +388,65 @@ bool PspLoader::runKeyDatabaseAndSpl(uint64_t splOffset) {
 		dispatch("SPL", splOffset, BlCmd::LoadTosSPLTable);
 }
 
+bool PspLoader::runKeyDatabaseSplAndSys(uint64_t splOffset, uint64_t sysOffset) {
+	const bool authorized = preflightOK;
+	preflightOK = false; // Every entry point consumes the same one-shot authorization.
+	auto disjoint = [](uint64_t a, uint64_t b) -> bool {
+		return a < b ? b - a >= kFwPriSize : a - b >= kFwPriSize;
+	};
+	if (!authorized || !chainValid() || !kdb.present() || !spl.present() || !sys.present() ||
+		!windowValid() || !windowValid(splOffset) || !windowValid(sysOffset) ||
+		!disjoint(fwPriOff, splOffset) || !disjoint(fwPriOff, sysOffset) ||
+		!disjoint(splOffset, sysOffset)) {
+		lastStepName = "preflight-required";
+		PSPLOG("KDB+SPL+SYS_DRV probe: fresh preflight, unchanged chain, all images, and three disjoint bounded windows required\n");
+		return false;
+	}
+	auto requireSosDown = [&]() -> bool {
+		const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+		if (sol == 0) return true;
+		lastStatus = sol;
+		PSPLOG("%s: strict probe requires readable SOS-down state (0x%08x)\n", lastStepName, sol);
+		return false;
+	};
+	auto requireReady = [&]() -> bool {
+		const uint32_t bl = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
+		lastStatus = bl;
+		if (bl == UINT32_MAX || !(bl & n48::kPspBootReadyBit)) {
+			PSPLOG("%s: expected readable bootloader-ready state (0x%08x)\n", lastStepName, bl);
+			return false;
+		}
+		return requireSosDown();
+	};
+	uint32_t st;
+	lastStepName = "KDB+SPL+SYS_DRV-prepare";
+	if (!requireSosDown() || !waitBootloader(10000, &st, true)) return false;
+
+	// Stage every window before the first mailbox store. From that point onward,
+	// any failed mailbox attempt leaves all three windows potentially PSP-owned.
+	struct Stage { const char *name; const SubBin *bin; uint64_t offset; };
+	const Stage stages[] = {{"KDB-stage", &kdb, fwPriOff}, {"SPL-stage", &spl, splOffset},
+		{"SYS_DRV-stage", &sys, sysOffset}};
+	for (const auto &stage : stages) {
+		lastStepName = stage.name;
+		if (!requireReady() || !hw.vramMemset(stage.offset, 0, kFwPriSize) ||
+			!requireReady() || !hw.vramWrite(stage.offset, stage.bin->data, stage.bin->size)) return false;
+	}
+
+	auto dispatch = [&](const char *name, uint64_t offset, uint32_t cmd) -> bool {
+		lastStepName = name;
+		if (!requireReady()) return false;
+		const uint64_t mc = vramMcBase + offset;
+		if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20)) ||
+			!requireReady() ||
+			!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, cmd)) return false;
+		if (!waitBootloader(10000, &st, true) || !requireSosDown()) return false;
+		PSPLOG("%s: command 0x%x issued, bootloader-ready observed (0x%08x)\n", name, cmd, st);
+		return true;
+	};
+	return dispatch("KDB", fwPriOff, BlCmd::LoadKeyDatabase) &&
+		dispatch("SPL", splOffset, BlCmd::LoadTosSPLTable) &&
+		dispatch("SYS_DRV", sysOffset, BlCmd::LoadSysDrv);
+}
+
 } // namespace n48
