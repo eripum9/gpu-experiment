@@ -9,7 +9,9 @@
 #include "ipdiscovery.hpp"
 #include <IOKit/IOLib.h>
 
-#define PSPLOG(fmt, ...) IOLog("Navi48Bringup: psp: " fmt "\n", ##__VA_ARGS__)
+// Standard C++17 forwarding, including calls with only a format string.
+// Each message supplies its own newline, preserving a single IOLog call.
+#define PSPLOG(...) IOLog("Navi48Bringup: psp: " __VA_ARGS__)
 
 namespace n48 {
 
@@ -49,7 +51,7 @@ bool PspLoader::parseContainer(const uint8_t *fw, size_t fwSize) {
 	kdb = spl = sys = sos = soc = intf = dbg = ras = ipkey = toc = rl = spdm = SubBin{};
 	cobalt::psp::Package package{};
 	if (!cobalt::psp::parse(fw, fwSize, package)) {
-		PSPLOG("parse: invalid or unsupported PSP v2 container (%zu bytes)", fwSize);
+		PSPLOG("parse: invalid or unsupported PSP v2 container (%zu bytes)\n", fwSize);
 		return false;
 	}
 	sos = {package.part[cobalt::psp::Sos].data, package.part[cobalt::psp::Sos].size, package.part[cobalt::psp::Sos].version};
@@ -64,7 +66,7 @@ bool PspLoader::parseContainer(const uint8_t *fw, size_t fwSize) {
 	ras = {package.part[cobalt::psp::RasDrv].data, package.part[cobalt::psp::RasDrv].size, package.part[cobalt::psp::RasDrv].version};
 	ipkey = {package.part[cobalt::psp::IpKeyMgrDrv].data, package.part[cobalt::psp::IpKeyMgrDrv].size, package.part[cobalt::psp::IpKeyMgrDrv].version};
 	spdm = {package.part[cobalt::psp::SpdmDrv].data, package.part[cobalt::psp::SpdmDrv].size, package.part[cobalt::psp::SpdmDrv].version};
-	PSPLOG("parse: KDB %u SPL %u SYS %u SOC %u INTF %u DBG %u RAS %u IPKEY %u SOS %u bytes (SOS ver 0x%08x)",
+	PSPLOG("parse: KDB %u SPL %u SYS %u SOC %u INTF %u DBG %u RAS %u IPKEY %u SOS %u bytes (SOS ver 0x%08x)\n",
 	       kdb.size, spl.size, sys.size, soc.size, intf.size, dbg.size, ras.size, ipkey.size,
 	       sos.size, sos.version);
 	parsedData = fw; parsedSize = fwSize;
@@ -76,7 +78,7 @@ bool PspLoader::setFwPriOffset(uint64_t vramOffset) {
 	fwPriConfigured = false;
 	fwPriOff = 0;
 	if ((vramOffset & (kFwPriSize - 1)) || vramOffset > UINT64_MAX - kFwPriSize) {
-		PSPLOG("fw_pri offset 0x%llx is unaligned or its 1 MiB extent overflows", vramOffset);
+		PSPLOG("fw_pri offset 0x%llx is unaligned or its 1 MiB extent overflows\n", vramOffset);
 		return false;
 	}
 	fwPriOff = vramOffset;
@@ -152,7 +154,7 @@ bool PspLoader::preflight() {
 	preflightOK = false;
 	vramMcBase = vramMcTop = 0;
 	if (!fwPriConfigured || !chainValid()) {
-		PSPLOG("preflight: explicit staging window and valid bounded chain required"); return false;
+		PSPLOG("preflight: explicit staging window and valid bounded chain required\n"); return false;
 	}
 	const uint32_t bl  = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
@@ -161,37 +163,37 @@ bool PspLoader::preflight() {
 	const uint32_t fbOff  = hw.regReadIp(IpDiscovery::HwMmhub, 0, kMmhubSeg, kMmhubFbOffset);
 	const uint32_t dcnBase = hw.regReadIp(IpDiscovery::HwDmu, 0, kDmuSeg, kDcnVmFbLocationBase);
 
-	PSPLOG("preflight: C2PMSG_35=0x%08x (%s) C2PMSG_81=0x%08x (%s)",
+	PSPLOG("preflight: C2PMSG_35=0x%08x (%s) C2PMSG_81=0x%08x (%s)\n",
 	       bl, (bl & n48::kPspBootReadyBit) ? "bootloader READY" : "bootloader NOT ready",
 	       sol, sol ? "SOS alive" : "SOS down");
-	PSPLOG("preflight: MMHUB FB_LOCATION base=0x%08x top=0x%08x FB_OFFSET=0x%08x  DCN FB_LOCATION base=0x%08x",
+	PSPLOG("preflight: MMHUB FB_LOCATION base=0x%08x top=0x%08x FB_OFFSET=0x%08x  DCN FB_LOCATION base=0x%08x\n",
 	       fbBase, fbTop, fbOff, dcnBase);
 
 	if (bl == 0xFFFFFFFF || sol == 0xFFFFFFFF || fbBase == 0xFFFFFFFF || fbTop == 0xFFFFFFFF) {
-		PSPLOG("preflight: MP0/MMHUB registers unreadable; refusing"); return false;
+		PSPLOG("preflight: MP0/MMHUB registers unreadable; refusing\n"); return false;
 	}
 	vramMcBase = (uint64_t)(fbBase & kFbMask) << kFbShift;
 	vramMcTop  = ((uint64_t)(fbTop & kFbMask) << kFbShift) + (1ULL << kFbShift);
 	if (vramMcBase == 0 || vramMcTop <= vramMcBase) {
-		PSPLOG("preflight: FB_LOCATION not posted (base 0x%llx top 0x%llx); refusing", vramMcBase, vramMcTop);
+		PSPLOG("preflight: FB_LOCATION not posted (base 0x%llx top 0x%llx); refusing\n", vramMcBase, vramMcTop);
 		return false;
 	}
 	if (dcnBase != 0xFFFFFFFF && (dcnBase & kFbMask) != (fbBase & kFbMask))
-		PSPLOG("preflight: WARNING DCN and MMHUB disagree on FB base (0x%06x vs 0x%06x)",
+		PSPLOG("preflight: WARNING DCN and MMHUB disagree on FB base (0x%06x vs 0x%06x)\n",
 		       dcnBase & kFbMask, fbBase & kFbMask);
 	if (fbOff != 0xFFFFFFFF && (fbOff & kFbMask) != (fbBase & kFbMask))
-		PSPLOG("preflight: NOTE FB_OFFSET 0x%06x != FB_LOCATION_BASE 0x%06x — deriving mailbox address from FB_LOCATION_BASE; caller must establish MC mapping",
+		PSPLOG("preflight: NOTE FB_OFFSET 0x%06x != FB_LOCATION_BASE 0x%06x — deriving mailbox address from FB_LOCATION_BASE; caller must establish MC mapping\n",
 		       fbOff & kFbMask, fbBase & kFbMask);
 
 	if (!windowValid()) {
-		PSPLOG("preflight: staging window outside MC range or not representable; refusing"); return false;
+		PSPLOG("preflight: staging window outside MC range or not representable; refusing\n"); return false;
 	}
 	const uint64_t mc = vramMcBase + fwPriOff;
-	PSPLOG("preflight: VRAM MC [0x%llx, 0x%llx) = %llu MiB; fw_pri at vram+0x%llx = MC 0x%llx (C2PMSG_36 will be 0x%08x)",
+	PSPLOG("preflight: VRAM MC [0x%llx, 0x%llx) = %llu MiB; fw_pri at vram+0x%llx = MC 0x%llx (C2PMSG_36 will be 0x%08x)\n",
 	       vramMcBase, vramMcTop, (vramMcTop - vramMcBase) >> 20, fwPriOff, mc, (uint32_t)(mc >> 20));
 
-	if (sol != 0)        { PSPLOG("preflight: SOS already alive — nothing to load"); preflightOK = true; return true; }
-	if (!(bl & n48::kPspBootReadyBit)) { PSPLOG("preflight: bootloader not ready; refusing"); return false; }
+	if (sol != 0)        { PSPLOG("preflight: SOS already alive — nothing to load\n"); preflightOK = true; return true; }
+	if (!(bl & n48::kPspBootReadyBit)) { PSPLOG("preflight: bootloader not ready; refusing\n"); return false; }
 	preflightOK = true;
 	return true;
 }
@@ -202,70 +204,70 @@ bool PspLoader::loadComponent(const char *name, const SubBin &bin, uint32_t blCm
 		const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
 		if (sol != 0) {
 			lastStatus = sol;
-			PSPLOG("%s: strict probe requires readable SOS-down state (0x%08x)", name, sol);
+			PSPLOG("%s: strict probe requires readable SOS-down state (0x%08x)\n", name, sol);
 			return false;
 		}
 		return true;
 	};
 	if (strictSosDown && !requireSosDown()) return false;
 	if (!bin.present()) {
-		if (strictSosDown) { PSPLOG("%s: required image absent", name); return false; }
-		PSPLOG("%s: not in container, skipping", name); return true;
+		if (strictSosDown) { PSPLOG("%s: required image absent\n", name); return false; }
+		PSPLOG("%s: not in container, skipping\n", name); return true;
 	}
-	if (bin.size > kFwPriSize) { PSPLOG("%s: %u bytes exceeds fw_pri", name, bin.size); return false; }
+	if (bin.size > kFwPriSize) { PSPLOG("%s: %u bytes exceeds fw_pri\n", name, bin.size); return false; }
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
-	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("%s: SOS register unreadable", name); return false; }
+	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("%s: SOS register unreadable\n", name); return false; }
 	if (sol != 0) {
-		if (strictSosDown) { lastStatus = sol; PSPLOG("%s: strict probe refuses live SOS", name); return false; }
-		PSPLOG("%s: SOS already alive, skip", name); return true;
+		if (strictSosDown) { lastStatus = sol; PSPLOG("%s: strict probe refuses live SOS\n", name); return false; }
+		PSPLOG("%s: SOS already alive, skip\n", name); return true;
 	}
 
 	uint32_t st;
-	if (!waitBootloader(10000, &st, strictSosDown)) { PSPLOG("%s: bootloader not ready (0x%08x)", name, st); return false; }
+	if (!waitBootloader(10000, &st, strictSosDown)) { PSPLOG("%s: bootloader not ready (0x%08x)\n", name, st); return false; }
 	// In strict mode this read is deliberately adjacent to staging: SOS must
 	// still be down after the readiness wait and before any VRAM write.
 	if (strictSosDown && !requireSosDown()) return false;
 
 	// Zero the whole 1 MiB window first, then copy the image (psp_copy_fw).
-	if (!hw.vramMemset(fwPriOff, 0, kFwPriSize))   { PSPLOG("%s: fw_pri memset failed", name); return false; }
-	if (!hw.vramWrite(fwPriOff, bin.data, bin.size)) { PSPLOG("%s: fw_pri write failed", name); return false; }
+	if (!hw.vramMemset(fwPriOff, 0, kFwPriSize))   { PSPLOG("%s: fw_pri memset failed\n", name); return false; }
+	if (!hw.vramWrite(fwPriOff, bin.data, bin.size)) { PSPLOG("%s: fw_pri write failed\n", name); return false; }
 	if (strictSosDown && !requireSosDown()) return false;
 
 	const uint64_t mc = vramMcBase + fwPriOff;
 	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20))) {
-		PSPLOG("%s: address register write failed", name); return false;
+		PSPLOG("%s: address register write failed\n", name); return false;
 	}
 	if (strictSosDown && !requireSosDown()) return false;
 	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, blCmd)) {
-		PSPLOG("%s: register write failed", name); return false;
+		PSPLOG("%s: register write failed\n", name); return false;
 	}
 	if (!waitBootloader(10000, &st, strictSosDown)) {
-		PSPLOG("%s: FAILED — bootloader status 0x%08x after cmd 0x%x", name, st, blCmd);
+		PSPLOG("%s: FAILED — bootloader status 0x%08x after cmd 0x%x\n", name, st, blCmd);
 		return false;
 	}
 	if (strictSosDown && !requireSosDown()) return false;
-	PSPLOG("%s: ok (%u bytes, cmd 0x%x, status 0x%08x)", name, bin.size, blCmd, st);
+	PSPLOG("%s: ok (%u bytes, cmd 0x%x, status 0x%08x)\n", name, bin.size, blCmd, st);
 	return true;
 }
 
 bool PspLoader::loadSOS() {
 	lastStepName = "SOS";
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
-	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("SOS: register unreadable"); return false; }
-	if (sol != 0) { PSPLOG("SOS: already alive"); return true; }
-	if (sos.size > kFwPriSize) { PSPLOG("SOS: %u bytes exceeds fw_pri", sos.size); return false; }
+	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("SOS: register unreadable\n"); return false; }
+	if (sol != 0) { PSPLOG("SOS: already alive\n"); return true; }
+	if (sos.size > kFwPriSize) { PSPLOG("SOS: %u bytes exceeds fw_pri\n", sos.size); return false; }
 	uint32_t st;
-	if (!waitBootloader(10000, &st)) { PSPLOG("SOS: bootloader not ready (0x%08x)", st); return false; }
+	if (!waitBootloader(10000, &st)) { PSPLOG("SOS: bootloader not ready (0x%08x)\n", st); return false; }
 
 	if (!hw.vramMemset(fwPriOff, 0, kFwPriSize)) return false;
 	if (!hw.vramWrite(fwPriOff, sos.data, sos.size)) return false;
 
 	const uint32_t solBefore = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
-	if (solBefore == UINT32_MAX) { lastStatus = solBefore; PSPLOG("SOS: register unreadable after staging"); return false; }
+	if (solBefore == UINT32_MAX) { lastStatus = solBefore; PSPLOG("SOS: register unreadable after staging\n"); return false; }
 	const uint64_t mc = vramMcBase + fwPriOff;
 	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20)) ||
 	    !hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, BlCmd::LoadSOSDrv)) {
-		PSPLOG("SOS: register write failed"); return false;
+		PSPLOG("SOS: register write failed\n"); return false;
 	}
 	IOSleep(20);   // upstream: "there might be handshake issue with hardware which needs delay"
 
@@ -273,16 +275,16 @@ bool PspLoader::loadSOS() {
 	// nonzero. Normally well under a second; allow 5 s.
 	for (uint32_t ms = 0; ms < 5000; ms++) {
 		uint32_t v = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
-		if (v == UINT32_MAX) { lastStatus = v; PSPLOG("SOS: sign-of-life read failed"); return false; }
+		if (v == UINT32_MAX) { lastStatus = v; PSPLOG("SOS: sign-of-life read failed\n"); return false; }
 		if (v != solBefore && v != 0 && v != 0xFFFFFFFF) {
-			PSPLOG("SOS ALIVE — C2PMSG_81 0x%08x -> 0x%08x after ~%u ms", solBefore, v, ms + 20);
+			PSPLOG("SOS ALIVE — C2PMSG_81 0x%08x -> 0x%08x after ~%u ms\n", solBefore, v, ms + 20);
 			lastStatus = v;
 			return true;
 		}
 		IOSleep(1);
 	}
 	lastStatus = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
-	PSPLOG("SOS: timeout — C2PMSG_81 unchanged (0x%08x), bootloader status 0x%08x", solBefore, lastStatus);
+	PSPLOG("SOS: timeout — C2PMSG_81 unchanged (0x%08x), bootloader status 0x%08x\n", solBefore, lastStatus);
 	return false;
 }
 
@@ -291,11 +293,11 @@ bool PspLoader::runChain() {
 	preflightOK = false; // Success and failure both consume the one-shot authorization.
 	if (!authorized || !chainValid() || !windowValid()) {
 		lastStepName = "preflight-required";
-		PSPLOG("chain: fresh successful preflight and unchanged bounded chain required"); return false;
+		PSPLOG("chain: fresh successful preflight and unchanged bounded chain required\n"); return false;
 	}
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
 	if (sol == UINT32_MAX) { lastStepName = "sos-unreadable"; lastStatus = sol; return false; }
-	if (sol != 0) { PSPLOG("chain: SOS already alive, skipping"); return true; }
+	if (sol != 0) { PSPLOG("chain: SOS already alive, skipping\n"); return true; }
 	struct Step { const char *name; const SubBin *bin; uint32_t cmd; } steps[] = {
 		// Order from Linux psp_hw_start; identical to mac-amdgpu's proven
 		// psp_load_sos_package (no SPDM_DRV: psp_14_0_3 ships none).
@@ -318,7 +320,7 @@ bool PspLoader::runKeyDatabase() {
 	preflightOK = false; // Consume the shared one-shot authorization on entry.
 	if (!authorized || !chainValid() || !windowValid() || !kdb.present()) {
 		lastStepName = "preflight-required";
-		PSPLOG("KDB probe: fresh successful preflight, unchanged bounded chain, and KDB required");
+		PSPLOG("KDB probe: fresh successful preflight, unchanged bounded chain, and KDB required\n");
 		return false;
 	}
 	// Deliberately stop after this single command. This proves only that the
