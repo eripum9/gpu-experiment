@@ -118,10 +118,23 @@ bool PspLoader::sosAlive() const {
 	return v != 0 && v != 0xFFFFFFFF;
 }
 
-bool PspLoader::waitBootloader(uint32_t budgetMs, uint32_t *lastValue) {
+bool PspLoader::waitBootloader(uint32_t budgetMs, uint32_t *lastValue, bool strictSosDown) {
 	uint32_t v = 0;
 	for (uint32_t ms = 0; ms < budgetMs; ms++) {
 		v = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
+		if (strictSosDown && v == UINT32_MAX) {
+			if (lastValue) *lastValue = v;
+			lastStatus = v;
+			return false;
+		}
+		if (strictSosDown) {
+			const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+			if (sol == UINT32_MAX || sol != 0) {
+				if (lastValue) *lastValue = v;
+				lastStatus = sol == UINT32_MAX ? sol : v;
+				return false;
+			}
+		}
 		if (v != 0xFFFFFFFF && (v & n48::kPspBootReadyBit)) {
 			if (lastValue) *lastValue = v;
 			lastStatus = v;
@@ -167,8 +180,7 @@ bool PspLoader::preflight() {
 		PSPLOG("preflight: WARNING DCN and MMHUB disagree on FB base (0x%06x vs 0x%06x)",
 		       dcnBase & kFbMask, fbBase & kFbMask);
 	if (fbOff != 0xFFFFFFFF && (fbOff & kFbMask) != (fbBase & kFbMask))
-		PSPLOG("preflight: NOTE FB_OFFSET 0x%06x != FB_LOCATION_BASE 0x%06x — using FB_LOCATION_BASE "
-		       "(BAR0 offset == MC offset is hardware-proven on this card by RDNA4FB)",
+		PSPLOG("preflight: NOTE FB_OFFSET 0x%06x != FB_LOCATION_BASE 0x%06x — deriving mailbox address from FB_LOCATION_BASE; caller must establish MC mapping",
 		       fbOff & kFbMask, fbBase & kFbMask);
 
 	if (!windowValid()) {
@@ -184,30 +196,54 @@ bool PspLoader::preflight() {
 	return true;
 }
 
-bool PspLoader::loadComponent(const char *name, const SubBin &bin, uint32_t blCmd) {
+bool PspLoader::loadComponent(const char *name, const SubBin &bin, uint32_t blCmd, bool strictSosDown) {
 	lastStepName = name;
-	if (!bin.present()) { PSPLOG("%s: not in container, skipping", name); return true; }
+	auto requireSosDown = [&]() -> bool {
+		const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+		if (sol != 0) {
+			lastStatus = sol;
+			PSPLOG("%s: strict probe requires readable SOS-down state (0x%08x)", name, sol);
+			return false;
+		}
+		return true;
+	};
+	if (strictSosDown && !requireSosDown()) return false;
+	if (!bin.present()) {
+		if (strictSosDown) { PSPLOG("%s: required image absent", name); return false; }
+		PSPLOG("%s: not in container, skipping", name); return true;
+	}
 	if (bin.size > kFwPriSize) { PSPLOG("%s: %u bytes exceeds fw_pri", name, bin.size); return false; }
 	const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
 	if (sol == UINT32_MAX) { lastStatus = sol; PSPLOG("%s: SOS register unreadable", name); return false; }
-	if (sol != 0) { PSPLOG("%s: SOS already alive, skip", name); return true; }
+	if (sol != 0) {
+		if (strictSosDown) { lastStatus = sol; PSPLOG("%s: strict probe refuses live SOS", name); return false; }
+		PSPLOG("%s: SOS already alive, skip", name); return true;
+	}
 
 	uint32_t st;
-	if (!waitBootloader(10000, &st)) { PSPLOG("%s: bootloader not ready (0x%08x)", name, st); return false; }
+	if (!waitBootloader(10000, &st, strictSosDown)) { PSPLOG("%s: bootloader not ready (0x%08x)", name, st); return false; }
+	// In strict mode this read is deliberately adjacent to staging: SOS must
+	// still be down after the readiness wait and before any VRAM write.
+	if (strictSosDown && !requireSosDown()) return false;
 
 	// Zero the whole 1 MiB window first, then copy the image (psp_copy_fw).
 	if (!hw.vramMemset(fwPriOff, 0, kFwPriSize))   { PSPLOG("%s: fw_pri memset failed", name); return false; }
 	if (!hw.vramWrite(fwPriOff, bin.data, bin.size)) { PSPLOG("%s: fw_pri write failed", name); return false; }
+	if (strictSosDown && !requireSosDown()) return false;
 
 	const uint64_t mc = vramMcBase + fwPriOff;
-	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20)) ||
-	    !hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, blCmd)) {
+	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20))) {
+		PSPLOG("%s: address register write failed", name); return false;
+	}
+	if (strictSosDown && !requireSosDown()) return false;
+	if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, blCmd)) {
 		PSPLOG("%s: register write failed", name); return false;
 	}
-	if (!waitBootloader(10000, &st)) {
+	if (!waitBootloader(10000, &st, strictSosDown)) {
 		PSPLOG("%s: FAILED — bootloader status 0x%08x after cmd 0x%x", name, st, blCmd);
 		return false;
 	}
+	if (strictSosDown && !requireSosDown()) return false;
 	PSPLOG("%s: ok (%u bytes, cmd 0x%x, status 0x%08x)", name, bin.size, blCmd, st);
 	return true;
 }
@@ -275,6 +311,19 @@ bool PspLoader::runChain() {
 	for (auto &s : steps)
 		if (!loadComponent(s.name, *s.bin, s.cmd)) return false;
 	return loadSOS();
+}
+
+bool PspLoader::runKeyDatabase() {
+	const bool authorized = preflightOK;
+	preflightOK = false; // Consume the shared one-shot authorization on entry.
+	if (!authorized || !chainValid() || !windowValid() || !kdb.present()) {
+		lastStepName = "preflight-required";
+		PSPLOG("KDB probe: fresh successful preflight, unchanged bounded chain, and KDB required");
+		return false;
+	}
+	// Deliberately stop after this single command. This proves only that the
+	// command reached an observed bootloader-ready state while SOS stayed down.
+	return loadComponent("KDB", kdb, BlCmd::LoadKeyDatabase, true);
 }
 
 } // namespace n48

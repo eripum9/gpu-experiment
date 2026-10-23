@@ -15,8 +15,9 @@
 //       the load command in C2PMSG_35, then wait for "bootloader ready".
 //    3. Load SOS the same way; completion is C2PMSG_81 changing to nonzero.
 //
-//  MC addressing (hardware-proven on this card by RDNA4FB's cursor readback):
-//  BAR0 byte offset x is VRAM offset x is MC address FB_LOCATION_BASE<<24 + x.
+//  MC addressing uses the posted FB_LOCATION_BASE to derive the mailbox address.
+//  This path validates that arithmetic; it does not prove Navi 48 memory-controller
+//  mapping or GPU execution.
 //
 //  Image authentication belongs to the PSP. This module validates its source
 //  views and address arithmetic; the caller must establish VRAM ownership,
@@ -63,7 +64,8 @@ public:
 
 	// Parse the sos.bin container (header v2.0/v2.1). Returns false on a
 	// malformed container. Keeps pointers into `fw`; caller owns it and must keep
-	// it alive through runChain. Every parse attempt invalidates prior preflight.
+	// it alive through runChain or runKeyDatabase. Every parse attempt invalidates
+	// prior preflight.
 	bool parseContainer(const uint8_t *fw, size_t fwSize);
 
 	// Where in VRAM (byte offset, 1 MiB aligned) the 1 MiB fw_pri staging
@@ -83,6 +85,12 @@ public:
 	// that authorization once, and revalidates all selected views before writes.
 	bool runChain();
 
+	// Bounded protocol probe (currently host-tested, unwired): issue only KDB 0x80000
+	// and wait for bootloader-ready with SOS observed down throughout. Returns
+	// true only when that command was issued and readiness was observed; it does
+	// not claim authentication, GPU execution, or MC mapping correctness.
+	bool runKeyDatabase();
+
 	// State / report
 	bool     sosAlive() const;                 // live register check
 	uint64_t mcBase() const { return vramMcBase; }         // FB_LOCATION_BASE << 24
@@ -97,8 +105,8 @@ public:
 private:
 	bool chainValid() const;
 	bool windowValid() const;
-	bool waitBootloader(uint32_t budgetMs, uint32_t *lastValue);
-	bool loadComponent(const char *name, const SubBin &bin, uint32_t blCmd);
+	bool waitBootloader(uint32_t budgetMs, uint32_t *lastValue, bool strictSosDown = false);
+	bool loadComponent(const char *name, const SubBin &bin, uint32_t blCmd, bool strictSosDown = false);
 	bool loadSOS();
 
 	HwAccess &hw;

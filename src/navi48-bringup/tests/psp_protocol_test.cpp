@@ -44,17 +44,23 @@ struct Bus final:n48::HwAccess {
     uint64_t expectedOffset=kOffset;
     bool sosTimeout=false, readyTimeout=false, timeoutAfterCommand=false;
     unsigned writes=0, failWrite=0, solReads=0;
+    unsigned commandReads=0;
     unsigned solDelay=0;
     bool issuedSos=false;
     std::vector<Event> events;
     Bytes window=Bytes(n48::PspLoader::kFwPriSize,0xa5);
     std::function<uint32_t(unsigned,uint32_t)> onSolRead;
+    std::function<uint32_t(unsigned,uint32_t)> onCommandRead;
     uint32_t regReadIp(uint16_t h,uint8_t inst,uint8_t seg,uint32_t reg) override {
         CHECK(inst==0);
         uint32_t result=0;
         if(h==IpDiscovery::HwMp0) {
             CHECK(seg==0);
-            if(reg==kCommandReg)result=readyTimeout || (timeoutAfterCommand && writes) ? 0 : bl;
+            if(reg==kCommandReg) {
+                ++commandReads;
+                result=readyTimeout || (timeoutAfterCommand && writes) ? 0 : bl;
+                if(onCommandRead)result=onCommandRead(commandReads,result);
+            }
             else if(reg==kSosReg) {
                 ++solReads;
                 result=issuedSos && !sosTimeout && solReads>solDelay ? 0x3b0f0d : sol;
@@ -185,6 +191,75 @@ static void protocolTests(const Bytes &good) {
     { Bus b;n48::PspLoader p(b);prepare(p,good);b.failWrite=1;CHECK(!p.runChain());
       b.failWrite=0;CHECK(p.preflight());CHECK(p.runChain()); }
 }
+static void checkKdbOnly(const Bus &bus,const Bytes &source) {
+    cobalt::psp::Package pkg{};CHECK(cobalt::psp::parse(source.data(),source.size(),pkg));
+    const auto &kdb=pkg.part[cobalt::psp::Kdb];CHECK(kdb.data && kdb.size);
+    const auto events=bus.writeEvents();CHECK(events.size()==4);
+    CHECK(events[0].op=='Z' && events[0].offset==bus.expectedOffset && events[0].size==n48::PspLoader::kFwPriSize);
+    CHECK(events[1].op=='C' && events[1].offset==bus.expectedOffset && events[1].size==kdb.size);
+    CHECK(events[1].source==kdb.data);
+    CHECK(events[2].op=='W' && events[2].offset==kAddressReg);
+    CHECK(events[2].value==(((uint64_t(bus.base)<<24)+bus.expectedOffset)>>20));
+    CHECK(events[3].op=='W' && events[3].offset==kCommandReg && events[3].value==0x80000);
+    CHECK(std::equal(bus.window.begin(),bus.window.begin()+kdb.size,kdb.data));
+    CHECK(std::all_of(bus.window.begin()+kdb.size,bus.window.end(),[](uint8_t v){return v==0;}));
+    CHECK(std::count_if(events.begin(),events.end(),[](const Event &e){return e.op=='W' && e.offset==kCommandReg;})==1);
+}
+static void keyDatabaseTests(const Bytes &good) {
+    { Bus b;n48::PspLoader p(b);prepare(p,good);CHECK(p.runKeyDatabase());checkKdbOnly(b,good);
+      const auto n=b.writes;CHECK(!p.runKeyDatabase());CHECK(!p.runChain());CHECK(b.writes==n); }
+    { const auto noKdb=package(false);Bus b;n48::PspLoader p(b);prepare(p,noKdb);CHECK(!p.runKeyDatabase());noWrites(b);CHECK(!p.runChain()); }
+    // A KDB probe consumes the same one-shot token as runChain, on success or failure.
+    { Bus b;n48::PspLoader p(b);prepare(p,good);CHECK(p.runChain());const auto n=b.writes;CHECK(!p.runKeyDatabase());CHECK(b.writes==n); }
+    { Bus b;n48::PspLoader p(b);prepare(p,good);b.bl=0;CHECK(!p.preflight());b.bl=kReady;
+      CHECK(!p.runKeyDatabase());noWrites(b); }
+    { Bus b;n48::PspLoader p(b);prepare(p,good);b.readyTimeout=true;CHECK(!p.runKeyDatabase());noWrites(b);CHECK(!p.runChain()); }
+    { Bus b;n48::PspLoader p(b);prepare(p,good);b.timeoutAfterCommand=true;CHECK(!p.runKeyDatabase());CHECK(b.writes==4);CHECK(!p.runChain()); }
+    for(unsigned fail=1;fail<=4;++fail) {
+        Bus b;n48::PspLoader p(b);prepare(p,good);b.failWrite=fail;
+        CHECK(!p.runKeyDatabase());CHECK(b.writes==fail);
+        const size_t events=b.events.size();
+        CHECK(!p.runKeyDatabase());CHECK(!p.runChain());
+        CHECK(b.writes==fail && b.events.size()==events);
+    }
+    // Busy zero may transition directly to ready; no busy-low handshake is required.
+    { Bus b;n48::PspLoader p(b);prepare(p,good);
+      b.onCommandRead=[](unsigned at,uint32_t value){return at==2?0u:value;};
+      CHECK(p.runKeyDatabase());checkKdbOnly(b,good);CHECK(b.commandReads>=4); }
+    // Invalidated or mutated public views/window cannot use the preflight token.
+    for(unsigned kind=0;kind<5;++kind) {
+        Bus b;n48::PspLoader p(b);prepare(p,good);
+        if(kind==0)++p.kdb.version;
+        if(kind==1)++p.kdb.data;
+        if(kind==2)++p.kdb.size;
+        if(kind==3)p.sys.data=nullptr;
+        if(kind==4)CHECK(p.setFwPriOffset(kOffset));
+        CHECK(!p.runKeyDatabase());noWrites(b);CHECK(!p.runChain());
+    }
+    { Bus b;n48::PspLoader p(b);parsed(p,good);CHECK(p.setFwPriOffset(kOffset));CHECK(!p.runKeyDatabase());noWrites(b); }
+    { Bus b;n48::PspLoader p(b);prepare(p,good);b.sol=0x55;CHECK(!p.runKeyDatabase());noWrites(b); }
+    // A single bad bootloader-status read is terminal even if a later read
+    // would report ready; strict polling must never turn that into success.
+    for(unsigned badRead:{2u,3u}) {
+      Bus b;n48::PspLoader p(b);prepare(p,good);
+      b.onCommandRead=[badRead](unsigned at,uint32_t value){return at==badRead?UINT32_MAX:value;};
+      CHECK(!p.runKeyDatabase());CHECK(b.commandReads==badRead);CHECK(b.writes==(badRead==2?0u:4u));CHECK(!p.runChain());
+    }
+    // SOS transitions/unreadable reads at each strict checkpoint stop before
+    // any later staging or mailbox action. Read 1 is preflight.
+    const unsigned phases[]={2,3,4,5,6,7,8,9};
+    for(unsigned phase:phases)for(uint32_t state:{0x55u,UINT32_MAX}) {
+        Bus b;n48::PspLoader p(b);prepare(p,good);
+        b.onSolRead=[phase,state](unsigned at,uint32_t value){return at==phase?state:value;};
+        CHECK(!p.runKeyDatabase());
+        const unsigned expected=phase<=5?0u:phase==6?2u:phase==7?3u:4u;
+        CHECK(b.writes==expected);
+        const auto events=b.writeEvents();
+        CHECK(std::count_if(events.begin(),events.end(),[](const Event &e){return e.op=='Z' || e.op=='C';})==(expected>=2?2:0));
+        CHECK(std::count_if(events.begin(),events.end(),[](const Event &e){return e.op=='W' && e.offset==kCommandReg;})==(phase>=8?1:0));
+        CHECK(!p.runChain());CHECK(b.writes==expected);
+    }
+}
 static void unreadableSosTests() {
     const auto good=package(false);
     { Bus b;b.sol=UINT32_MAX;n48::PspLoader p(b);parsed(p,good);CHECK(p.setFwPriOffset(kOffset));
@@ -203,11 +278,11 @@ static void unreadableSosTests() {
 }
 int main(int argc,char **argv) {
     try {
-        prerequisiteTests();addressTests();unreadableSosTests();protocolTests(package());protocolTests(package(false));
+        prerequisiteTests();addressTests();unreadableSosTests();protocolTests(package());protocolTests(package(false));keyDatabaseTests(package());
         for(int i=1;i<argc;++i) {
             std::ifstream f(argv[i],std::ios::binary);CHECK(f.good());
             const Bytes bytes((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
-            protocolTests(bytes);std::printf("Validated actual PSP protocol with package: %s\n",argv[i]);
+            protocolTests(bytes);keyDatabaseTests(bytes);std::printf("Validated actual PSP protocol with package: %s\n",argv[i]);
         }
         std::printf("Actual PSP loader protocol checks passed: %u\n",checks);
     } catch(const std::exception &e) {std::fprintf(stderr,"%s\n",e.what());return 1;}
