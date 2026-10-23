@@ -1,4 +1,4 @@
-# Independent survey with separately armed transport and one-command KDB tests.
+# Independent survey with separately armed transport and pre-SOS experiments.
 .DEFAULT_GOAL := all
 PRODUCT := CobaltNavi44Survey
 BUILD ?= build
@@ -20,7 +20,7 @@ COMMON := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -I$(MKSDK)/Headers -Isrc -I$(SHARED) -mmacosx-version-min=$(DEPLOY) \
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
   -D_FORTIFY_SOURCE=0 -nostdinc -fno-builtin -fno-common -fno-stack-protector \
-  -mkernel -Wall -Wextra -Werror -Os -g
+  -mkernel -Wall -Wextra -Werror -Os -g -fstack-usage
 CXXFLAGS := $(COMMON) -fapple-kext -std=c++17 -fno-exceptions -fno-rtti -fcheck-new -fno-c++-static-destructors
 CFLAGS := $(COMMON)
 LDFLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \

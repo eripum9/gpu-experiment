@@ -9,7 +9,8 @@ address-selector writes, a 16-byte VRAM transport test, and a full 1 MiB
 synthetic staging test, described below. Version 0.7.0 additionally includes
 a separately armed one-command KDB firmware diagnostic. Embedding firmware
 does not activate that mode. Version 0.8.0 adds a separately armed KDB and SPL
-diagnostic using two buffers.
+diagnostic using two buffers. Version 0.9.0 adds the complete pinned pre-SOS
+batch, separately armed with seven independent buffers.
 
 ## One-command KDB checkpoint (0.7.0)
 
@@ -101,6 +102,62 @@ An unreadable or changed context permanently revokes writes, even if a later
 sample looks valid. The result does not establish authentication, GPU execution,
 display support or Metal acceleration. Repeat attempts require review and a
 cold reset; the ordinary boot configuration should be restored after capture.
+
+## Complete pre-SOS checkpoint (0.9.0)
+
+`cobalt-survey-presos=1` requires all seven earlier survey flags, including
+`cobalt-survey-spl=1`, to equal numeric 1. It selects this batch instead of
+the pair, KDB-only or synthetic experiments. Missing prerequisites refuse
+without falling through; earlier discovery/state/console failures retain
+their existing diagnostics before a batch transaction can begin.
+
+The immutable, hash-pinned PSP 14.0.2 package contains seven selected pre-SOS
+images, submitted in this order:
+
+| Image | Bytes | Fixed command |
+| --- | ---: | --- |
+| KDB | 6,816 | `0x00080000` |
+| SPL | 832 | `0x10000000` |
+| SYS_DRV | 78,272 | `0x00010000` |
+| SOC_DRV | 103,792 | `0x000b0000` |
+| INTF_DRV | 37,280 | `0x000d0000` |
+| HAD/DBG_DRV | 53,344 | `0x000c0000` |
+| IPKEYMGR | 12,848 | `0x000f0000` |
+
+RAS is absent in this pinned package. SOS and TOC are not submitted. The
+adapter requires the exact seven source pointers, lengths and versions from
+the pinned manifest. It calls the shared `runPreSos()` protocol once, without
+entering the existing full-chain startup path.
+
+The planner checks the entire seven-window region against BAR0, conservative
+usable-VRAM exclusions and the posted MC range. All seven originals are read
+twice and checked through indexed page edges. Each window is then cleared,
+flushed, copied and verified through full CPU readback and indexed samples.
+**Every window is prepared before the first mailbox address is attempted.**
+These checks retain the experimental placement policy; they do not establish
+exclusive allocation or complete PSP address translation.
+
+Only fourteen mailbox stores are permitted: one address and one fixed command
+per image. The next image requires a direct protocol boot-ready observation
+followed by direct SOS down. Resource-guard reads cannot authorize a phase
+transition. Attempt state advances before each store, and unreadable or changed
+context permanently stops writes. Busy completion polling can become ready;
+an unexpected direct busy observation after established completion aborts.
+
+After **any mailbox attempt**, including an address-only failure, all seven
+buffers remain preserved until a cold reset, without CPU writes, flushing or
+restoration. Before that boundary, dirty originals may be restored only through
+a valid context with verification. Selector cleanup is separately guarded and
+may be skipped after context loss. The provider attempt marker excludes the
+older firmware modes. Repeat attempts require review and a full cold reset.
+
+Results use `PreSos` aggregate properties and per-image prefixes. Schema 9
+requires all seven ready observations, fourteen stores, verified staging and
+cleanup, valid context and complete metadata publication. Failure or refusal
+retains the earlier console schema; stale success is revoked before fallible
+fallback publication. `Ready` remains false. No SOS startup, GPU queues,
+display programming or acceleration is enabled by this checkpoint. Returned
+ready observations do not prove authentication or GPU execution.
 
 ## What the test measures
 
@@ -432,7 +489,8 @@ To remove the survey, restore the saved EFI or remove its Kernel/Add entry,
 bundle, and `cobalt-survey=1` argument. No internal ESP changes are required.
 Remove `cobalt-survey-indexed=1`, `cobalt-survey-state=1` and
 `cobalt-survey-aperture=1`, `cobalt-survey-staging=1`, and
-`cobalt-survey-kdb=1` and `cobalt-survey-spl=1` as well when disabling those experiments.
+`cobalt-survey-kdb=1`, `cobalt-survey-spl=1` and `cobalt-survey-presos=1` as well
+when disabling those experiments.
 
 ## Build
 

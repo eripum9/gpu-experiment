@@ -31,6 +31,13 @@ struct FirmwarePairPlan {
     Plan spl;
 };
 
+struct FirmwareBatchPlan {
+    bool ok;
+    const char *reason;
+    uint32_t count;
+    Plan windows[8];
+};
+
 // Conservative experimental policy, not a guarantee that GPU firmware or
 // another client leaves this region unused. The caller must establish
 // ownership before any access to the planned aperture.
@@ -149,6 +156,66 @@ inline FirmwarePairPlan planFirmwarePair(const Inputs &in) {
 
     const Plan second{true, "ok", secondOffset, kApertureWindowBytes, secondMcAddress};
     return FirmwarePairPlan{true, "ok", first, second};
+}
+
+// Plan a batch of adjacent one-MiB firmware apertures. The first window uses
+// the same conservative selection policy as planAperture; the entire batch
+// must fit each resource bound before any window is returned.
+inline FirmwareBatchPlan planFirmwareBatch(const Inputs &in, uint32_t count) {
+    constexpr uint32_t maxWindows = 8;
+    constexpr uint64_t max = UINT64_MAX;
+    const auto fail = [=](const char *reason) {
+        FirmwareBatchPlan result{false, reason, 0, {}};
+        for (uint32_t i = 0; i < maxWindows; ++i)
+            result.windows[i] = Plan{false, reason, 0, 0, 0};
+        return result;
+    };
+
+    if (count < 3 || count > maxWindows)
+        return fail("firmware batch count must be between 3 and 8");
+
+    const Plan first = planAperture(in);
+    if (!first.ok) return fail(first.reason);
+    if (static_cast<uint64_t>(count) > max / kApertureWindowBytes)
+        return fail("firmware batch size overflows");
+    const uint64_t batchBytes = static_cast<uint64_t>(count) * kApertureWindowBytes;
+    if (first.windowOffset > max - batchBytes)
+        return fail("firmware batch offset overflows");
+
+    if (first.windowOffset > in.bar0Bytes || batchBytes > in.bar0Bytes - first.windowOffset)
+        return fail("firmware batch does not fit BAR0");
+    const uint64_t safeVramBytes = in.usableVramBytes - in.firmwareReserveBytes;
+    if (first.windowOffset > safeVramBytes || batchBytes > safeVramBytes - first.windowOffset)
+        return fail("firmware batch reaches reserved or unavailable VRAM");
+    const uint64_t mcBytes = in.mcEnd - in.mcBase;
+    if (first.windowOffset > mcBytes || batchBytes > mcBytes - first.windowOffset)
+        return fail("firmware batch does not fit the MC range");
+    if (in.mcBase > max - first.windowOffset)
+        return fail("firmware batch MC address overflows");
+    const uint64_t firstMcAddress = in.mcBase + first.windowOffset;
+    if (firstMcAddress > max - batchBytes || firstMcAddress + batchBytes > in.mcEnd)
+        return fail("firmware batch MC address range overflows or exceeds MC end");
+
+    FirmwareBatchPlan result{true, "ok", count, {}};
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t delta = static_cast<uint64_t>(i) * kApertureWindowBytes;
+        if (first.windowOffset > max - delta)
+            return fail("firmware batch window offset overflows");
+        const uint64_t offset = first.windowOffset + delta;
+        if (offset > max - kApertureWindowBytes ||
+            in.mcBase > max - offset)
+            return fail("firmware batch window address overflows");
+        const uint64_t mcAddress = in.mcBase + offset;
+        if (mcAddress > max - kApertureWindowBytes ||
+            mcAddress + kApertureWindowBytes > in.mcEnd)
+            return fail("firmware batch window exceeds the MC range");
+        if ((mcAddress >> 20) > UINT32_MAX)
+            return fail("firmware batch MC address cannot be represented in the hardware register");
+        result.windows[i] = Plan{true, "ok", offset, kApertureWindowBytes, mcAddress};
+    }
+    for (uint32_t i = count; i < maxWindows; ++i)
+        result.windows[i] = Plan{false, "not selected", 0, 0, 0};
+    return result;
 }
 
 } // namespace cobalt::survey

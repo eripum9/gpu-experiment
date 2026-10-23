@@ -55,6 +55,7 @@ struct SubBin {
 class PspLoader {
 public:
 	static constexpr uint32_t kFwPriSize = 1024u * 1024u;   // PSP_1_MEG
+	static constexpr size_t kPreSosMaxComponents = 8;
 
 	explicit PspLoader(HwAccess &hw) : hw(hw) {}
 	PspLoader(const PspLoader &) = delete;
@@ -108,6 +109,17 @@ public:
 	// bootloader-ready with SOS down; this does not establish authentication,
 	// execution, or MC mapping correctness.
 	bool runKeyDatabaseSplAndSys(uint64_t splOffset, uint64_t sysOffset);
+
+	// Run the complete pre-SOS component batch in canonical KDB, SPL, SYS_DRV,
+	// SOC_DRV, INTF_DRV, HAD/DBG_DRV, RAS_DRV, IPKEYMGR order. Supply one
+	// caller-owned, aligned and disjoint 1 MiB VRAM window per present component;
+	// offsets correspond to present components in that canonical order, with the
+	// first equal to fwPriOffset(). The caller owns, maps, and reserves every
+	// window, establishes globally visible writes, and preserves them through cold
+	// reset. Consumes the shared preflight on all outcomes. Returns true only when
+	// all commands were issued and readiness was
+	// observed; it does not establish authentication, execution or MC mapping.
+	bool runPreSos(const uint64_t *windowOffsets, size_t windowCount);
 
 	// State / report
 	bool     sosAlive() const;                 // live register check

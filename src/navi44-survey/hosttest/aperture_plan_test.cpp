@@ -9,6 +9,7 @@ namespace {
 using cobalt::survey::Inputs;
 using cobalt::survey::Plan;
 using cobalt::survey::FirmwarePairPlan;
+using cobalt::survey::FirmwareBatchPlan;
 constexpr std::uint64_t MiB = 1ULL << 20;
 constexpr std::uint64_t GiB = 1ULL << 30;
 constexpr std::uint64_t kReserve = 516ULL * MiB;
@@ -47,6 +48,18 @@ bool pairRejectedAndCleared(const Inputs &input, const char *label) {
                   "pair failure clears both plans");
 }
 
+bool batchRejectedAndCleared(const Inputs &input, std::uint32_t count, const char *label) {
+    const FirmwareBatchPlan result = cobalt::survey::planFirmwareBatch(input, count);
+    bool ok = expect(!result.ok, label) &&
+              expect(result.reason != nullptr && result.count == 0,
+                     "batch failure has a reason and clears count");
+    for (const Plan &window : result.windows) {
+        ok &= expect(!window.ok && window.windowOffset == 0 && window.windowBytes == 0 &&
+                     window.mcAddress == 0, "batch failure clears every window");
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -70,6 +83,101 @@ int main() {
                  "hardware sample computes the expected KDB and SPL MC addresses");
     ok &= expect(pair.kdb.windowBytes == MiB && pair.spl.windowBytes == MiB,
                  "each pair window remains exactly 1 MiB");
+
+    const FirmwareBatchPlan hardwareBatch = cobalt::survey::planFirmwareBatch(hardwareInputs, 7);
+    ok &= expect(hardwareBatch.ok && hardwareBatch.count == 7 &&
+                 hardwareBatch.windows[0].windowOffset == expected.windowOffset,
+                 "seven-window hardware batch retains the legacy first window");
+    ok &= expect(hardwareBatch.windows[0].mcAddress == 0x8004000000ULL &&
+                 hardwareBatch.windows[6].windowOffset == 70 * MiB &&
+                 hardwareBatch.windows[6].mcAddress == 0x8004600000ULL,
+                 "seven-window hardware batch reaches the expected final MC address");
+    bool contiguousBatch = hardwareBatch.ok;
+    for (std::uint32_t i = 0; i < hardwareBatch.count; ++i) {
+        const Plan &window = hardwareBatch.windows[i];
+        contiguousBatch &= window.ok && window.windowBytes == MiB &&
+                           window.windowOffset == 64 * MiB + i * MiB &&
+                           window.mcAddress == hardwareInputs.mcBase + window.windowOffset;
+    }
+    ok &= expect(contiguousBatch && !hardwareBatch.windows[7].ok &&
+                 hardwareBatch.windows[7].windowOffset == 0,
+                 "batch windows are adjacent and unused slots stay empty");
+
+    Inputs batchBoundary = hardwareInputs;
+    batchBoundary.usableVramBytes = 73 * MiB;
+    batchBoundary.firmwareReserveBytes = MiB;
+    batchBoundary.mcEnd = batchBoundary.mcBase + batchBoundary.usableVramBytes;
+    const FirmwareBatchPlan exactEight = cobalt::survey::planFirmwareBatch(batchBoundary, 8);
+    ok &= expect(exactEight.ok && exactEight.windows[7].windowOffset == 71 * MiB &&
+                 exactEight.windows[7].windowOffset + exactEight.windows[7].windowBytes ==
+                     batchBoundary.usableVramBytes - batchBoundary.firmwareReserveBytes,
+                 "eight windows exactly fit the unreserved VRAM end");
+
+    batchBoundary = hardwareInputs;
+    batchBoundary.consolePhysical = kBar0 + 232 * MiB;
+    batchBoundary.consoleBytes = MiB;
+    const FirmwareBatchPlan exactBar = cobalt::survey::planFirmwareBatch(batchBoundary, 7);
+    ok &= expect(exactBar.ok && exactBar.windows[0].windowOffset == 249 * MiB &&
+                 exactBar.windows[6].windowOffset + exactBar.windows[6].windowBytes ==
+                     batchBoundary.bar0Bytes,
+                 "seven windows exactly fit the BAR0 end");
+
+    batchBoundary = hardwareInputs;
+    batchBoundary.consolePhysical = kBar0 + 233 * MiB;
+    batchBoundary.consoleBytes = MiB;
+    const Plan lastBarStart = cobalt::survey::planAperture(batchBoundary);
+    ok &= expect(lastBarStart.ok && lastBarStart.windowOffset + MiB <= batchBoundary.bar0Bytes,
+                 "BAR boundary fixture leaves the first window valid");
+    ok &= batchRejectedAndCleared(batchBoundary, 7,
+                                  "last batch window crossing BAR0 clears the complete batch");
+
+    batchBoundary = hardwareInputs;
+    batchBoundary.mcBase += 4096;
+    batchBoundary.mcEnd += 4096;
+    ok &= batchRejectedAndCleared(batchBoundary, 7,
+                                  "misaligned MC base rejects and clears the complete batch");
+
+    batchBoundary = hardwareInputs;
+    batchBoundary.bar0Physical = 0xFFFFFFFFF0000000ULL;
+    batchBoundary.bar0ConfigPhysical = batchBoundary.bar0Physical;
+    ok &= batchRejectedAndCleared(batchBoundary, 7,
+                                  "BAR0 end overflow rejects and clears the complete batch");
+
+    batchBoundary = hardwareInputs;
+    batchBoundary.usableVramBytes = 73 * MiB;
+    batchBoundary.firmwareReserveBytes = 2 * MiB;
+    batchBoundary.mcEnd = batchBoundary.mcBase + batchBoundary.usableVramBytes;
+    const Plan lastSafeStart = cobalt::survey::planAperture(batchBoundary);
+    ok &= expect(lastSafeStart.ok && lastSafeStart.windowOffset == 64 * MiB,
+                 "reserve boundary fixture leaves the first window valid");
+    ok &= batchRejectedAndCleared(batchBoundary, 8,
+                                  "last batch window crossing firmware reserve clears the complete batch");
+
+    batchBoundary = hardwareInputs;
+    batchBoundary.mcBase =
+        (static_cast<std::uint64_t>(UINT32_MAX) - 69) * MiB;
+    batchBoundary.mcEnd = batchBoundary.mcBase + batchBoundary.usableVramBytes;
+    const Plan fieldFirst = cobalt::survey::planAperture(batchBoundary);
+    const FirmwareBatchPlan fieldBoundary = cobalt::survey::planFirmwareBatch(batchBoundary, 7);
+    ok &= expect(fieldFirst.ok && (fieldFirst.mcAddress >> 20) <= UINT32_MAX &&
+                 !fieldBoundary.ok && fieldBoundary.count == 0,
+                 "last window crossing mailbox field range is refused after a valid first window");
+    ok &= batchRejectedAndCleared(batchBoundary, 7,
+                                  "unrepresentable final mailbox address clears the complete batch");
+
+    Inputs movedBatchInputs = hardwareInputs;
+    movedBatchInputs.consolePhysical += 80 * MiB;
+    const Plan movedBatchFirst = cobalt::survey::planAperture(movedBatchInputs);
+    const FirmwareBatchPlan movedBatch = cobalt::survey::planFirmwareBatch(movedBatchInputs, 7);
+    ok &= expect(movedBatch.ok && movedBatch.windows[0].windowOffset == movedBatchFirst.windowOffset &&
+                 movedBatch.windows[0].windowOffset > 80 * MiB,
+                 "batch follows the console plus guard when the console moves");
+    ok &= batchRejectedAndCleared(base, 0, "zero-window batch is rejected");
+    ok &= batchRejectedAndCleared(base, 1, "one-window batch is rejected");
+    ok &= batchRejectedAndCleared(base, 2, "two-window batch is rejected");
+    ok &= batchRejectedAndCleared(base, 9, "nine-window batch is rejected");
+    ok &= batchRejectedAndCleared(base, std::numeric_limits<std::uint32_t>::max(),
+                                  "maximum uint32 batch count is rejected");
 
     Inputs movedConsole = base;
     movedConsole.consolePhysical += 80 * MiB;

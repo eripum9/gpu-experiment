@@ -83,6 +83,20 @@ jobs:
       - name: Compile standalone x86_64 Navi 44 survey
         run: make -C src/navi44-survey MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
 
+      - name: Record optimized survey stack frames
+        run: |
+          test -s src/navi44-survey/build/CobaltNavi44Survey.su
+          test -s src/navi44-survey/build/psp.su
+          cat src/navi44-survey/build/CobaltNavi44Survey.su src/navi44-survey/build/psp.su
+
+      - name: Upload optimized survey stack frames
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CobaltNavi44Survey-stack-usage
+          path: src/navi44-survey/build/*.su
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Package compile-only artifacts
         run: python3 tools/ci/package_compile_artifact.py --output "$RUNNER_TEMP/Navi48Bringup-compile-check.tar.gz"
 

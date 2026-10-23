@@ -98,3 +98,27 @@ A future hardware adapter must separately establish three-window placement,
 mapping, ownership, visibility, preservation and provider-lifetime guards.
 This API supplies none of those hardware proofs and does not establish
 firmware authentication, GPU execution or graphics acceleration.
+
+## Complete pre-SOS batch
+
+`runPreSos(windowOffsets, windowCount)` batches all present pre-SOS images
+in the canonical KDB, SPL, SYS_DRV, SOC_DRV, INTF_DRV, HAD/DBG_DRV, RAS_DRV,
+IPKEYMGR order. KDB, SPL and SYS_DRV are required; absent optional images are
+skipped. The number of supplied windows must exactly match the selected
+images, between three and eight, with the first at `fwPriOffset()`.
+
+The API consumes the shared fresh preflight once and validates the unchanged
+container, every complete aligned window and all pairwise disjointness before
+any mutation. It snapshots the selected views and offsets. Every clear and
+copy finishes before the first mailbox attempt; then only the fixed address
+and command sequence is issued. Direct ready and SOS-down checks precede each
+mutation, with bounded strict completion waits. Any failure stops the batch.
+There are no staging writes after any mailbox attempt, retries, resets,
+cleanup, SOS startup or later-chain continuation.
+
+The separately armed 0.9.0 survey adapter uses this API for the seven images
+present in its pinned 14.0.2 package, with seven bounded maps and preservation
+through cold reset. Its placement, visibility, ownership, lifetime and sticky
+context guards are described in [the survey documentation](NAVI44-SURVEY.md).
+Neither API success nor a returned ready bit establishes firmware
+authentication, GPU execution, or graphics acceleration.

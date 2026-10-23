@@ -449,4 +449,94 @@ bool PspLoader::runKeyDatabaseSplAndSys(uint64_t splOffset, uint64_t sysOffset) 
 		dispatch("SYS_DRV", sysOffset, BlCmd::LoadSysDrv);
 }
 
+bool PspLoader::runPreSos(const uint64_t *windowOffsets, size_t windowCount) {
+	const bool authorized = preflightOK;
+	preflightOK = false; // The shared preflight is consumed on every outcome.
+	struct Component { const char *name; const SubBin *view; uint32_t command; };
+	const Component canonical[] = {
+		{"KDB", &kdb, BlCmd::LoadKeyDatabase},
+		{"SPL", &spl, BlCmd::LoadTosSPLTable},
+		{"SYS_DRV", &sys, BlCmd::LoadSysDrv},
+		{"SOC_DRV", &soc, BlCmd::LoadSocDrv},
+		{"INTF_DRV", &intf, BlCmd::LoadIntfDrv},
+		{"HAD_DRV", &dbg, BlCmd::LoadHADDrv},
+		{"RAS_DRV", &ras, BlCmd::LoadRASDrv},
+		{"IPKEYMGR", &ipkey, BlCmd::LoadIPKeyMgrDrv},
+	};
+	if (!authorized || !windowOffsets || !chainValid() || !kdb.present() ||
+		!spl.present() || !sys.present() || !windowValid()) {
+		lastStepName = "preflight-required";
+		PSPLOG("pre-SOS batch: fresh preflight, unchanged chain, and required KDB/SPL/SYS images required\n");
+		return false;
+	}
+	Component selected[kPreSosMaxComponents]{};
+	size_t expectedCount = 0;
+	for (const auto &component : canonical)
+		if (component.view->present()) selected[expectedCount++] = component;
+	if (windowCount != expectedCount || windowCount < 3 || windowCount > kPreSosMaxComponents ||
+		windowOffsets[0] != fwPriOff) {
+		lastStepName = "preflight-required";
+		PSPLOG("pre-SOS batch: exact canonical window count and fw_pri first offset required\n");
+		return false;
+	}
+	for (size_t i = 0; i < expectedCount; ++i) {
+		if (!windowValid(windowOffsets[i])) {
+			lastStepName = "preflight-required";
+			PSPLOG("pre-SOS batch: invalid 1 MiB window for %s\n", selected[i].name);
+			return false;
+		}
+		for (size_t j = 0; j < i; ++j) {
+			const uint64_t a = windowOffsets[i], b = windowOffsets[j];
+			if ((a < b ? b - a : a - b) < kFwPriSize) {
+				lastStepName = "preflight-required";
+				PSPLOG("pre-SOS batch: overlapping windows for %s\n", selected[i].name);
+				return false;
+			}
+		}
+	}
+	// Snapshot parser-validated views and offsets before any hardware callback.
+	SubBin bins[kPreSosMaxComponents]{};
+	uint64_t offsets[kPreSosMaxComponents]{};
+	for (size_t i = 0; i < expectedCount; ++i) {
+		bins[i] = *selected[i].view;
+		offsets[i] = windowOffsets[i];
+	}
+	auto requireSosDown = [&]() -> bool {
+		const uint32_t sol = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg81);
+		if (sol == 0) return true;
+		lastStatus = sol;
+		PSPLOG("%s: strict probe requires readable SOS-down state (0x%08x)\n", lastStepName, sol);
+		return false;
+	};
+	auto requireReady = [&]() -> bool {
+		const uint32_t bl = hw.regReadIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35);
+		lastStatus = bl;
+		if (bl == UINT32_MAX || !(bl & n48::kPspBootReadyBit)) {
+			PSPLOG("%s: expected readable bootloader-ready state (0x%08x)\n", lastStepName, bl);
+			return false;
+		}
+		return requireSosDown();
+	};
+	uint32_t st;
+	lastStepName = "pre-SOS-prepare";
+	if (!requireSosDown() || !waitBootloader(10000, &st, true)) return false;
+	// Stage all selected images before the first mailbox attempt. After any
+	// mailbox attempt, the PSP may own every staged window, including on failure.
+	for (size_t i = 0; i < expectedCount; ++i) {
+		lastStepName = selected[i].name;
+		if (!requireReady() || !hw.vramMemset(offsets[i], 0, kFwPriSize) ||
+			!requireReady() || !hw.vramWrite(offsets[i], bins[i].data, bins[i].size)) return false;
+	}
+	for (size_t i = 0; i < expectedCount; ++i) {
+		lastStepName = selected[i].name;
+		if (!requireReady()) return false;
+		const uint64_t mc = vramMcBase + offsets[i];
+		if (!hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg36, (uint32_t)(mc >> 20))) return false;
+		if (!requireReady() || !hw.regWriteIp(IpDiscovery::HwMp0, 0, kMp0Seg, kC2PMsg35, selected[i].command)) return false;
+		if (!waitBootloader(10000, &st, true) || !requireSosDown()) return false;
+		PSPLOG("%s: command 0x%x issued, bootloader-ready observed (0x%08x)\n", selected[i].name, selected[i].command, st);
+	}
+	return true;
+}
+
 } // namespace n48
