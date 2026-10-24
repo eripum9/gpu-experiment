@@ -56,6 +56,7 @@ class PspLoader {
 public:
 	static constexpr uint32_t kFwPriSize = 1024u * 1024u;   // PSP_1_MEG
 	static constexpr size_t kPreSosMaxComponents = 8;
+	static constexpr size_t kSosMaxComponents = 9;
 
 	explicit PspLoader(HwAccess &hw) : hw(hw) {}
 	PspLoader(const PspLoader &) = delete;
@@ -120,6 +121,18 @@ public:
 	// all commands were issued and readiness was
 	// observed; it does not establish authentication, execution or MC mapping.
 	bool runPreSos(const uint64_t *windowOffsets, size_t windowCount);
+
+	// Prepare the complete canonical pre-SOS chain plus SOS in caller-owned,
+	// aligned and disjoint 1 MiB VRAM windows before any mailbox attempt. Supply
+	// one offset per present image in KDB, SPL, SYS_DRV, SOC_DRV, INTF_DRV,
+	// HAD/DBG_DRV, RAS_DRV, IPKEYMGR, SOS order; the first equals fwPriOffset().
+	// KDB/SPL/SYS_DRV/SOS are required. The caller owns, maps, reserves, and
+	// preserves every window through cold reset. Consumes shared preflight on all
+	// outcomes. Returns true only when the strict pre-SOS ready protocol completes
+	// and a fresh readable nonzero SOS sign of life is observed; boot-ready after
+	// SOS is not required. This does not establish authentication, execution, or
+	// MC mapping correctness.
+	bool runSosCheckpoint(const uint64_t *windowOffsets, size_t windowCount);
 
 	// State / report
 	bool     sosAlive() const;                 // live register check

@@ -10,7 +10,8 @@ synthetic staging test, described below. Version 0.7.0 additionally includes
 a separately armed one-command KDB firmware diagnostic. Embedding firmware
 does not activate that mode. Version 0.8.0 adds a separately armed KDB and SPL
 diagnostic using two buffers. Version 0.9.0 adds the complete pinned pre-SOS
-batch, separately armed with seven independent buffers.
+batch, separately armed with seven independent buffers. Version 0.10.0 adds
+a separately armed SOS-startup checkpoint with eight buffers.
 
 ## One-command KDB checkpoint (0.7.0)
 
@@ -158,6 +159,56 @@ retains the earlier console schema; stale success is revoked before fallible
 fallback publication. `Ready` remains false. No SOS startup, GPU queues,
 display programming or acceleration is enabled by this checkpoint. Returned
 ready observations do not prove authentication or GPU execution.
+
+## Bounded SOS-startup checkpoint (0.10.0)
+
+`cobalt-survey-sos=1` requires all eight preceding survey flags, including
+`cobalt-survey-presos=1`, to equal numeric 1. It selects this checkpoint
+instead of the earlier firmware modes. Missing prerequisites refuse without
+falling through. Earlier discovery/state/console failures can stop the service
+before the firmware transaction begins.
+
+The exact seven pre-SOS images are followed by the pinned SOS image: 125,472
+bytes at package offset `0x14d60`, version `0x003b0f0d`, command `0x00020000`.
+All eight independent 1 MiB windows, including SOS, are cleared, copied,
+flushed and checked before the first mailbox attempt. The shared
+`runSosCheckpoint()` API validates the complete source inventory and placement;
+it does not continue an earlier attempt or reuse a buffer after dispatch.
+The conservative placement policy remains an experiment, not proof of
+exclusive allocation or complete PSP memory translation.
+
+The seven pre-SOS commands retain their strict direct boot-ready and SOS-down
+checks. The last two stores are the SOS address and fixed SOS command, each
+preceded by fresh ready/SOS-down checks. After that command, **no further
+mailbox, selector, CPU-window or flush writes are permitted**. Following the
+existing 20 ms startup delay, bounded direct SOS reads seek a transition from
+zero to a readable nonzero value. An unreadable `0xffffffff` sample aborts
+immediately. A preexisting nonzero SOS value is refused; it is not adopted as
+a successful attempt. Bootloader-ready after SOS is not required.
+
+Expected SOS startup may change its status register and clear boot-ready.
+Other ownership, PCI, BAR, console, remap, memory-size and pinned framebuffer
+changes still revoke the transaction. Guard reads cannot authorize success:
+only the direct SOS response can establish the observed transition. Context
+loss is sticky, and a return to zero after a direct alive observation revokes
+the result. No later GPU initialization is attempted.
+
+Every staging buffer is preserved after any mailbox attempt, including an
+address-only failure. Before the SOS command, selector restoration retains
+the existing guarded SOS-down policy. After its command, selector cleanup is
+intentionally skipped and reported as `preserved-after-sos-command`; no write
+is issued to improve the cleanup label. A cold reset is required before reuse.
+
+Results use `SosBoot` aggregate properties and per-image prefixes. Schema 10
+requires all eight staged images, seven direct pre-SOS completions, sixteen
+stores, a direct readable nonzero SOS transition, valid context, the cleanup
+policy above and complete metadata publication. The aggregate
+`SosBootAliveObserved` and the SOS image's `SosBootSosAliveObserved` record the
+transition; its `ReadyObserved` remains false because post-SOS boot-ready is
+not measured. Stale success is revoked before fallible fallback
+publication. Global `Ready` remains false. This checkpoint enables no queues,
+interrupts, display programming or Metal acceleration; a status-register
+transition does not validate GPU workloads or firmware authentication.
 
 ## What the test measures
 
@@ -489,7 +540,8 @@ To remove the survey, restore the saved EFI or remove its Kernel/Add entry,
 bundle, and `cobalt-survey=1` argument. No internal ESP changes are required.
 Remove `cobalt-survey-indexed=1`, `cobalt-survey-state=1` and
 `cobalt-survey-aperture=1`, `cobalt-survey-staging=1`, and
-`cobalt-survey-kdb=1`, `cobalt-survey-spl=1` and `cobalt-survey-presos=1` as well
+`cobalt-survey-kdb=1`, `cobalt-survey-spl=1`, `cobalt-survey-presos=1` and
+`cobalt-survey-sos=1` as well
 when disabling those experiments.
 
 ## Build

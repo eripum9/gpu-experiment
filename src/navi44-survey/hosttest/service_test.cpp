@@ -4,6 +4,7 @@
 #include "psp_container.hpp"
 #include "psp_firmware.hpp"
 #include "presos_manifest.hpp"
+#include "sos_manifest.hpp"
 #include <iostream>
 
 static unsigned checks = 0;
@@ -1186,6 +1187,14 @@ static void preSosDevice(Device &d, bool nativeRoute) {
     testState.preSosBootPresent = true; testState.preSosBoot = "1";
     testState.preSosClaimFail = false;
 }
+static void sosDevice(Device &d, bool nativeRoute) {
+    preSosDevice(d, nativeRoute);
+    testState.sosCpu.assign(8, std::vector<uint32_t>(262144, 0x27182818));
+    testState.sosGpu.assign(8, std::vector<uint32_t>(262144, 0x27182818));
+    testState.sosBootPresent = true; testState.sosBoot = "1";
+    testState.sosClaimFail = false; testState.sosFinalStoreSeen = false;
+    testState.sosWrites = 0; testState.sosEvents.clear();
+}
 static void noKdbWrites() {
     CHECK(testState.kdbWrites == 0);
     CHECK(testState.apertureCpuWrites == 0);
@@ -2226,6 +2235,366 @@ static void preSosTests() {
         CHECK(testState.openLive == 0 && testState.allocations == 0);
     }
 }
+static void sosTests() {
+    activeTestPhase = "sosTests.fixture";
+    const Bytes &fake = syntheticPreSosPspFirmware();
+    CHECK(fake.size() == cobalt::survey::kSosFirmwareBytes);
+    cobalt::psp::Package package {};
+    CHECK(cobalt::psp::parse(fake.data(), fake.size(), package));
+    CHECK(package.part[cobalt::psp::Sos].data == fake.data() + 0x14d60);
+    CHECK(package.part[cobalt::psp::Sos].size == 125472);
+    for (unsigned n = 0; n < cobalt::survey::kSosImageCount; ++n) {
+        const auto &spec = cobalt::survey::kSosImages[n];
+        const auto &part = package.part[spec.type];
+        CHECK(part.data == fake.data() + spec.fileOffset);
+        CHECK(part.size == spec.bytes && part.version == spec.version);
+    }
+    for (bool nativeRoute : {false, true}) {
+        activeTestPhase = nativeRoute ? "sosTests.native-success" : "sosTests.isolated-success";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, nativeRoute);
+        const auto read = testState.stateRead;
+        testState.stateRead = [read](uint32_t offset, uint32_t value) {
+            if (offset == 0x4644 && testState.sosFinalStoreSeen) return 0x17u;
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        activeTestPhase = nativeRoute ? "sosTests.native-assert" : "sosTests.isolated-assert";
+        CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "sos-transition-observed-reset-required");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 10);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,AccessMode") == "indexed-and-sos-startup-commands");
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootComponentCount") == 8);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootPhase") == 16);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootSharedApiUsed") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAddressWritesIssued") == 8);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootCommandWritesIssued") == 8);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootInitialSosRaw") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootFinalSosRaw") == 0x17);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootReadyObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootRestoreBytesIssued") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootZeroBytesIssued") == (8ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootCopyBytesIssued") == 418656);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootZeroChunksIssued") == 2048);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootCopyChunksIssued") == 108);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootCpuReadBytes") == (32ULL << 20));
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootCpuReadChunks") == 8192);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootDataReads") == 12288);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootSelectorWritesIssued") == 24576);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootVramWritesIssued") == 2201816);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootFlushWritesIssued") == 16);
+        CHECK(testState.sosWrites == 16 && testState.sosEvents.size() == 16);
+        CHECK(testState.apertureCpuWrites == 2201816);
+        CHECK(testState.apertureFlushWrites == 16);
+        CHECK(testState.apertureCpuReads == (32ULL << 20) / 4);
+        CHECK(testState.apertureDataReads == 12288);
+        CHECK(testState.selectorWrites == 29700); // transaction plus discovery.
+        CHECK(testState.sosFinalStoreSeen);
+        const uint64_t firstMc = d.service.numbers.at("CobaltSurvey,SosBootKdbMcAddress");
+        for (unsigned n = 0; n < cobalt::survey::kSosImageCount; ++n) {
+            const auto &spec = cobalt::survey::kSosImages[n];
+            const std::string key = std::string("CobaltSurvey,SosBoot") + spec.name;
+            CHECK(d.service.numbers.at(key + "PayloadBytes") == spec.bytes);
+            CHECK(d.service.numbers.at(key + "Command") == spec.command);
+            CHECK(d.service.numbers.at(key + "AddressAttempted") == 1);
+            CHECK(d.service.numbers.at(key + "CommandAttempted") == 1);
+            CHECK(d.service.numbers.at(key + "ReadyObserved") == (n == 7 ? 0u : 1u));
+            CHECK(d.service.numbers.at(key + "OriginalStable") == 1);
+            CHECK(d.service.numbers.at(key + "ZeroVerified") == 1);
+            CHECK(d.service.numbers.at(key + "CopyVerified") == 1);
+            CHECK(d.service.numbers.at(key + "StagingPreserved") == 1);
+            CHECK(d.service.numbers.at(key + "WindowOffset") == ((64ULL + n) << 20));
+            CHECK(d.service.numbers.at(key + "McAddress") == firstMc + (uint64_t(n) << 20));
+            bool imageMatches = true;
+            for (size_t word = 0; word < testState.sosCpu[n].size(); ++word) {
+                uint32_t expected = 0;
+                if (word * 4 < spec.bytes) std::memcpy(&expected, fake.data() + spec.fileOffset + word * 4, 4);
+                imageMatches = imageMatches && testState.sosCpu[n][word] == expected && testState.sosGpu[n][word] == expected;
+            }
+            CHECK(imageMatches);
+        }
+        for (unsigned n = 0; n < cobalt::survey::kSosImageCount; ++n) {
+            CHECK(testState.sosEvents[n * 2].offset == testState.kdbAddressByteOffset);
+            CHECK(testState.sosEvents[n * 2].value == static_cast<uint32_t>((firstMc + (uint64_t(n) << 20)) >> 20));
+            CHECK(testState.sosEvents[n * 2 + 1].offset == 0x458c);
+            CHECK(testState.sosEvents[n * 2 + 1].value == cobalt::survey::kSosImages[n].command);
+        }
+        CHECK(testState.sosEvents.back().value == 0x00020000u);
+        CHECK(d.pci.getProperty("CobaltSurvey,SosBootAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+        d.service.stop(&d.pci);
+        CHECK(!d.service.strings.count("CobaltSurvey,SosBootStatus"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,SosBootAliveObserved"));
+    }
+    // Every SOS mailbox store is a terminal boundary for context loss. The
+    // shim also rejects any follow-on staging, flush, selector, or mailbox
+    // write once the final SOS command has been stored.
+    for (unsigned lostAfterStore = 1; lostAfterStore <= 16; ++lostAfterStore) {
+        activeTestPhase = "sosTests.post-store-context-loss";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, lostAfterStore](uint32_t offset, uint32_t value) {
+            if (testState.sosWrites >= lostAfterStore && offset == 0x458c) return UINT32_MAX;
+            if (offset == 0x4644 && testState.sosFinalStoreSeen) return 0x17u;
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.sosWrites == lostAfterStore);
+        CHECK(testState.apertureCpuWrites == 2201816);
+        CHECK(testState.apertureFlushWrites == 16);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootStagingPreserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootRestoreBytesIssued") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootReadyObserved") == 0);
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    for (unsigned missing = 0; missing < 7; ++missing) {
+        activeTestPhase = "sosTests.prerequisite-gate";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        switch (missing) {
+            case 0: testState.indexedBoot = "0"; break;
+            case 1: testState.stateBoot = "0"; break;
+            case 2: testState.apertureBoot = "0"; break;
+            case 3: testState.stagingBoot = "0"; break;
+            case 4: testState.kdbBoot = "0"; break;
+            case 5: testState.splBoot = "0"; break;
+            case 6: testState.preSosBoot = "0"; break;
+        }
+        CHECK(d.service.start(&d.pci));
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        if (missing >= 2) {
+            CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "all-nine-flags-required");
+            CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        } else {
+            CHECK(!d.service.strings.count("CobaltSurvey,SosBootStatus"));
+        }
+        CHECK(!d.pci.getProperty("CobaltSurvey,SosBootAttempt-v1"));
+        CHECK(testState.sosWrites == 0 && testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    for (unsigned sosOff = 0; sosOff < 2; ++sosOff) {
+        activeTestPhase = sosOff == 0 ? "sosTests.flag-off-pre-sos-fallback" : "sosTests.flag-absent-pre-sos-fallback";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        if (sosOff == 0) testState.sosBoot = "0";
+        else testState.sosBootPresent = false;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,PreSosStatus") == "pre-sos-ready-observed-reset-required");
+        CHECK(!d.service.strings.count("CobaltSurvey,SosBootStatus"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,SosBootAliveObserved"));
+        CHECK(testState.sosWrites == 0 && testState.preSosWrites == 14);
+        CHECK(testState.apertureCpuWrites > (7ULL << 20) / 4 && testState.apertureFlushWrites == 14);
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    for (unsigned failure = 0; failure < 6; ++failure) {
+        activeTestPhase = failure == 0 ? "sosTests.planner-refusal" :
+            failure == 1 ? "sosTests.source-refusal" :
+            failure == 2 ? "sosTests.first-window-map-failure" :
+            failure == 3 ? "sosTests.last-window-map-failure" :
+            failure == 4 ? "sosTests.first-backup-allocation-failure" : "sosTests.last-backup-allocation-failure";
+        Bytes badSource;
+        const Bytes *source = &fake;
+        if (failure == 1) {
+            badSource = fake;
+            put32(badSource, 36 + 2 * 16 + 4, 0xdeadbeefu);
+            source = &badSource;
+        }
+        FirmwareOverrideScope firmware(*source);
+        Device d; sosDevice(d, false);
+        if (failure == 0) {
+            const auto read = testState.stateRead;
+            testState.stateRead = [read](uint32_t offset, uint32_t value) {
+                return offset == 0xa954 ? 0x83f0u : read(offset, value);
+            };
+        } else if (failure == 2) {
+            testState.preSosMapFailIndex = 0;
+        } else if (failure == 3) {
+            testState.preSosMapFailIndex = 7;
+        } else if (failure == 4) {
+            testState.failAllocationCall = 2;
+        } else if (failure == 5) {
+            testState.failAllocationCall = 9;
+        }
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.sosWrites == 0 && testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(testState.selectorWrites == 5124);
+        CHECK(!d.pci.getProperty("CobaltSurvey,SosBootAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    {
+        activeTestPhase = "sosTests.failed-metadata-fallback";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        testState.propertyFailKey = "CobaltSurvey,SosBootAliveObserved";
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "metadata-publication-failed");
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    {
+        activeTestPhase = "sosTests.stale-schema-failed-fallback";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        testState.onAperturePublication = [&d](const std::string &key) {
+            if (key == "CobaltSurvey,SosBootStatus") {
+                d.service.numbers["CobaltSurvey,Schema"] = 10;
+                testState.propertyFailKey = "CobaltSurvey,Schema";
+            }
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(!d.service.numbers.count("CobaltSurvey,Schema"));
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "metadata-publication-failed");
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    {
+        activeTestPhase = "sosTests.claim-failure";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false); testState.sosClaimFail = true;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "attempt-claim-failed");
+        CHECK(testState.sosWrites == 0 && testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(testState.selectorWrites == 5124);
+        CHECK(!d.pci.getProperty("CobaltSurvey,SosBootAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    for (const char *marker : {"CobaltSurvey,KdbAttempt-v1", "CobaltSurvey,KdbSplAttempt-v1",
+                               "CobaltSurvey,PreSosAttempt-v1", "CobaltSurvey,SosBootAttempt-v1"}) {
+        activeTestPhase = "sosTests.cross-mode-marker";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false); d.pci.numbers[marker] = 1;
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "already-attempted");
+        CHECK(testState.sosWrites == 0 && testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(!d.pci.getProperty("CobaltSurvey,SosBootAttempt-v1") ||
+            std::string(marker) == "CobaltSurvey,SosBootAttempt-v1");
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+    {
+        activeTestPhase = "sosTests.survey-flag-off";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false); testState.boot = "0";
+        CHECK(!d.service.start(&d.pci)); CHECK(!d.service.registered);
+        CHECK(testState.sosWrites == 0 && testState.preSosWrites == 0);
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        CHECK(!d.service.strings.count("CobaltSurvey,SosBootStatus"));
+        CHECK(!d.pci.getProperty("CobaltSurvey,SosBootAttempt-v1"));
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+    }
+    {
+        activeTestPhase = "sosTests.guard-alive-does-not-authorize";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        unsigned postFinalSolReads = 0;
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &postFinalSolReads](uint32_t offset, uint32_t value) {
+            if (offset == 0x4644 && testState.sosFinalStoreSeen) {
+                const unsigned n = ++postFinalSolReads;
+                return n % 3 ? 0x17u : 0u; // guard reads appear alive; direct polls stay zero.
+            }
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        const auto aliveGuardReads = static_cast<unsigned>(std::count_if(testState.stateEvents.begin(), testState.stateEvents.end(),
+            [](const std::pair<uint32_t, uint32_t> &event) { return event.first == 0x4644 && event.second == 0x17u; }));
+        CHECK(postFinalSolReads >= 3 && aliveGuardReads != 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootFinalSosRaw") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(testState.sosWrites == 16 && testState.apertureCpuWrites == 2201816);
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+    }
+    {
+        activeTestPhase = "sosTests.direct-alive-then-guard-zero";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        unsigned postFinalSolReads = 0;
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, &postFinalSolReads](uint32_t offset, uint32_t value) {
+            if (offset == 0x4644 && testState.sosFinalStoreSeen) {
+                const unsigned n = ++postFinalSolReads;
+                return n == 3 ? 0x17u : 0u;
+            }
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(postFinalSolReads >= 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootContextLost") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(testState.sosWrites == 16 && testState.apertureCpuWrites == 2201816);
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+    }
+    {
+        activeTestPhase = "sosTests.post-command-boot-busy-allowed";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        const auto read = testState.stateRead;
+        testState.stateRead = [read](uint32_t offset, uint32_t value) {
+            if (offset == 0x458c && testState.sosFinalStoreSeen) return 0u;
+            if (offset == 0x4644 && testState.sosFinalStoreSeen) return 0x17u;
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "sos-transition-observed-reset-required");
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootReadyObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 1);
+    }
+    for (unsigned outcome : {0u, 1u, 2u}) {
+        activeTestPhase = outcome == 0 ? "sosTests.delayed-direct-alive" :
+            outcome == 1 ? "sosTests.direct-alive-timeout" : "sosTests.direct-alive-unreadable";
+        FirmwareOverrideScope firmware(fake);
+        Device d; sosDevice(d, false);
+        unsigned postFinalSolReads = 0, postFinalSleeps = 0;
+        testState.onSleep = [&postFinalSleeps]() { if (testState.sosFinalStoreSeen) ++postFinalSleeps; };
+        const auto read = testState.stateRead;
+        testState.stateRead = [read, outcome, &postFinalSolReads](uint32_t offset, uint32_t value) {
+            if (offset == 0x4644 && testState.sosFinalStoreSeen) {
+                ++postFinalSolReads;
+                if (outcome == 0) return postFinalSolReads < 7 ? 0u : 0x31u;
+                if (outcome == 1) return 0u;
+                return postFinalSolReads == 3 ? UINT32_MAX : 0u;
+            }
+            return read(offset, value);
+        };
+        d.run("discovery-snapshot-validated");
+        CHECK(postFinalSolReads != 0);
+        CHECK(testState.sosWrites == 16 && testState.apertureCpuWrites == 2201816);
+        CHECK(testState.apertureFlushWrites == 16 && testState.selectorWrites == 29700);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootReadyObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootRestoreBytesIssued") == 0);
+        if (outcome == 0) {
+            CHECK(d.service.strings.at("CobaltSurvey,SosBootStatus") == "sos-transition-observed-reset-required");
+            CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 10);
+            CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 1);
+            CHECK(d.service.numbers.at("CobaltSurvey,SosBootFinalSosRaw") == 0x31);
+        } else {
+            CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+            CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 0);
+            CHECK(d.service.numbers.at("CobaltSurvey,SosBootFinalSosRaw") ==
+                (outcome == 1 ? 0u : UINT32_MAX));
+            if (outcome == 1) {
+                CHECK(postFinalSolReads >= 5000);
+                CHECK(postFinalSleeps == 5001);
+            }
+        }
+        CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+        CHECK(testState.openLive == 0 && testState.allocations == 0);
+    }
+}
 static const std::string &apertureStatus(const Device &d) {
     return d.service.strings.at("CobaltSurvey,ApertureStatus");
 }
@@ -2998,6 +3367,11 @@ int main(int argc, char **argv) {
             std::cout << "CobaltNavi44Survey pre-SOS host checks passed: " << checks << "\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--sos-only") {
+            sosTests();
+            std::cout << "CobaltNavi44Survey SOS host checks passed: " << checks << "\n";
+            return 0;
+        }
         activeTestPhase = "gates"; gates();
         activeTestPhase = "pciGuards"; pciGuards();
         activeTestPhase = "mappingFailures"; mappingFailures();
@@ -3016,6 +3390,7 @@ int main(int argc, char **argv) {
         activeTestPhase = "kdbTests"; kdbTests();
         activeTestPhase = "kdbSplTests"; kdbSplTests();
         activeTestPhase = "preSosTests"; preSosTests();
+        activeTestPhase = "sosTests"; sosTests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << "phase=" << activeTestPhase << ": " << e.what() << "\n"; return 1;

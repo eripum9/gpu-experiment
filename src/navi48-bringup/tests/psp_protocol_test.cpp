@@ -51,7 +51,7 @@ struct Bus final:n48::HwAccess {
     bool issuedSos=false;
 	bool dualWindow=false, tripleWindow=false, mailboxAttempted=false;
 	bool batchWindow=false;
-	uint64_t batchOffsets[n48::PspLoader::kPreSosMaxComponents]{};
+	uint64_t batchOffsets[n48::PspLoader::kSosMaxComponents]{};
 	size_t batchCount=0;
     uint64_t splOffset=kSplOffset;
 	uint64_t sysOffset=kSysOffset;
@@ -59,8 +59,9 @@ struct Bus final:n48::HwAccess {
     Bytes window=Bytes(n48::PspLoader::kFwPriSize,0xa5);
     Bytes splWindow=Bytes(n48::PspLoader::kFwPriSize,0xa5);
     Bytes sysWindow=Bytes(n48::PspLoader::kFwPriSize,0xa5);
-	Bytes extraWindows[5] = {Bytes(n48::PspLoader::kFwPriSize,0xa5), Bytes(n48::PspLoader::kFwPriSize,0xa5),
-		Bytes(n48::PspLoader::kFwPriSize,0xa5), Bytes(n48::PspLoader::kFwPriSize,0xa5), Bytes(n48::PspLoader::kFwPriSize,0xa5)};
+	Bytes extraWindows[6] = {Bytes(n48::PspLoader::kFwPriSize,0xa5), Bytes(n48::PspLoader::kFwPriSize,0xa5),
+		Bytes(n48::PspLoader::kFwPriSize,0xa5), Bytes(n48::PspLoader::kFwPriSize,0xa5), Bytes(n48::PspLoader::kFwPriSize,0xa5),
+		Bytes(n48::PspLoader::kFwPriSize,0xa5)};
     std::function<uint32_t(unsigned,uint32_t)> onSolRead;
     std::function<uint32_t(unsigned,uint32_t)> onCommandRead;
     std::function<void()> onAnyRead;
@@ -634,6 +635,159 @@ static void preSosTests(const Bytes &good) {
         }
     }
 }
+static void setupSosBus(Bus &b,size_t count) {
+    b.batchWindow=true;b.batchCount=count;
+    for(size_t i=0;i<count;++i)b.batchOffsets[i]=kOffset+i*n48::PspLoader::kFwPriSize;
+    b.expectedOffset=b.batchOffsets[0];
+}
+static size_t sosImageCount(const Bytes &source) {
+    cobalt::psp::Package pkg{};CHECK(cobalt::psp::parse(source.data(),source.size(),pkg));
+    const unsigned types[]={cobalt::psp::Kdb,cobalt::psp::Spl,cobalt::psp::SysDrv,cobalt::psp::SocDrv,
+        cobalt::psp::IntfDrv,cobalt::psp::DbgDrv,cobalt::psp::RasDrv,cobalt::psp::IpKeyMgrDrv,cobalt::psp::Sos};
+    size_t count=0;for(unsigned type:types)if(pkg.part[type].data)++count;return count;
+}
+static void checkSosCheckpoint(const Bus &b,const Bytes &source) {
+    cobalt::psp::Package pkg{};CHECK(cobalt::psp::parse(source.data(),source.size(),pkg));
+    const unsigned parts[]={cobalt::psp::Kdb,cobalt::psp::Spl,cobalt::psp::SysDrv,cobalt::psp::SocDrv,
+        cobalt::psp::IntfDrv,cobalt::psp::DbgDrv,cobalt::psp::RasDrv,cobalt::psp::IpKeyMgrDrv,cobalt::psp::Sos};
+    const uint32_t commands[]={0x80000,0x10000000,0x10000,0xb0000,0xd0000,0xc0000,0xe0000,0xf0000,kSosCmd};
+    const auto events=b.writeEvents();size_t selected=0;for(unsigned type:parts)if(pkg.part[type].data)++selected;
+    CHECK(selected==b.batchCount);CHECK(events.size()==selected*4);
+    // The first half of the write stream stages every image, including SOS.
+    for(size_t i=0;i<selected;++i) {
+        size_t part=0,seen=0;for(;part<9;++part)if(pkg.part[parts[part]].data && seen++==i)break;
+        const auto &bin=pkg.part[parts[part]];const auto &image=b.target(b.batchOffsets[i]);
+        CHECK(events[2*i].op=='Z' && events[2*i].offset==b.batchOffsets[i] && events[2*i].size==n48::PspLoader::kFwPriSize);
+        CHECK(events[2*i+1].op=='C' && events[2*i+1].offset==b.batchOffsets[i] && events[2*i+1].size==bin.size && events[2*i+1].source==bin.data);
+        CHECK(std::equal(image.begin(),image.begin()+bin.size,bin.data));
+        CHECK(std::all_of(image.begin()+bin.size,image.end(),[](uint8_t v){return v==0;}));
+    }
+    size_t at=selected*2;
+    for(size_t i=0;i<selected;++i) {
+		size_t part=0,seen=0;for(;part<9;++part)if(pkg.part[parts[part]].data && seen++==i)break;
+        const auto &address=events[at++],&command=events[at++];
+        CHECK(address.op=='W' && address.offset==kAddressReg);
+        CHECK(address.value==(((uint64_t(b.base)<<24)+b.batchOffsets[i])>>20));
+        CHECK(command.op=='W' && command.offset==kCommandReg && command.value==commands[part]);
+    }
+    CHECK(at==events.size() && b.issuedSos);
+    bool afterSosCommand=false;
+    for(const auto &event:b.events) {
+        if(afterSosCommand)CHECK(event.op=='R' && event.offset==kSosReg);
+        if(event.op=='W' && event.offset==kCommandReg && event.value==kSosCmd)afterSosCommand=true;
+    }
+    CHECK(afterSosCommand);
+}
+static void sosCheckpointTests(const Bytes &good) {
+    const size_t count=sosImageCount(good);CHECK(count>=4 && count<=9);
+    Bus reference;setupSosBus(reference,count);n48::PspLoader success(reference);prepare(success,good);
+    uint64_t originalOffsets[9];std::copy(reference.batchOffsets,reference.batchOffsets+count,originalOffsets);
+    CHECK(success.runSosCheckpoint(originalOffsets,count));checkSosCheckpoint(reference,good);
+    CHECK(std::string(success.lastStep())=="SOS");CHECK(success.lastBootloaderStatus()==0x3b0f0d);
+    // A callback mutating the caller's offsets cannot change the pre-HW snapshot.
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);uint64_t offsets[9];
+     std::copy(b.batchOffsets,b.batchOffsets+count,offsets);bool changed=false;
+     b.onAnyRead=[&]{if(!changed){changed=true;for(size_t i=0;i<count;++i)offsets[i]+=n48::PspLoader::kFwPriSize;}};
+     CHECK(p.runSosCheckpoint(offsets,count));CHECK(changed);checkSosCheckpoint(b,good);}
+    // Every CPU staging write precedes the first mailbox attempt; every failed
+    // store is terminal, including the SOS command itself.
+    for(unsigned fail=1;fail<=count*4;++fail) {
+        Bus b;setupSosBus(b,count);b.failWrite=fail;n48::PspLoader p(b);prepare(p,good);
+        CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(b.writes==fail);
+        const auto actual=b.writeEvents(),expected=reference.writeEvents();CHECK(actual.size()==fail);
+        for(unsigned i=0;i<fail;++i)CHECK(actual[i].op==expected[i].op && actual[i].offset==expected[i].offset &&
+            actual[i].value==expected[i].value && actual[i].size==expected[i].size && actual[i].source==expected[i].source);
+        if(fail>=count*4-1) {
+            CHECK(std::string(p.lastStep())=="SOS");
+            CHECK(p.lastBootloaderStatus()==0);
+        }
+        if(fail==count*4) {
+            CHECK(!b.events.empty());
+            CHECK(b.events.back().op=='W' && b.events.back().offset==kCommandReg && b.events.back().value==kSosCmd);
+        }
+    }
+    unsigned targetReadyRead=0,guardTargets=0;
+    for(size_t i=2;i<reference.events.size();++i) {
+        if(reference.events[i].op=='R' || reference.events[i-2].op!='R' || reference.events[i-2].offset!=kCommandReg ||
+           reference.events[i-1].op!='R' || reference.events[i-1].offset!=kSosReg)continue;
+        ++guardTargets;targetReadyRead=0;
+        for(size_t j=0;j<=i-2;++j)if(reference.events[j].op=='R'&&reference.events[j].offset==kCommandReg)++targetReadyRead;
+        for(uint32_t state:{0u,UINT32_MAX}) {
+            Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+            b.onCommandRead=[targetReadyRead,state](unsigned at,uint32_t value){return at==targetReadyRead?state:value;};
+            CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(b.commandReads==targetReadyRead);
+            CHECK(b.writes==writesBeforeRead(reference,kCommandReg,targetReadyRead));
+        }
+    }
+    CHECK(guardTargets==count*4);
+    // Invalid counts, windows, and all source-view mutations refuse before HW.
+    for(size_t supplied=0;supplied<=10;++supplied)if(supplied!=count) {
+        Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);const auto before=b.events.size();
+        CHECK(!p.runSosCheckpoint(b.batchOffsets,supplied));CHECK(b.events.size()==before);noWrites(b);
+    }
+    for(unsigned requiredDescriptor:{0u,1u,2u,8u}) {
+        Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+        n48::SubBin *required[]={&p.kdb,&p.spl,&p.sys,&p.sos};*required[requiredDescriptor==8?3:requiredDescriptor]={};
+        CHECK(!p.runSosCheckpoint(b.batchOffsets,count));noWrites(b);
+    }
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);CHECK(!p.runSosCheckpoint(nullptr,count));noWrites(b);}
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);uint64_t offsets[9];
+     std::copy(b.batchOffsets,b.batchOffsets+count,offsets);if(count>1)offsets[1]=offsets[0];
+     const auto before=b.events.size();CHECK(!p.runSosCheckpoint(offsets,count));CHECK(b.events.size()==before);noWrites(b);}
+    for(uint64_t bad:{kOffset+1,UINT64_MAX,UINT64_MAX&~uint64_t(n48::PspLoader::kFwPriSize-1),
+        (uint64_t(0x83fb+1-0x8000)<<24)}) {
+        Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);uint64_t offsets[9];
+        std::copy(b.batchOffsets,b.batchOffsets+count,offsets);offsets[count-1]=bad;
+        const auto before=b.events.size();CHECK(!p.runSosCheckpoint(offsets,count));CHECK(b.events.size()==before);noWrites(b);
+    }
+    for(unsigned slot=0;slot<9;++slot)for(unsigned field=0;field<3;++field) {
+        Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+        n48::SubBin *slots[]={&p.kdb,&p.spl,&p.sys,&p.soc,&p.intf,&p.dbg,&p.ras,&p.ipkey,&p.sos};
+        if(field==0)slots[slot]->data=slots[slot]->data?slots[slot]->data+1:good.data();
+        if(field==1)++slots[slot]->size;if(field==2)++slots[slot]->version;
+        const auto before=b.events.size();CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(b.events.size()==before);noWrites(b);
+    }
+    // Strict pre-SOS guard/read failures do not reach later writes. The direct
+    // final SOL accepts readable nonzero without requiring boot-ready afterward.
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+     b.onCommandRead=[](unsigned at,uint32_t value){return at==2?0u:value;};
+     CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(!b.issuedSos);}
+    for(uint32_t badReady:{0u,UINT32_MAX}) {
+        Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);b.bl=badReady;
+        CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(!b.issuedSos);
+        CHECK(p.lastBootloaderStatus()==badReady);
+        CHECK(!b.events.empty() && b.events.back().op=='R' && b.events.back().offset==kCommandReg);
+    }
+    {Bus b;setupSosBus(b,count);b.sol=0x55u;n48::PspLoader p(b);prepare(p,good);
+        CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(!b.issuedSos);noWrites(b);
+    }
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+     b.onSolRead=[](unsigned at,uint32_t value){return at==2?UINT32_MAX:value;};
+     CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(!b.issuedSos);noWrites(b);}
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+     b.onSolRead=[](unsigned at,uint32_t value){return at>1?0x55u:value;};
+     CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(!b.issuedSos);}
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);unsigned postCommandReads=0;
+     b.onSolRead=[&b,&postCommandReads](unsigned,uint32_t value){
+         if(b.issuedSos && ++postCommandReads<=3)return 0u;
+         return value;
+     };
+     CHECK(p.runSosCheckpoint(b.batchOffsets,count));CHECK(postCommandReads==4);
+     CHECK(p.lastBootloaderStatus()==0x3b0f0d);checkSosCheckpoint(b,good);}
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);b.sosTimeout=true;
+     CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(b.issuedSos);CHECK(p.lastBootloaderStatus()==0);}
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);
+     b.onSolRead=[&b](unsigned at,uint32_t value){return b.issuedSos && at>b.solReads-1?UINT32_MAX:value;};
+     // The callback is installed before preflight? prepare already completed;
+     // reject unreadable SOL at the first post-command observation.
+     CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(b.issuedSos);CHECK(p.lastBootloaderStatus()==UINT32_MAX);}
+    // Preflight authorization is shared with all existing entry points and is
+    // consumed on success, invalid arguments, and a failed command.
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);CHECK(p.runSosCheckpoint(b.batchOffsets,count));
+     const auto n=b.events.size();CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(!p.runPreSos(nullptr,0));CHECK(b.events.size()==n);}
+    {Bus b;setupSosBus(b,count);n48::PspLoader p(b);prepare(p,good);CHECK(!p.runSosCheckpoint(b.batchOffsets,count-1));
+     const auto n=b.events.size();CHECK(!p.runSosCheckpoint(b.batchOffsets,count));CHECK(b.events.size()==n);}
+}
 static void keyDatabaseSplAndSysTests(const Bytes &good) {
     { Bus b;b.tripleWindow=true;n48::PspLoader p(b);prepare(p,good);
       CHECK(p.runKeyDatabaseSplAndSys(kSplOffset,kSysOffset));checkTriple(b,good);
@@ -787,7 +941,7 @@ int main(int argc,char **argv) {
         prerequisiteTests();addressTests();unreadableSosTests();protocolTests(package());protocolTests(package(false));keyDatabaseTests(package());
         keyDatabaseAndSplPrerequisites();keyDatabaseAndSplTests(package());
         keyDatabaseSplAndSysTests(package());
-        preSosTests(package());
+        preSosTests(package());sosCheckpointTests(package());
         auto mandatoryOnly=package();for(unsigned descriptor=3;descriptor<=7;++descriptor)put32(mandatoryOnly,36+descriptor*16,0);
         preSosTests(mandatoryOnly);
         {auto missingRequired=package(false);Bus b;setupPreSosBus(b,3);n48::PspLoader p(b);prepare(p,missingRequired);
@@ -800,6 +954,8 @@ int main(int argc,char **argv) {
         CHECK(optionalFixture.part[cobalt::psp::SocDrv].data==nullptr);
         keyDatabaseSplAndSysTests(withoutSoc);
         auto withoutRas=package();put32(withoutRas,36+6*16,0);preSosTests(withoutRas);
+        auto requiredOnly=package();for(unsigned descriptor:{3u,4u,5u,6u,7u})put32(requiredOnly,36+descriptor*16,0);
+        sosCheckpointTests(requiredOnly);sosCheckpointTests(withoutRas);
         for(int i=1;i<argc;++i) {
             std::ifstream f(argv[i],std::ios::binary);CHECK(f.good());
             const Bytes bytes((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
@@ -820,7 +976,7 @@ int main(int argc,char **argv) {
                     pinned.part[cobalt::psp::IntfDrv].data && pinned.part[cobalt::psp::DbgDrv].data &&
                     pinned.part[cobalt::psp::RasDrv].data && pinned.part[cobalt::psp::IpKeyMgrDrv].data);
             }
-            protocolTests(bytes);keyDatabaseTests(bytes);keyDatabaseAndSplTests(bytes);keyDatabaseSplAndSysTests(bytes);preSosTests(bytes);
+            protocolTests(bytes);keyDatabaseTests(bytes);keyDatabaseAndSplTests(bytes);keyDatabaseSplAndSysTests(bytes);preSosTests(bytes);sosCheckpointTests(bytes);
             std::printf("Validated actual PSP protocol with package: %s\n",argv[i]);
         }
         std::printf("Actual PSP loader protocol checks passed: %u\n",checks);

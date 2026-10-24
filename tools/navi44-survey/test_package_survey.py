@@ -58,6 +58,7 @@ class SurveyPackageTests(unittest.TestCase):
         self.assertIn(b"Contains embedded AMD firmware", files["BUILD-INFO.txt"])
         self.assertIn(b"Optional cobalt-survey-spl=1", files["BUILD-INFO.txt"])
         self.assertIn(b"Optional cobalt-survey-presos=1", files["BUILD-INFO.txt"])
+        self.assertIn(b"Optional cobalt-survey-sos=1", files["BUILD-INFO.txt"])
         self.assertNotIn(b"Contains no GPU firmware", files["BUILD-INFO.txt"])
         self.assertNotIn("Navi48Bringup", " ".join(files))
         manifest = files["SHA256SUMS.txt"].decode()

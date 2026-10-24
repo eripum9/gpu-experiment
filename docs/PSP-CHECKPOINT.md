@@ -122,3 +122,25 @@ through cold reset. Its placement, visibility, ownership, lifetime and sticky
 context guards are described in [the survey documentation](NAVI44-SURVEY.md).
 Neither API success nor a returned ready bit establishes firmware
 authentication, GPU execution, or graphics acceleration.
+
+## Bounded SOS-startup batch
+
+`runSosCheckpoint(windowOffsets, windowCount)` prepares the canonical present
+pre-SOS images followed by SOS in separate aligned, disjoint 1 MiB windows.
+KDB, SPL, SYS_DRV and SOS are required. The exact count is the number of
+present pre-SOS images plus one, between four and nine. Its first offset must
+equal `fwPriOffset()`. A fresh shared preflight is consumed on every outcome;
+all source views and windows are validated and snapshotted before callbacks.
+
+Every clear/copy finishes before any mailbox attempt. The pre-SOS prefix uses
+strict direct ready and SOS-down checks. The final SOS address and fixed
+`0x00020000` command also require fresh ready/SOS-down observations. After its
+command, the API makes no writes, retries, resets or cleanup calls. It waits
+20 ms, then uses at most 5,000 direct SOS reads with a 1 ms sleep after each
+zero response. The first readable nonzero response succeeds; the first
+`0xffffffff` fails immediately. Post-SOS bootloader-ready is not required.
+
+This isolated entry point does not adopt an existing SOS instance or enter
+`runChain()`. Callers must preserve every window through a cold reset, provide
+appropriate post-command read guards, and interpret the result as an observed
+status transition rather than firmware authentication or GPU workload proof.

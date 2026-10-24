@@ -71,6 +71,7 @@ def payload() -> dict[str, bytes]:
         "Optional cobalt-survey-kdb=1: one PSP KDB command using embedded pinned PSP 14.0.2 firmware; requires all five prior survey flags; no remaining firmware chain or SOS startup\n"
         "Optional cobalt-survey-spl=1: prepare two separate 1 MiB windows, then issue only KDB and SPL; requires all six prior survey flags; preserves both windows after any mailbox attempt; no SYS or SOS startup\n"
         "Optional cobalt-survey-presos=1: prepare all seven separate 1 MiB windows before the complete pinned pre-SOS batch; requires all seven prior survey flags; preserves every window after any mailbox attempt; no SOS startup\n"
+        "Optional cobalt-survey-sos=1: prepare all eight separate 1 MiB windows before the seven pre-SOS commands and final SOS command; requires all eight prior survey flags; no writes after SOS command; observes a fresh readable nonzero SOS transition only; no queues, display programming or acceleration\n"
         "Contains embedded AMD firmware under licenses/LICENSE.amdgpu; no Navi48Bringup executable\n"
     ).encode("utf-8")
     files["SHA256SUMS.txt"] = "".join(

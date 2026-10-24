@@ -53,6 +53,13 @@ struct TestState {
     bool splBootPresent = false, splEnabled = false, splClaimFail = false, splClaimed = false;
     std::string preSosBoot = "1";
     bool preSosBootPresent = false, preSosEnabled = false, preSosClaimFail = false, preSosClaimed = false;
+    std::string sosBoot = "1";
+    bool sosBootPresent = false, sosEnabled = false, sosClaimFail = false, sosClaimed = false;
+    bool sosFinalStoreSeen = false;
+    unsigned sosWrites = 0;
+    struct SosEvent { uint32_t offset, value; };
+    std::vector<SosEvent> sosEvents;
+    std::function<void(const SosEvent &)> onSos;
     uint64_t apertureOffset = 64ULL << 20;
     uint32_t apertureRemap = 0x7f000, apertureMemsize = 16304;
     uint32_t apertureNbifSegmentBase = 0xd20;
@@ -74,6 +81,10 @@ struct TestState {
     std::vector<std::vector<uint32_t>> preSosGpu;
     std::vector<bool> preSosWindowLive = std::vector<bool>(7, false);
     std::vector<volatile uint32_t *> preSosPages = std::vector<volatile uint32_t *>(7, nullptr);
+    std::vector<std::vector<uint32_t>> sosCpu;
+    std::vector<std::vector<uint32_t>> sosGpu;
+    std::vector<bool> sosWindowLive = std::vector<bool>(8, false);
+    std::vector<volatile uint32_t *> sosPages = std::vector<volatile uint32_t *>(8, nullptr);
     int preSosMapFailIndex = -1, preSosMapInvalidIndex = -1;
     unsigned preSosWrites = 0;
     struct PreSosEvent { uint32_t offset, value; };
@@ -136,7 +147,7 @@ inline bool aperturePhase() {
     return testState.apertureBootPresent && testState.openCalls >= 2 && testState.openLive == 1;
 }
 inline bool stagingPhase() {
-    return (testState.stagingEnabled || testState.kdbEnabled || testState.splEnabled || testState.preSosEnabled) && testState.openCalls >= 2 && testState.openLive == 1;
+    return (testState.stagingEnabled || testState.kdbEnabled || testState.splEnabled || testState.preSosEnabled || testState.sosEnabled) && testState.openCalls >= 2 && testState.openLive == 1;
 }
 inline void requireExplicitWritableMode();
 inline void apertureEvent(char operation, uint32_t offset, uint32_t value) {
@@ -204,12 +215,14 @@ public:
         if ((std::string(key).find("CobaltSurvey,Aperture") == 0 ||
              std::string(key).find("CobaltSurvey,Staging") == 0 ||
              std::string(key).find("CobaltSurvey,Kdb") == 0 ||
-             std::string(key).find("CobaltSurvey,PreSos") == 0) &&
+             std::string(key).find("CobaltSurvey,PreSos") == 0 ||
+             std::string(key).find("CobaltSurvey,SosBoot") == 0) &&
             std::string(key) != "CobaltSurvey,ApertureAttempt-v1" &&
             std::string(key) != "CobaltSurvey,StagingAttempt-v1" &&
             std::string(key) != "CobaltSurvey,KdbAttempt-v1" &&
             std::string(key) != "CobaltSurvey,KdbSplAttempt-v1" &&
-            std::string(key) != "CobaltSurvey,PreSosAttempt-v1") {
+            std::string(key) != "CobaltSurvey,PreSosAttempt-v1" &&
+            std::string(key) != "CobaltSurvey,SosBootAttempt-v1") {
             if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
                 testState.openLive || testState.iteratorsLive)
                 throw std::runtime_error("GPU resources retained at aperture/staging publication");
@@ -247,6 +260,8 @@ public:
         if (std::string(key) == "CobaltSurvey,KdbSplAttempt-v1") testState.splClaimed = true;
         if (std::string(key) == "CobaltSurvey,PreSosAttempt-v1" && testState.preSosClaimFail) return false;
         if (std::string(key) == "CobaltSurvey,PreSosAttempt-v1") testState.preSosClaimed = true;
+        if (std::string(key) == "CobaltSurvey,SosBootAttempt-v1" && testState.sosClaimFail) return false;
+        if (std::string(key) == "CobaltSurvey,SosBootAttempt-v1") testState.sosClaimed = true;
         numbers[key] = value ? 1 : 0; return true;
     }
     OSObject *getProperty(const char *key) {
@@ -288,7 +303,9 @@ public:
             testState.mapsLive >= 4 && testState.mapsLive <= 8;
         const bool preSosTransactionLive = testState.preSosEnabled && testState.openLive == 1 &&
             (testState.mapsLive == 12 || testState.mapsLive == 13);
-        if ((!kdbTransactionLive && !preSosTransactionLive && (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)) ||
+        const bool sosTransactionLive = testState.sosEnabled && testState.openLive == 1 &&
+            (testState.mapsLive == 13 || testState.mapsLive == 14);
+        if ((!kdbTransactionLive && !preSosTransactionLive && !sosTransactionLive && (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)) ||
             (testState.openLive && !aperturePhase()) || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at console API");
         ++testState.consoleCalls;
@@ -315,8 +332,9 @@ public:
     bool fragmented = false, wrongSegment = false;
     bool indexedMapping = false, splMapping = false;
     bool probeMapping = false, flushMapping = false, nbifMapping = false, nativeFlushMapping = false;
-    bool kdbMailboxMapping = false, preSosWindowMapping = false;
+    bool kdbMailboxMapping = false, preSosWindowMapping = false, sosWindowMapping = false;
     unsigned preSosWindowIndex = 0;
+    unsigned sosWindowIndex = 0;
     std::function<void()> onAddress;
     IOMemoryMap() { ++testState.mapsLive; }
     ~IOMemoryMap() override;
@@ -369,6 +387,11 @@ public:
             ((offset - testState.apertureOffset) & ((1ULL << 20)-1)) == 0 && n == (1ULL << 20) &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const unsigned preSosIndex = preSosWindow ? static_cast<unsigned>((offset - testState.apertureOffset) >> 20) : 0;
+        const bool sosWindow = testState.sosEnabled && physical == 0x1000000000ULL &&
+            offset >= testState.apertureOffset && offset < testState.apertureOffset + (8ULL << 20) &&
+            ((offset - testState.apertureOffset) & ((1ULL << 20)-1)) == 0 && n == (1ULL << 20) &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const unsigned sosIndex = sosWindow ? static_cast<unsigned>((offset - testState.apertureOffset) >> 20) : 0;
         const bool staging = !testState.preSosEnabled && stagingPhase() && physical == 0x1000000000ULL &&
             (offset == testState.apertureOffset || (testState.splEnabled && offset == testState.apertureOffset + (1ULL << 20))) && n == (1ULL << 20) &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
@@ -396,7 +419,7 @@ public:
         }
         if (nativeFlush && testState.apertureNbifReadLive)
             throw std::runtime_error("native flush RW map aliases a live read-only NBIF map");
-        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !kdbMailbox && !probe && !staging && !preSosWindow && !flush && !nbifRead && !nativeFlush &&
+        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !kdbMailbox && !probe && !staging && !preSosWindow && !sosWindow && !flush && !nbifRead && !nativeFlush &&
             (offset != expectedOffset || n != expectedLength ||
              options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
@@ -405,6 +428,7 @@ public:
         if (onMap) onMap();
         if (mapFail || (indexed && indexedMapFail) ||
             (preSosWindow && static_cast<int>(preSosIndex) == testState.preSosMapFailIndex) ||
+            (sosWindow && static_cast<int>(sosIndex) == testState.preSosMapFailIndex) ||
             (testState.failMapRequest && testState.mapRequests == testState.failMapRequest)) return nullptr;
         auto *map = new IOMemoryMap;
         map->physical = physical + offset + (mapWrongPhysical ? 4 : 0);
@@ -436,8 +460,9 @@ public:
             }
         }
         const bool splWindow = staging && offset == testState.apertureOffset + (1ULL << 20);
-        map->address = (mapNullAddress || (preSosWindow && static_cast<int>(preSosIndex) == testState.preSosMapInvalidIndex)) ? 0 : reinterpret_cast<uintptr_t>(
-            indexed ? selectorStorage.data() : preSosWindow ? testState.preSosCpu[preSosIndex].data() : splWindow ? testState.splCpu.data() : (probe || staging) ? testState.apertureCpu.data() :
+        map->address = (mapNullAddress || (preSosWindow && static_cast<int>(preSosIndex) == testState.preSosMapInvalidIndex) ||
+            (sosWindow && static_cast<int>(sosIndex) == testState.preSosMapInvalidIndex)) ? 0 : reinterpret_cast<uintptr_t>(
+            indexed ? selectorStorage.data() : sosWindow ? testState.sosCpu[sosIndex].data() : preSosWindow ? testState.preSosCpu[preSosIndex].data() : splWindow ? testState.splCpu.data() : (probe || staging) ? testState.apertureCpu.data() :
                 (flush || nbifRead || nativeFlush) ? testState.apertureFlush.data() : storage.data());
         if (mapMisalignedAddress && map->address) ++map->address;
         if (indexed) {
@@ -450,6 +475,12 @@ public:
             map->preSosWindowIndex = preSosIndex;
             testState.preSosWindowLive[preSosIndex] = true;
             testState.preSosPages[preSosIndex] = testState.preSosCpu[preSosIndex].data();
+        }
+        if (sosWindow) {
+            map->sosWindowMapping = true;
+            map->sosWindowIndex = sosIndex;
+            testState.sosWindowLive[sosIndex] = true;
+            testState.sosPages[sosIndex] = testState.sosCpu[sosIndex].data();
         }
         if (probe || staging) {
             if (splWindow) { map->splMapping = true; testState.splMapLive = true; testState.splPage = testState.splCpu.data(); }
@@ -500,6 +531,10 @@ inline IOMemoryMap::~IOMemoryMap() {
     if (preSosWindowMapping) {
         testState.preSosWindowLive[preSosWindowIndex] = false;
         testState.preSosPages[preSosWindowIndex] = nullptr;
+    }
+    if (sosWindowMapping) {
+        testState.sosWindowLive[sosWindowIndex] = false;
+        testState.sosPages[sosWindowIndex] = nullptr;
     }
     if (ownsDescriptor) descriptor->release();
     --testState.mapsLive; ++testState.mapReleases;
@@ -588,11 +623,17 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
         const uint64_t pos = (uint64_t(high) << 31) | (low & 0x7fffffffu);
         if (aperturePhase()) {
             const uint64_t windowBytes = testState.splEnabled ? (2ULL << 20) : stagingPhase() ? (1ULL << 20) : 16;
-            const uint64_t activeWindowBytes = testState.preSosEnabled ? (7ULL << 20) : windowBytes;
-            if ((!testState.preSosEnabled && !testState.probeMapLive) || !(low & 0x80000000u) || (pos & 3) ||
+            const uint64_t activeWindowBytes = testState.sosEnabled ? (8ULL << 20) : testState.preSosEnabled ? (7ULL << 20) : windowBytes;
+            if ((!testState.preSosEnabled && !testState.sosEnabled && !testState.probeMapLive) || !(low & 0x80000000u) || (pos & 3) ||
                 pos < testState.apertureOffset || pos >= testState.apertureOffset + activeWindowBytes)
                 throw std::runtime_error("aperture MM_DATA outside fixed survey window");
-            if (testState.preSosEnabled) {
+            if (testState.sosEnabled) {
+                const unsigned index = static_cast<unsigned>((pos - testState.apertureOffset) >> 20);
+                if (index >= testState.sosWindowLive.size() || !testState.sosWindowLive[index])
+                    throw std::runtime_error("MM_DATA outside mapped SOS CPU window");
+                const size_t word = static_cast<size_t>((pos - testState.apertureOffset) & ((1u << 20)-1)) / 4;
+                value = testState.sosGpu[index][word];
+            } else if (testState.preSosEnabled) {
                 const unsigned index = static_cast<unsigned>((pos - testState.apertureOffset) >> 20);
                 if (index >= testState.preSosWindowLive.size() || !testState.preSosWindowLive[index])
                     throw std::runtime_error("pre-SOS MM_DATA without its bounded window map");
@@ -621,7 +662,8 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
 inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t offset) {
     const bool expectedMaps = testState.mapsLive == 2 || testState.mapsLive == 4 ||
         (stagingPhase() && testState.mapsLive >= 4 && testState.mapsLive <= 8) ||
-        (testState.preSosEnabled && (testState.mapsLive == 12 || testState.mapsLive == 13));
+        (testState.preSosEnabled && (testState.mapsLive == 12 || testState.mapsLive == 13)) ||
+        (testState.sosEnabled && (testState.mapsLive == 13 || testState.mapsLive == 14));
     if (!testState.stateBootPresent || !expectedMaps ||
         (std::find(testState.stateAllowedOffsets.begin(), testState.stateAllowedOffsets.end(), offset) ==
             testState.stateAllowedOffsets.end() && (!testState.kdbEnabled ||
@@ -634,7 +676,7 @@ inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t
             mapping.second + (offset & 0xfffu)) mappedAddress = true;
     if (!mappedAddress) throw std::runtime_error("state MMIO pointer outside mapped page");
     uint32_t observed = 0;
-    if (testState.kdbBootPresent || testState.preSosEnabled) {
+    if (testState.kdbBootPresent || testState.preSosEnabled || testState.sosEnabled) {
         if (offset == 0x458c) observed = 0x80000000u;
         else if (offset == 0x4644) observed = 0;
         else if (offset == 0xa950 || offset == 0x5d14) observed = 0x33;
@@ -650,11 +692,31 @@ inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t
     return actual;
 }
 inline void cobaltSurveyTestKdbWrite32(volatile uint32_t *address, uint32_t value, uint32_t offset) {
-    if ((!testState.kdbEnabled && !testState.splEnabled && !testState.preSosEnabled) || testState.openLive != 1 || !testState.indexedOwner ||
+    if ((!testState.kdbEnabled && !testState.splEnabled && !testState.preSosEnabled && !testState.sosEnabled) || testState.openLive != 1 || !testState.indexedOwner ||
         !testState.kdbMailboxMapLive || !testState.kdbMailboxPage ||
-        (!(testState.kdbClaimed || testState.splClaimed || testState.preSosClaimed)))
+        (!(testState.kdbClaimed || testState.splClaimed || testState.preSosClaimed || testState.sosClaimed)))
         throw std::runtime_error("PSP mailbox write without owned attempt");
     requireExplicitWritableMode();
+    if (testState.sosEnabled) {
+        if (testState.sosFinalStoreSeen) throw std::runtime_error("write after final SOS command store");
+        if (testState.sosWrites == 0) {
+            for (unsigned i = 0; i < testState.sosWindowLive.size(); ++i) {
+                if (!testState.sosWindowLive[i] || testState.sosCpu[i].size() != 262144 ||
+                    testState.sosGpu[i].size() != 262144 || testState.sosCpu[i] != testState.sosGpu[i])
+                    throw std::runtime_error("first mailbox store before all eight SOS images are staged and visible");
+            }
+        }
+        if (offset != testState.kdbAddressByteOffset && offset != 0x458c)
+            throw std::runtime_error("SOS mailbox write outside fixed C2P allowlist");
+        auto *expected = reinterpret_cast<volatile uint32_t *>(
+            reinterpret_cast<volatile uint8_t *>(testState.kdbMailboxPage) + (offset & 0xfffu));
+        if (address != expected) throw std::runtime_error("SOS mailbox pointer outside mapped C2P word");
+        ++testState.sosWrites;
+        testState.sosEvents.push_back({offset, value});
+        if (testState.onSos) testState.onSos(testState.sosEvents.back());
+        if (offset == 0x458c && value == 0x00020000u) testState.sosFinalStoreSeen = true;
+        return;
+    }
     if (testState.preSosEnabled) {
         if (offset != testState.kdbAddressByteOffset && offset != testState.kdbCommandByteOffset)
             throw std::runtime_error("pre-SOS mailbox write outside fixed C2P allowlist");
@@ -684,15 +746,19 @@ inline void cobaltSurveyTestKdbWrite32(volatile uint32_t *address, uint32_t valu
     }
 }
 inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t value) {
+    if (testState.sosEnabled && testState.sosFinalStoreSeen)
+        throw std::runtime_error("selector write after final SOS command store");
     if (!testState.indexedMapLive || testState.openLive != 1 || !testState.indexedOwner)
         throw std::runtime_error("selector write without explicit writable mode");
     requireExplicitWritableMode();
     const auto offset = static_cast<uint32_t>(address - testState.indexedPage) * 4;
+    if (testState.sosEnabled && testState.sosFinalStoreSeen)
+        throw std::runtime_error("selector write after final SOS command store");
     if (offset != 0 && offset != 0x18) throw std::runtime_error("write outside selectors");
     *address = value; ++testState.selectorWrites;
     const MmioEvent event {'w', offset, value}; testState.mmioEvents.push_back(event);
     if (aperturePhase()) {
-        if (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed)
+        if (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed && !testState.sosClaimed)
             throw std::runtime_error("aperture selector write before persistent claim");
         apertureEvent('s', offset, value);
     }
@@ -701,7 +767,7 @@ inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t
 
 inline void apertureIoOwnership(bool permitStagingBackupRead = false) {
     if (!aperturePhase() || !testState.indexedOwner ||
-        (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed &&
+        (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed && !testState.sosClaimed &&
          !(permitStagingBackupRead && stagingPhase())))
         throw std::runtime_error("aperture access without owned explicit attempt");
     requireExplicitWritableMode();
@@ -723,6 +789,16 @@ inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
     apertureIoOwnership(true);
     const size_t maxWords = stagingPhase() ? 262144 : 4;
     const uintptr_t pointer = reinterpret_cast<uintptr_t>(address);
+    if (testState.sosEnabled) for (unsigned i = 0; i < testState.sosPages.size(); ++i) {
+        const auto base = reinterpret_cast<uintptr_t>(testState.sosPages[i]);
+        if (testState.sosWindowLive[i] && base && pointer >= base && pointer < base + maxWords * sizeof(uint32_t)) {
+            uint32_t value = *address;
+            if (testState.apertureCpuRead) value = testState.apertureCpuRead(testState.apertureCpuReads, value);
+            ++testState.apertureCpuReads;
+            apertureEvent('c', i * (1u << 20) + static_cast<uint32_t>(pointer - base), value);
+            return value;
+        }
+    }
     for (unsigned i = 0; i < testState.preSosPages.size(); ++i) {
         const auto base = reinterpret_cast<uintptr_t>(testState.preSosPages[i]);
         if (testState.preSosWindowLive[i] && base && pointer >= base && pointer < base + maxWords * sizeof(uint32_t)) {
@@ -746,12 +822,22 @@ inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
 }
 inline void cobaltSurveyTestApertureCpuWrite(volatile uint32_t *address, uint32_t value) {
     apertureIoOwnership();
+    if (testState.sosEnabled && testState.sosWrites)
+        throw std::runtime_error("CPU window write after an SOS mailbox attempt");
     const size_t maxWords = stagingPhase() ? 262144 : 4;
     if (testState.preSosEnabled && testState.preSosWrites)
         throw std::runtime_error("CPU window write after a pre-SOS mailbox attempt");
     if (testState.splEnabled && testState.kdbWrites + testState.splWrites)
         throw std::runtime_error("CPU window write after a PSP mailbox attempt");
     const uintptr_t pointer = reinterpret_cast<uintptr_t>(address);
+    if (testState.sosEnabled) for (unsigned i = 0; i < testState.sosPages.size(); ++i) {
+        const auto base = reinterpret_cast<uintptr_t>(testState.sosPages[i]);
+        if (testState.sosWindowLive[i] && base && pointer >= base && pointer < base + maxWords * sizeof(uint32_t)) {
+            *address = value; ++testState.apertureCpuWrites;
+            apertureEvent('v', i * (1u << 20) + static_cast<uint32_t>(pointer - base), value);
+            return;
+        }
+    }
     for (unsigned i = 0; i < testState.preSosPages.size(); ++i) {
         const auto base = reinterpret_cast<uintptr_t>(testState.preSosPages[i]);
         if (testState.preSosWindowLive[i] && base && pointer >= base && pointer < base + maxWords * sizeof(uint32_t)) {
@@ -775,6 +861,8 @@ inline void cobaltSurveyTestApertureFence() {
 }
 inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
     apertureIoOwnership();
+    if (testState.sosEnabled && testState.sosWrites)
+        throw std::runtime_error("HDP flush after an SOS mailbox attempt");
     if (testState.preSosEnabled && testState.preSosWrites)
         throw std::runtime_error("HDP flush after a pre-SOS mailbox attempt");
     if ((testState.splEnabled && testState.kdbWrites + testState.splWrites) ||
@@ -795,6 +883,9 @@ inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
     for (unsigned i = 0; i < testState.preSosWindowLive.size(); ++i)
         if (testState.preSosWindowLive[i])
             std::copy_n(testState.preSosCpu[i].data(), 262144, testState.preSosGpu[i].data());
+    for (unsigned i = 0; i < testState.sosWindowLive.size(); ++i)
+        if (testState.sosWindowLive[i])
+            std::copy_n(testState.sosCpu[i].data(), 262144, testState.sosGpu[i].data());
     ++testState.apertureFlushWrites;
     apertureEvent('h', 0, 0);
 }
@@ -807,15 +898,16 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool kdb = std::string(key) == "cobalt-survey-kdb";
     const bool spl = std::string(key) == "cobalt-survey-spl";
     const bool preSos = std::string(key) == "cobalt-survey-presos";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos) throw std::runtime_error("unexpected boot argument");
+    const bool sos = std::string(key) == "cobalt-survey-sos";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos) throw std::runtime_error("unexpected boot argument");
     if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
-        preSos ? !testState.preSosBootPresent :
+        sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
         spl ? !testState.splBootPresent : kdb ? !testState.kdbBootPresent :
         aperture ? !testState.apertureBootPresent : staging ? !testState.stagingBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
         aperture ? testState.apertureBoot : staging ? testState.stagingBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
@@ -825,13 +917,15 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (staging) testState.stagingEnabled = integer == 1;
         if (kdb) testState.kdbEnabled = integer == 1;
         if (spl) testState.splEnabled = integer == 1;
-        if (preSos) testState.preSosEnabled = integer == 1;
+        if (preSos) testState.preSosEnabled = integer == 1 && !testState.sosEnabled;
+        if (sos) testState.sosEnabled = integer == 1;
         std::memcpy(out, &integer, static_cast<size_t>(n) < sizeof(integer) ? static_cast<size_t>(n) : sizeof(integer));
     } else {
         if (staging) testState.stagingEnabled = false;
         if (kdb) testState.kdbEnabled = false;
         if (spl) testState.splEnabled = false;
         if (preSos) testState.preSosEnabled = false;
+        if (sos) testState.sosEnabled = false;
         std::memset(out, 0, static_cast<size_t>(n));
         std::memcpy(out, token.data(), token.size() < static_cast<size_t>(n) ? token.size() : static_cast<size_t>(n));
     }

@@ -16,6 +16,13 @@
 #include "psp_container.hpp"
 #include "psp_firmware.hpp"
 #include "presos_manifest.hpp"
+#include "sos_manifest.hpp"
+
+#if defined(_MSC_VER)
+#define COBALT_SURVEY_NOINLINE __declspec(noinline)
+#else
+#define COBALT_SURVEY_NOINLINE __attribute__((noinline))
+#endif
 
 #define super IOService
 OSDefineMetaClassAndStructors(CobaltNavi44Survey, IOService)
@@ -74,6 +81,14 @@ bool preSosArmed() {
     uint32_t value = 0;
     return PE_parse_boot_argn("cobalt-survey-presos", &value, sizeof(value)) && value == 1u;
 }
+
+bool sosArmed() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-sos", &value, sizeof(value)) && value == 1u;
+}
+
+constexpr unsigned kSosCount = cobalt::survey::kSosImageCount;
+static_assert(kSosCount == 8, "hardware SOS inventory must be exactly eight");
 
 constexpr unsigned kPreSosCount = cobalt::survey::kPreSosImageCount;
 static_assert(kPreSosCount == 7, "hardware pre-SOS inventory must be exactly seven");
@@ -193,6 +208,7 @@ public:
     void address(uint32_t value) const { store(target.addressOffset, value); }
     void command() const { store(target.commandOffset, 0x00080000u); }
     void splCommand() const { store(target.commandOffset, 0x10000000u); }
+    void sosCommand() const { store(target.commandOffset, 0x00020000u); }
     // Only this immutable manifest selects new mailbox commands. No writable
     // mapping or caller-provided command value is exposed.
     bool preSosCommandForIndex(unsigned index) const {
@@ -1015,6 +1031,16 @@ struct PreSosResult : KdbResult {
     KdbResult part[kPreSosCount] {};
     bool sharedApiUsed {false};
     uint32_t phase {0};
+};
+
+// SOS startup has its own fixed inventory and direct transition result.
+struct SosBootResult : KdbResult {
+    cobalt::survey::FirmwareBatchPlan batch {false, "not-planned", 0, {}};
+    KdbResult part[kSosCount] {};
+    bool sharedApiUsed {false};
+    uint32_t phase {0};
+    uint32_t initialSosRaw {0}, finalSosRaw {0};
+    bool sosAliveObserved {false};
 };
 
 void clearStagingProperties(IOService *service) {
@@ -2510,6 +2536,400 @@ public:
 };
 
 
+// Independent startup adapter; no post-command writable cleanup is permitted.
+class SosBootTransaction final : public n48::HwAccess, public cobalt::psp::StagingBus {
+    IOService *service;
+    IOPCIDevice *pci;
+    const PciState &state;
+    const Aperture &mmio, &vram;
+    ProviderSession &session;
+    const ApertureProof &ap;
+    const KdbProof &proof;
+    const ConsoleObservation &console;
+    HdpFlushTarget target;
+    SosBootResult &result;
+    uint32_t mib;
+    const volatile uint8_t *nbif, *mmhub, *dmu;
+    KdbMailboxMapping mp0;
+    StagingMapping cpu[kSosCount];
+    volatile uint32_t *flush;
+    SelectorIO io;
+    uint32_t *original[kSosCount];
+    const uint8_t *payload[kSosCount];
+    cobalt::psp::StagingWindow windows[kSosCount];
+    unsigned active {0}, preparation {0};
+    bool directReadyPending {false};
+    KdbResult &part() { return result.part[active]; }
+    const KdbResult &part() const { return result.part[active]; }
+    cobalt::psp::StagingWindow &window() { return windows[active]; }
+    size_t payloadBytes() const { return cobalt::survey::kSosImages[active].bytes; }
+    bool mailboxAttempted() const { return result.phase != 0; }
+    uint32_t savedLow {0}, savedHigh {0};
+    bool pinned {false}, selectorDirty {false}, vramDirty[kSosCount] {};
+    bool zeroRequested[kSosCount] {}, copyRequested[kSosCount] {}, originalIndexed[kSosCount] {};
+    static constexpr size_t kBytes = cobalt::psp::StagingWindow::kBytes;
+    static constexpr size_t kChunk = cobalt::psp::StagingWindow::kChunkBytes;
+    bool lose() { result.contextLost = true; return false; }
+    bool baseGuard() {
+        if (result.contextLost) return false;
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
+            !apertureOnlyClient(pci, service)) return lose();
+        IOPlatformExpert *platform = IOService::getPlatform();
+        PE_Video video {};
+        if (!platform || platform->getConsoleInfo(&video) != kIOReturnSuccess) return lose();
+        uint64_t values[kConsoleScalarCount] {};
+        consoleScalars(video, values);
+        for (unsigned n = 0; n < kConsoleScalarCount; ++n)
+            if (values[n] != console.values[n]) return lose();
+        return (session.owns() && consoleGuard(pci, state, mmio, vram) &&
+            apertureOnlyClient(pci, service)) || lose();
+    }
+    bool rawState(unsigned n, uint32_t &value, bool direct = false) {
+        if (n >= 6 || !baseGuard()) return false;
+        const volatile uint8_t *page = n < 2 ? mp0.readBytes() : (n < 5 ? mmhub : dmu);
+        if (!page) return lose();
+        const auto *word = reinterpret_cast<const volatile uint32_t *>(page + (proof.offsets[n] & 0xfff));
+#if defined(COBALT_SURVEY_HOSTTEST)
+        value = cobaltSurveyTestReadState32(const_cast<volatile uint32_t *>(word), proof.offsets[n]);
+#else
+        value = *word;
+#endif
+        ++result.registerReads;
+        if (direct && n == 0 && result.phase >= 2 && result.phase < 16 && !(result.phase & 1u))
+            result.part[result.phase / 2 - 1].lastStatus = value;
+        // Busy is allowed only while waiting for a command whose completion
+        // has not yet been observed. Once ready+SOS0 was directly observed,
+        // losing ready also invalidates the gap after the next address store.
+        const bool awaitingCompletion = result.phase >= 2 && result.phase < 16 && !(result.phase & 1u) &&
+            !result.part[result.phase / 2 - 1].readyObserved;
+        if (direct && n == 1 && result.phase == 16) {
+            result.finalSosRaw = value;
+            result.part[kSosCount - 1].lastStatus = value;
+        }
+        if (value == UINT32_MAX || (n == 1 && result.phase < 16 && value != 0) ||
+            (n == 1 && result.sosAliveObserved && value == 0) ||
+            (n == 0 && result.phase < 16 && !(value & 0x80000000u) && !awaitingCompletion) ||
+            (n == 0 && result.phase < 2 && value != 0x80000000u) ||
+            (n >= 2 && pinned && value != result.raw[n])) return lose();
+        return baseGuard();
+    }
+    bool nbifRead(uint32_t offset, uint32_t &value) {
+        if (!baseGuard()) return false;
+        value = apertureRegisterRead(reinterpret_cast<const volatile uint32_t *>(nbif + (offset & 0xfff)), offset);
+        if (value == UINT32_MAX) return lose();
+        return baseGuard();
+    }
+    bool selectorRead(uint32_t &low, uint32_t &high) {
+        if (!guard()) return false;
+        low = io.low();
+        if (low == UINT32_MAX) return lose();
+        if (!guard()) return false;
+        high = io.high();
+        if (high == UINT32_MAX) return lose();
+        return guard();
+    }
+    bool selectorWrite(bool high, uint32_t value) {
+        if (result.phase >= 16 || !guard()) return false;
+        selectorDirty = true; ++result.selectorWrites;
+        if (high) io.high(value); else io.low(value);
+        return guard();
+    }
+    static uint32_t sourceWord(const uint8_t *source) {
+        return static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8) |
+            (static_cast<uint32_t>(source[2]) << 16) | (static_cast<uint32_t>(source[3]) << 24);
+    }
+    uint32_t expected(size_t index, unsigned mode) const {
+        if (mode == 1) return original[active][index];
+        if (mode == 3 && index * 4 < payloadBytes()) return sourceWord(payload[active] + index * 4);
+        return 0;
+    }
+    bool readWindow(unsigned mode) {
+        for (size_t offset = 0; offset < kBytes; offset += kChunk) {
+            if (!guard()) return false;
+            ++result.cpuReadChunks; ++part().cpuReadChunks;
+            bool matches = true;
+            for (size_t local = 0; local < kChunk; local += 4) {
+                const size_t index = (offset + local) / 4;
+                uint32_t value = 0;
+                if (!cpu[active].read(index, value)) return lose();
+                result.cpuReadBytes += 4; part().cpuReadBytes += 4;
+                if (!mode) original[active][index] = value;
+                else if (value != expected(index, mode)) matches = false;
+            }
+            if (!guard() || !matches) return false;
+        }
+        return true;
+    }
+    bool indexedSamples(unsigned mode) {
+        for (size_t page = 0; page < kBytes; page += kChunk) for (unsigned edge = 0; edge < 2; ++edge) {
+            const size_t offset = page + (edge ? kChunk - 4 : 0);
+            const uint64_t address = part().plan.windowOffset + offset;
+            const uint32_t low = static_cast<uint32_t>(address) | 0x80000000u;
+            const uint32_t high = static_cast<uint32_t>(address >> 31);
+            if (!selectorWrite(false, low) || !selectorWrite(true, high)) return false;
+            uint32_t observedLow = 0, observedHigh = 0;
+            if (!selectorRead(observedLow, observedHigh)) return false;
+            if (observedLow != low || observedHigh != high) return lose();
+            if (!guard()) return false;
+            const uint32_t value = io.data(); ++result.dataReads;
+            // An all-ones VRAM word is valid data; only registers use the
+            // unreadable sentinel. Edges are compared to the CPU image.
+            if (!guard() || value != expected(offset / 4, mode)) return false;
+        }
+        return true;
+    }
+    bool writeChunk(uint64_t offset, const uint8_t *source, size_t length) {
+        if (mailboxAttempted() || !cpu[active].valid() || !length || length > kChunk ||
+            (offset & 3) || (length & 3) || offset < part().plan.windowOffset ||
+            offset - part().plan.windowOffset > kBytes || length > kBytes - (offset - part().plan.windowOffset)) return false;
+        if (!guard()) return false;
+        const size_t index = static_cast<size_t>((offset - part().plan.windowOffset) / 4);
+        for (size_t local = 0; local < length; local += 4) {
+            vramDirty[active] = true;
+            if (!cpu[active].write(index + local / 4, source ? sourceWord(source + local) : 0)) return lose();
+            ++result.vramWrites;
+        }
+        return guard();
+    }
+public:
+    SosBootTransaction(IOService *s, IOPCIDevice *p, const PciState &st, const Aperture &m, const Aperture &v,
+        ProviderSession &owner, const ApertureProof &a, const KdbProof &ip, const ConsoleObservation &co,
+        HdpFlushTarget selected, SosBootResult &r, uint32_t size, const volatile uint8_t *registers,
+        KdbMailboxMapping mailbox, const volatile uint8_t *hub, const volatile uint8_t *display,
+        const StagingMapping (&mappings)[kSosCount], volatile uint32_t *flushWord, volatile uint32_t *selectors,
+        uint32_t *const (&backups)[kSosCount], const uint8_t *const (&sources)[kSosCount])
+        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), ap(a), proof(ip), console(co),
+          target(selected), result(r), mib(size), nbif(registers), mmhub(hub), dmu(display), mp0(mailbox),
+          flush(flushWord), io(selectors), windows{
+              {*this, r.part[0].plan.windowOffset}, {*this, r.part[1].plan.windowOffset},
+              {*this, r.part[2].plan.windowOffset}, {*this, r.part[3].plan.windowOffset},
+              {*this, r.part[4].plan.windowOffset}, {*this, r.part[5].plan.windowOffset},
+              {*this, r.part[6].plan.windowOffset}, {*this, r.part[7].plan.windowOffset}} {
+        for (unsigned n = 0; n < kSosCount; ++n) {
+            cpu[n] = mappings[n]; original[n] = backups[n]; payload[n] = sources[n];
+        }
+    }
+    bool guard() {
+        if (result.contextLost) return false;
+        uint32_t remap = 0, memsize = 0;
+        if (!target.valid() || !nbifRead(ap.remapOffset, remap) || remap != target.byteOffset ||
+            !nbifRead(ap.memsizeOffset, memsize) || memsize != mib) return lose();
+        for (unsigned n = 0; n < 6; ++n) {
+            uint32_t value = 0;
+            if (!rawState(n, value)) return false;
+            if (n == 0) {
+                if (result.phase < 2 && value != 0x80000000u) return lose();
+            } else if ((n == 1 && result.phase < 16 && value != 0) || (n >= 2 && pinned && value != result.raw[n])) return lose();
+        }
+        return true;
+    }
+    const char *prepare(const StateObservation &prior) {
+        for (unsigned pass = 0; pass < 2; ++pass) for (unsigned n = 0; n < 6; ++n) {
+            uint32_t value = 0;
+            if (!rawState(n, value)) return "fresh-state-unreadable-or-context-changed";
+            if (!pass) result.raw[n] = value;
+            else if (result.raw[n] != value) { lose(); return "fresh-state-unstable"; }
+        }
+        if (result.raw[0] != 0x80000000u || result.raw[1] != 0 || result.raw[2] != prior.values[2] ||
+            result.raw[3] != prior.values[3] || result.raw[2] > 0xffffff || result.raw[3] > 0xffffff ||
+            result.raw[4] > 0xffffff || (result.raw[5] & 0xffffff) != result.raw[2]) { lose(); return "fresh-state-policy-refused"; }
+        // FB_OFFSET is separately recorded and pinned. Its relationship to
+        // FB_LOCATION_BASE is not an established MC-translation proof.
+        result.initialSosRaw = result.raw[1];
+        pinned = true;
+        if (!guard()) return "device-context-changed";
+        uint32_t low = 0, high = 0;
+        if (!selectorRead(savedLow, savedHigh) || !selectorRead(low, high)) return "selectors-unreadable-or-context-changed";
+        if (low != savedLow || high != savedHigh) return "selectors-unstable";
+        for (active = 0; active < kSosCount; ++active) {
+            if (!readWindow(0) || !readWindow(1)) return "original-read-mismatch";
+            part().originalStable = true;
+        }
+        active = 0; result.originalStable = true;
+        return nullptr;
+    }
+    bool verifyOriginalIndexed() {
+        for (active = 0; active < kSosCount; ++active) {
+            originalIndexed[active] = result.attempted && part().originalStable && indexedSamples(1);
+            if (!originalIndexed[active]) return false;
+        }
+        active = 0;
+        return true;
+    }
+    bool contextValid() override { return !mailboxAttempted() && guard(); }
+    bool zeroChunk(uint64_t offset, size_t length) override {
+        return zeroRequested[active] && !copyRequested[active] && writeChunk(offset, nullptr, length);
+    }
+    bool copyChunk(uint64_t offset, const uint8_t *source, size_t length) override {
+        if (!copyRequested[active] || !source || offset < part().plan.windowOffset) return false;
+        const uint64_t relative = offset - part().plan.windowOffset;
+        if (relative >= payloadBytes() || length > payloadBytes() - relative || source != payload[active] + relative) return false;
+        return writeChunk(offset, source, length);
+    }
+    bool flushWrites() override {
+        if (mailboxAttempted() || !guard()) return false;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureFence();
+#else
+        __asm__ volatile("mfence" ::: "memory");
+#endif
+        if (!guard()) return false;
+        ++result.flushWrites; ++part().flushWrites;
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestApertureFlush(flush);
+#else
+        *flush = 0;
+#endif
+        uint32_t posted = 0;
+        if (!nbifRead(ap.memsizeOffset, posted) || posted != mib) return lose();
+        return guard();
+    }
+    uint32_t regReadIp(uint16_t hw, uint8_t instance, uint8_t segment, uint32_t word) override {
+        unsigned n = 6;
+        if (!instance && !segment && hw == IpDiscovery::HwMp0) {
+            if (word == 0x63) n = 0;
+            else if (word == 0x91) n = 1;
+        } else if (!instance && !segment && hw == IpDiscovery::HwMmhub) {
+            if (word == 0x554) n = 2;
+            else if (word == 0x555) n = 3;
+            else if (word == 0x4c7) n = 4;
+        } else if (!instance && segment == 2 && hw == IpDiscovery::HwDmu && word == 0x475) n = 5;
+        if (n == 6 || !guard()) { lose(); return UINT32_MAX; }
+        uint32_t value = 0;
+        if (!rawState(n, value, true)) return UINT32_MAX;
+        // Only consecutive DIRECT protocol boot-ready then DIRECT SOS0
+        // observations authorize the next address. Stable guard reads cannot.
+        if (n == 1 && result.phase == 16) {
+            if (value != 0) result.sosAliveObserved = true;
+            directReadyPending = false;
+        } else if (n == 0 && result.phase >= 2 && result.phase < 16 && !(result.phase & 1u)) {
+            KdbResult &response = result.part[result.phase / 2 - 1];
+            if (response.readyObserved && !(value & 0x80000000u)) { lose(); return UINT32_MAX; }
+            directReadyPending = (value & 0x80000000u) != 0;
+        } else if (n == 1 && directReadyPending && result.phase >= 2 && result.phase < 16 && !(result.phase & 1u)) {
+            result.part[result.phase / 2 - 1].readyObserved = true;
+            directReadyPending = false;
+        } else directReadyPending = false;
+        if (!guard()) return UINT32_MAX;
+        return value;
+    }
+    bool regWriteIp(uint16_t hw, uint8_t instance, uint8_t segment, uint32_t word, uint32_t value) override {
+        if (!result.attempted || hw != IpDiscovery::HwMp0 || instance || segment ||
+            result.phase >= 2 * kSosCount || !guard()) return false;
+        for (unsigned n = 0; n < kSosCount; ++n)
+            if (!windows[n].payloadVisible() || !result.part[n].copyVerified) return false;
+        uint32_t boot = 0, sos = 0;
+        if (!rawState(0, boot)) return false;
+        if (!(boot & 0x80000000u)) return lose();
+        if (!rawState(1, sos) || sos != 0 || !guard()) return false;
+        const unsigned which = result.phase / 2;
+        KdbResult &p = result.part[which];
+        if (word == 0x64 && !(result.phase & 1u) &&
+            value == static_cast<uint32_t>(p.plan.mcAddress >> 20) &&
+            (!which || (result.part[which - 1].commandAttempted && result.part[which - 1].readyObserved)) &&
+            !p.addressAttempted && !p.commandAttempted) {
+            p.addressAttempted = true; ++p.addressWrites; ++result.addressWrites;
+            result.addressAttempted = result.resetRequired = result.stagingPreserved = true;
+            for (auto &image : result.part) image.stagingPreserved = true;
+            ++result.phase; directReadyPending = false;
+            mp0.address(value);
+            return guard();
+        }
+        if (word == 0x63 && (result.phase & 1u) &&
+            value == cobalt::survey::kSosImages[which].command && p.addressAttempted && !p.commandAttempted) {
+            p.commandAttempted = true; ++p.commandWrites; ++result.commandWrites;
+            result.commandAttempted = result.resetRequired = true;
+            ++result.phase; directReadyPending = false;
+            if (which == kSosCount - 1) {
+                // phase 16 was latched BEFORE this final permitted hardware write.
+                mp0.sosCommand();
+            } else if (!mp0.preSosCommandForIndex(which)) return lose();
+            return guard();
+        }
+        return false;
+    }
+    void helperStats() {
+        result.helperStats = {};
+        for (unsigned n = 0; n < kSosCount; ++n) {
+            result.part[n].helperStats = windows[n].stats();
+            const auto &stats = result.part[n].helperStats;
+            result.helperStats.zeroBytesIssued += stats.zeroBytesIssued;
+            result.helperStats.copyBytesIssued += stats.copyBytesIssued;
+            result.helperStats.zeroChunksIssued += stats.zeroChunksIssued;
+            result.helperStats.copyChunksIssued += stats.copyChunksIssued;
+            result.helperStats.flushesIssued += stats.flushesIssued;
+        }
+    }
+    bool vramMemset(uint64_t offset, uint8_t value, size_t length) override {
+        if (preparation >= 2 * kSosCount || (preparation & 1u)) return false;
+        active = preparation / 2;
+        if (mailboxAttempted() || !result.attempted || !part().originalStable || !originalIndexed[active] ||
+            zeroRequested[active] || copyRequested[active] || value || offset != part().plan.windowOffset || length != kBytes || !guard()) return false;
+        zeroRequested[active] = true;
+        const bool zeroed = window().zero(offset, length); helperStats();
+        if (!zeroed || !window().cleared() || !readWindow(2) || !indexedSamples(2)) return false;
+        part().zeroVerified = true; ++preparation;
+        result.zeroVerified = true;
+        for (const auto &image : result.part) result.zeroVerified = image.zeroVerified && result.zeroVerified;
+        return true;
+    }
+    bool vramWrite(uint64_t offset, const void *source, size_t length) override {
+        if (preparation >= 2 * kSosCount || !(preparation & 1u)) return false;
+        active = preparation / 2;
+        if (mailboxAttempted() || !result.attempted || !part().zeroVerified || copyRequested[active] ||
+            source != payload[active] || length != payloadBytes() || offset != part().plan.windowOffset || !guard()) return false;
+        copyRequested[active] = true;
+        const bool copied = window().copy(offset, source, length); helperStats();
+        if (!copied || !window().payloadVisible() || !readWindow(3) || !indexedSamples(3)) return false;
+        part().copyVerified = true; ++preparation;
+        result.copyVerified = true;
+        for (const auto &image : result.part) result.copyVerified = image.copyVerified && result.copyVerified;
+        return true;
+    }
+    bool cleanup() {
+        bool restored = true;
+        if (mailboxAttempted()) {
+            result.resetRequired = result.stagingPreserved = true;
+            for (auto &image : result.part) image.stagingPreserved = true;
+            result.vramCleanup = "preserved-until-cold-reset";
+            result.cleanup = "staging-preserved-reset-required";
+        } else {
+            for (active = 0; active < kSosCount; ++active) if (vramDirty[active]) {
+                bool ok = guard();
+                for (size_t offset = 0; ok && offset < kBytes; offset += kChunk) {
+                    if (!guard()) { ok = false; break; }
+                    ++result.restoreChunks; result.restoreBytes += kChunk;
+                    ++part().restoreChunks; part().restoreBytes += kChunk;
+                    ok = writeChunk(part().plan.windowOffset + offset,
+                        reinterpret_cast<const uint8_t *>(original[active]) + offset, kChunk);
+                }
+                ok = ok && flushWrites() && readWindow(1) && indexedSamples(1);
+                part().restoreVerified = ok; restored = ok && restored;
+            }
+            bool dirty = false;
+            for (bool imageDirty : vramDirty) dirty = imageDirty || dirty;
+            result.restoreVerified = restored && dirty;
+            if (dirty) {
+                result.vramCleanup = restored ? "restored-observed" : "restore-skipped-or-unverified";
+                result.cleanup = restored ? "vram-and-selectors-restored-observed" : "vram-restore-unverified";
+            }
+        }
+        if (result.phase == 16) {
+            // Startup owns the device now. Even selector restoration is forbidden.
+            result.selectorCleanup = "preserved-after-sos-command";
+        } else if (selectorDirty) {
+            uint32_t low = 0, high = 0;
+            const bool ok = selectorWrite(false, savedLow) && selectorWrite(true, savedHigh) &&
+                selectorRead(low, high) && low == savedLow && high == savedHigh;
+            result.selectorCleanup = ok ? "restored-observed" : "restore-skipped-or-unverified";
+            if (!ok) { restored = false; result.cleanup = "selector-restore-skipped-or-unverified"; }
+        }
+        if (!restored) result.resetRequired = true;
+        return restored;
+    }
+};
+
+
 const char *freshApertureState(IOService *service, IOPCIDevice *pci, const PciState &state,
     const Aperture &mmio, const Aperture &vram, ProviderSession &session,
     const ApertureProof &proof, const StateObservation &prior) {
@@ -2754,7 +3174,7 @@ void runKdb(IOService *service, IOPCIDevice *pci, const PciState &state,
     }
     constexpr const char *attemptKey = "CobaltSurvey,KdbAttempt-v1";
     if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+        pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
     Map nbif, selectors, staging, flush, mp0, mmhub, dmu;
@@ -2815,7 +3235,7 @@ void runKdb(IOService *service, IOPCIDevice *pci, const PciState &state,
         result.status = "psp-preflight-refused"; return;
     }
     if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+        pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
     if (!service->setProperty("CobaltSurvey,Ready", false) ||
@@ -2889,7 +3309,7 @@ void runKdbSpl(IOService *service, IOPCIDevice *pci, const PciState &state,
     }
     constexpr const char *attemptKey = "CobaltSurvey,KdbSplAttempt-v1";
     if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+        pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
     Map nbif, selectors, staging, splStaging, flush, mp0, mmhub, dmu;
@@ -2952,7 +3372,7 @@ void runKdbSpl(IOService *service, IOPCIDevice *pci, const PciState &state,
         result.status = "psp-preflight-refused"; return;
     }
     if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+        pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
     if (!service->setProperty("CobaltSurvey,Ready", false) ||
@@ -3033,7 +3453,7 @@ void runPreSosSurvey(IOService *service, IOPCIDevice *pci, const PciState &state
     }
     constexpr const char *attemptKey = "CobaltSurvey,PreSosAttempt-v1";
     if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1")) {
+        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
     Map nbif, selectors, staging[kPreSosCount], flush, mp0, mmhub, dmu;
@@ -3102,7 +3522,7 @@ void runPreSosSurvey(IOService *service, IOPCIDevice *pci, const PciState &state
         result.status = "psp-preflight-refused"; return;
     }
     if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1")) {
+        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
     if (!service->setProperty("CobaltSurvey,Ready", false) ||
@@ -3126,6 +3546,164 @@ void runPreSosSurvey(IOService *service, IOPCIDevice *pci, const PciState &state
     }
     const bool cleaned = transaction.cleanup();
     result.success = result.readyObserved && cleaned && !result.contextLost;
+    if (!cleaned) {
+        result.resetRequired = true;
+        result.status = "cleanup-unverified";
+    }
+    for (auto &image : storage) image.reset();
+    dmu.reset(); mmhub.reset(); mp0.reset(); flush.reset();
+    for (auto &image : staging) image.reset();
+    selectors.reset(); nbif.reset();
+    session.close();
+}
+
+
+void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, uint32_t mib, const ApertureProof &ap,
+    const KdbProof &proof, const StateObservation &prior, const ConsoleObservation &console, SosBootResult &result) {
+    if (!sosArmed() || !preSosArmed() || !splArmed() || !kdbArmed() || !armed() || !indexedArmed() || !stateArmed() || !apertureArmed() || !stagingArmed()) {
+        result.status = "all-nine-flags-required"; return;
+    }
+    if ((state.classRevision & 0xff) != 0xc0 || state.subsystem != 0x86011eae ||
+        vram.length != (256ULL << 20) || mmio.length != 0x80000) {
+        result.status = "board-policy-refused"; return;
+    }
+    if (ap.failure || proof.failure) { result.status = ap.failure ? ap.failure : proof.failure; return; }
+    for (unsigned n = 0; n < 6; ++n) result.offsets[n] = proof.offsets[n];
+    result.nativeFlushOffset = ap.nativeFlushOffset;
+    if (!console.span || prior.values[0] != 0x80000000u || prior.values[1] != 0 ||
+        prior.values[2] > 0xffffff || prior.values[3] > 0xffffff) {
+        result.status = "state-or-console-policy-refused"; return;
+    }
+    // This is the existing conservative exclusion plan, not proof that
+    // firmware or another owner has reserved this region for the diagnostic.
+    result.batch = cobalt::survey::planFirmwareBatch({vram.physical,
+        (static_cast<uint64_t>(state.bars[1]) << 32) | (state.bars[0] & ~0xfu), vram.length,
+        static_cast<uint64_t>(mib) << 20, static_cast<uint64_t>(prior.values[2]) << 24,
+        (static_cast<uint64_t>(prior.values[3]) + 1) << 24,
+        console.values[0] & ~3ULL, console.span, 516ULL << 20}, kSosCount);
+    for (unsigned n = 0; n < kSosCount; ++n) result.part[n].plan = result.batch.windows[n];
+    if (!result.batch.ok || result.batch.count != kSosCount) { result.status = "window-plan-refused"; return; }
+    const cobalt::survey::FirmwareView firmware = cobalt::survey::psp1402Firmware();
+    cobalt::psp::Package package {};
+    if (firmware.size != cobalt::survey::kSosFirmwareBytes ||
+        !cobalt::psp::parse(firmware.data, firmware.size, package) ||
+        package.part[cobalt::psp::RasDrv].data || package.part[cobalt::psp::RasDrv].size) {
+        result.status = "firmware-package-invalid"; return;
+    }
+    const uint8_t *sources[kSosCount] {};
+    for (unsigned n = 0; n < kSosCount; ++n) {
+        const auto &spec = cobalt::survey::kSosImages[n];
+        const auto &image = package.part[spec.type];
+        if (image.data != firmware.data + spec.fileOffset || image.size != spec.bytes || image.version != spec.version) {
+            result.status = "firmware-package-invalid"; return;
+        }
+        sources[n] = image.data;
+    }
+    if (!apertureOnlyClient(pci, service)) { result.status = "peer-refused"; return; }
+    ProviderSession session(pci, service);
+    if (!session.open()) { result.status = "provider-busy"; return; }
+    if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {
+        result.status = "device-context-changed"; return;
+    }
+    constexpr const char *attemptKey = "CobaltSurvey,SosBootAttempt-v1";
+    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+        result.status = "already-attempted"; return;
+    }
+    Map nbif, selectors, staging[kSosCount], flush, mp0, mmhub, dmu;
+    if (!nbif.create(mmio, ap.remapOffset & ~0xfffu, 4096)) { result.status = "nbif-map-failed"; return; }
+    const volatile uint8_t *registers = nbif.bytes();
+    if (!registers || (reinterpret_cast<uintptr_t>(registers) & 3)) { result.status = "nbif-map-invalid"; return; }
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {
+            result.status = "device-context-changed"; return;
+        }
+        result.remap[pass] = apertureRegisterRead(reinterpret_cast<const volatile uint32_t *>(
+            registers + (ap.remapOffset & 0xfff)), ap.remapOffset);
+        if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {
+            result.status = "device-context-changed"; return;
+        }
+        if (result.remap[pass] != 0x7f000 && result.remap[pass] != ap.nativeFlushOffset) {
+            result.status = "hdp-remap-not-whitelisted"; return;
+        }
+    }
+    if (result.remap[0] != result.remap[1]) { result.status = "hdp-remap-unstable"; return; }
+    const HdpFlushTarget target {result.remap[0], ap.nativeFlushOffset, result.remap[0] == ap.nativeFlushOffset};
+    if (!target.valid()) { result.status = "hdp-flush-target-invalid"; return; }
+    result.flushOffset = target.byteOffset;
+    result.flushRoute = target.native ? "native-nbif" : "isolated-remap";
+    result.guardMapping = target.native ? "shared-native-rw" : "read-only-nbif";
+    if (target.native) { registers = nullptr; nbif.reset(); }
+    if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {
+        result.status = "device-context-changed"; return;
+    }
+    if (!selectors.createIndexedPage(mmio)) { result.status = "sos-map-failed"; return; }
+    for (unsigned n = 0; n < kSosCount; ++n)
+        if (!staging[n].createStagingWindow(vram, result.part[n].plan)) { result.status = "sos-map-failed"; return; }
+    if (!flush.createFlushPage(mmio, target) || !mp0.createKdbMailboxPage(mmio, proof.mailbox) ||
+        !mmhub.create(mmio, proof.offsets[2] & ~0xfffu, 4096) ||
+        !dmu.create(mmio, proof.offsets[5] & ~0xfffu, 4096)) {
+        result.status = "sos-map-failed"; return;
+    }
+    if (target.native) registers = flush.bytes();
+    const KdbMailboxMapping mailbox = mp0.kdbMailbox(proof.mailbox);
+    StagingMapping mappings[kSosCount] {};
+    for (unsigned n = 0; n < kSosCount; ++n) {
+        mappings[n] = staging[n].stagingWindow(result.part[n].plan);
+        if (!mappings[n].valid()) { result.status = "sos-map-invalid"; return; }
+    }
+    volatile uint32_t *selectorWords = selectors.selectorPage(), *flushWord = flush.flushWord(target);
+    if (!registers || !mailbox.valid() || !selectorWords || !flushWord || !mmhub.bytes() || !dmu.bytes() ||
+        ((reinterpret_cast<uintptr_t>(registers) | reinterpret_cast<uintptr_t>(selectorWords) |
+          reinterpret_cast<uintptr_t>(flushWord) | reinterpret_cast<uintptr_t>(mmhub.bytes()) |
+          reinterpret_cast<uintptr_t>(dmu.bytes())) & 3u)) {
+        result.status = "sos-map-invalid"; return;
+    }
+    KdbStorage storage[kSosCount];
+    uint32_t *backups[kSosCount] {};
+    for (unsigned n = 0; n < kSosCount; ++n) {
+        if (!storage[n].allocate()) { result.status = "sos-allocation-failed"; return; }
+        backups[n] = storage[n].original;
+    }
+    SosBootTransaction transaction(service, pci, state, mmio, vram, session, ap, proof, console, target,
+        result, mib, registers, mailbox, mmhub.bytes(), dmu.bytes(), mappings, flushWord, selectorWords, backups, sources);
+    result.status = transaction.prepare(prior);
+    if (result.status) return;
+    n48::PspLoader loader(transaction);
+    if (!loader.parseContainer(firmware.data, firmware.size) || !loader.setFwPriOffset(result.part[0].plan.windowOffset) ||
+        !loader.preflight() || !transaction.guard()) {
+        result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
+        result.status = "psp-preflight-refused"; return;
+    }
+    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+        result.status = "already-attempted"; return;
+    }
+    if (!service->setProperty("CobaltSurvey,Ready", false) ||
+        !service->setProperty("CobaltSurvey,ReadOnly", false) ||
+        !service->setProperty("CobaltSurvey,AccessMode", "indexed-and-sos-startup-commands")) {
+        result.status = "metadata-publication-failed"; return;
+    }
+    if (!transaction.guard()) { result.status = "device-context-changed"; return; }
+    if (!pci->setProperty(attemptKey, true)) { result.status = "attempt-claim-failed"; return; }
+    result.attempted = true;
+    if (!transaction.verifyOriginalIndexed()) result.status = "original-indexed-mismatch";
+    else {
+        result.sharedApiUsed = true;
+        uint64_t offsets[kSosCount] {};
+        for (unsigned n = 0; n < kSosCount; ++n) offsets[n] = result.part[n].plan.windowOffset;
+        const bool alive = loader.runSosCheckpoint(offsets, kSosCount);
+        result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
+        bool prefixReady = true;
+        for (unsigned n = 0; n < kSosCount - 1; ++n) prefixReady = result.part[n].readyObserved && prefixReady;
+        result.status = alive && result.sosAliveObserved && prefixReady && result.phase == 16 ?
+            "sos-transition-observed-reset-required" : "sos-protocol-failed";
+        // No boot-ready observation is made for SOS itself.
+        result.success = alive && result.sosAliveObserved && prefixReady && result.phase == 16;
+    }
+    const bool cleaned = transaction.cleanup();
+    result.success = result.success && cleaned && !result.contextLost;
     if (!cleaned) {
         result.resetRequired = true;
         result.status = "cleanup-unverified";
@@ -3589,6 +4167,168 @@ void publishPreSos(IOService *service, PreSosResult &result) {
     }
 }
 
+void clearSosBootProperties(IOService *service) {
+    for (const char *name : kKdbSplProperties) {
+        char key[96]; snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%s", name); service->removeProperty(key);
+    }
+    service->removeProperty("CobaltSurvey,SosBootComponentCount");
+    service->removeProperty("CobaltSurvey,SosBootAliveObserved");
+    service->removeProperty("CobaltSurvey,SosBootSosAliveObserved");
+    service->removeProperty("CobaltSurvey,SosBootInitialSosRaw");
+    service->removeProperty("CobaltSurvey,SosBootFinalSosRaw");
+    for (const auto &image : cobalt::survey::kSosImages) {
+        char key[96]; snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%sCommand", image.name); service->removeProperty(key);
+        for (const char *name : kKdbSplPartProperties) {
+            snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%s%s", image.name, name); service->removeProperty(key);
+        }
+    }
+}
+void publishSosBoot(IOService *service, SosBootResult &result) {
+    service->removeProperty("CobaltSurvey,Schema");
+    bool published = true;
+#define PAIR_PROPERTY(name, value) published = service->setProperty("CobaltSurvey,SosBoot" name, value) && published
+#define PAIR_NUMBER(name, value, bits) published = service->setProperty("CobaltSurvey,SosBoot" name, value, bits) && published
+    PAIR_PROPERTY("Attempted", result.attempted);
+    PAIR_PROPERTY("SharedApiUsed", result.sharedApiUsed);
+    PAIR_NUMBER("Phase", result.phase, 32);
+    PAIR_NUMBER("ComponentCount", kSosCount, 32);
+    PAIR_PROPERTY("AddressAttempted", result.addressAttempted);
+    PAIR_PROPERTY("CommandAttempted", result.commandAttempted);
+    PAIR_PROPERTY("ReadyObserved", result.readyObserved);
+    PAIR_PROPERTY("AliveObserved", result.sosAliveObserved);
+    PAIR_NUMBER("InitialSosRaw", result.initialSosRaw, 32);
+    PAIR_NUMBER("FinalSosRaw", result.finalSosRaw, 32);
+    PAIR_PROPERTY("ResetRequired", result.resetRequired);
+    PAIR_PROPERTY("StagingPreserved", result.stagingPreserved);
+    PAIR_PROPERTY("ContextLost", result.contextLost);
+    PAIR_NUMBER("AddressWritesIssued", result.addressWrites, 32);
+    PAIR_NUMBER("CommandWritesIssued", result.commandWrites, 32);
+    PAIR_NUMBER("SelectorWritesIssued", result.selectorWrites, 32);
+    PAIR_NUMBER("DataReads", result.dataReads, 32);
+    PAIR_NUMBER("VramWritesIssued", result.vramWrites, 32);
+    PAIR_NUMBER("FlushWritesIssued", result.flushWrites, 32);
+    PAIR_NUMBER("ZeroBytesIssued", result.helperStats.zeroBytesIssued, 64);
+    PAIR_NUMBER("CopyBytesIssued", result.helperStats.copyBytesIssued, 64);
+    PAIR_NUMBER("ZeroChunksIssued", result.helperStats.zeroChunksIssued, 32);
+    PAIR_NUMBER("CopyChunksIssued", result.helperStats.copyChunksIssued, 32);
+    PAIR_NUMBER("HelperFlushesIssued", result.helperStats.flushesIssued, 32);
+    PAIR_NUMBER("RestoreBytesIssued", result.restoreBytes, 64);
+    PAIR_NUMBER("RestoreChunksIssued", result.restoreChunks, 32);
+    PAIR_NUMBER("CpuReadBytes", result.cpuReadBytes, 64);
+    PAIR_NUMBER("CpuReadChunks", result.cpuReadChunks, 32);
+    PAIR_PROPERTY("Cleanup", result.cleanup);
+    PAIR_PROPERTY("VramCleanup", result.vramCleanup);
+    PAIR_PROPERTY("SelectorCleanup", result.selectorCleanup);
+    PAIR_NUMBER("RemapFirstRaw", result.remap[0], 32);
+    PAIR_NUMBER("RemapSecondRaw", result.remap[1], 32);
+    PAIR_PROPERTY("FlushRoute", result.flushRoute);
+    PAIR_PROPERTY("GuardMapping", result.guardMapping);
+    PAIR_NUMBER("FlushByteOffset", result.flushOffset, 32);
+    PAIR_NUMBER("NativeFlushByteOffset", result.nativeFlushOffset, 32);
+    PAIR_PROPERTY("PlanReason", result.batch.reason);
+    PAIR_NUMBER("PayloadBytes", 418656ULL, 64);
+    PAIR_PROPERTY("ReadOnly", !result.attempted);
+    PAIR_PROPERTY("OriginalStable", result.originalStable);
+    PAIR_PROPERTY("ZeroVerified", result.zeroVerified);
+    PAIR_PROPERTY("CopyVerified", result.copyVerified);
+    PAIR_PROPERTY("RestoreVerified", result.restoreVerified);
+    PAIR_NUMBER("LastStatus", result.lastStatus, 32);
+    PAIR_PROPERTY("LastStep", result.lastStep);
+    PAIR_NUMBER("RegisterReads", result.registerReads, 32);
+    PAIR_PROPERTY("Status", result.status);
+    const char *names[] = {"PspBootloader", "PspSos", "FbBase", "FbTop", "FbOffset", "DcnFbBase"};
+    for (unsigned n = 0; n < 6; ++n) {
+        char key[96]; snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%sRaw", names[n]);
+        published = service->setProperty(key, result.raw[n], 32) && published;
+        snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%sByteOffset", names[n]);
+        published = service->setProperty(key, result.offsets[n], 32) && published;
+    }
+    for (unsigned n = 0; n < kSosCount; ++n) {
+        const KdbResult &p = result.part[n]; const auto &spec = cobalt::survey::kSosImages[n]; const char *name = spec.name;
+        char key[96];
+#define PART_PROPERTY(suffix, value) do { snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%s" suffix, name); published = service->setProperty(key, value) && published; } while (false)
+#define PART_NUMBER(suffix, value, bits) do { snprintf(key, sizeof(key), "CobaltSurvey,SosBoot%s" suffix, name); published = service->setProperty(key, value, bits) && published; } while (false)
+        PART_NUMBER("WindowOffset", p.plan.windowOffset, 64);
+        PART_NUMBER("WindowBytes", p.plan.windowBytes, 64);
+        PART_NUMBER("McAddress", p.plan.mcAddress, 64);
+        PART_PROPERTY("PlanReason", p.plan.reason);
+        PART_NUMBER("PayloadBytes", spec.bytes, 64);
+        PART_NUMBER("Command", spec.command, 32);
+        PART_PROPERTY("OriginalStable", p.originalStable);
+        PART_PROPERTY("ZeroVerified", p.zeroVerified);
+        PART_PROPERTY("CopyVerified", p.copyVerified);
+        PART_PROPERTY("RestoreVerified", p.restoreVerified);
+        PART_PROPERTY("StagingPreserved", p.stagingPreserved);
+        PART_PROPERTY("AddressAttempted", p.addressAttempted);
+        PART_PROPERTY("CommandAttempted", p.commandAttempted);
+        PART_PROPERTY("ReadyObserved", p.readyObserved);
+        if (n == kSosCount - 1) PART_PROPERTY("AliveObserved", result.sosAliveObserved);
+        PART_NUMBER("ResponseRaw", p.lastStatus, 32);
+        PART_NUMBER("ZeroBytesIssued", p.helperStats.zeroBytesIssued, 64);
+        PART_NUMBER("CopyBytesIssued", p.helperStats.copyBytesIssued, 64);
+        PART_NUMBER("ZeroChunksIssued", p.helperStats.zeroChunksIssued, 32);
+        PART_NUMBER("CopyChunksIssued", p.helperStats.copyChunksIssued, 32);
+        PART_NUMBER("HelperFlushesIssued", p.helperStats.flushesIssued, 32);
+        PART_NUMBER("FlushWritesIssued", p.flushWrites, 32);
+        PART_NUMBER("AddressWritesIssued", p.addressWrites, 32);
+        PART_NUMBER("CommandWritesIssued", p.commandWrites, 32);
+        PART_NUMBER("CpuReadBytes", p.cpuReadBytes, 64);
+        PART_NUMBER("CpuReadChunks", p.cpuReadChunks, 32);
+        PART_NUMBER("RestoreBytesIssued", p.restoreBytes, 64);
+        PART_NUMBER("RestoreChunksIssued", p.restoreChunks, 32);
+#undef PART_PROPERTY
+#undef PART_NUMBER
+    }
+#undef PAIR_PROPERTY
+#undef PAIR_NUMBER
+    published = service->setProperty("CobaltSurvey,Ready", false) && published;
+    result.success = result.success && result.sharedApiUsed && result.phase == 2 * kSosCount && result.addressWrites == kSosCount &&
+        result.commandWrites == kSosCount && !result.readyObserved && !result.contextLost &&
+        result.sosAliveObserved && result.initialSosRaw == 0 && result.finalSosRaw != 0 && result.finalSosRaw != UINT32_MAX &&
+        !result.part[kSosCount - 1].readyObserved;
+    for (unsigned n = 0; n < kSosCount; ++n) {
+        const auto &image = result.part[n];
+        result.success = image.originalStable && image.zeroVerified && image.copyVerified && image.stagingPreserved &&
+            image.addressAttempted && image.commandAttempted && (n == kSosCount - 1 || image.readyObserved) && result.success;
+    }
+    published = published && service->setProperty("CobaltSurvey,Schema", result.success ? 10ULL : 4ULL, 32);
+    if (!published) {
+        result.success = false; result.status = "metadata-publication-failed";
+        service->removeProperty("CobaltSurvey,SosBootStatus"); service->setProperty("CobaltSurvey,SosBootStatus", result.status);
+        service->removeProperty("CobaltSurvey,Schema"); service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
+    }
+}
+
+COBALT_SURVEY_NOINLINE void runAndPublishPreSos(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, uint32_t mib, const ApertureProof &ap,
+    const KdbProof &proof, const StateObservation &stateResult, const ConsoleObservation &consoleResult) {
+    PreSosResult preSosResult;
+    runPreSosSurvey(service, pci, state, mmio, vram, mib, ap, proof, stateResult, consoleResult, preSosResult);
+    if (!consoleGuard(pci, state, mmio, vram)) {
+        preSosResult.success = false; preSosResult.contextLost = true; preSosResult.status = "device-context-changed";
+    }
+    publishPreSos(service, preSosResult);
+    if (!consoleGuard(pci, state, mmio, vram)) {
+        preSosResult.success = false; preSosResult.contextLost = true; preSosResult.status = "device-context-changed";
+        publishPreSos(service, preSosResult);
+    }
+}
+
+COBALT_SURVEY_NOINLINE void runAndPublishSosBoot(IOService *service, IOPCIDevice *pci, const PciState &state,
+    const Aperture &mmio, const Aperture &vram, uint32_t mib, const ApertureProof &ap,
+    const KdbProof &proof, const StateObservation &stateResult, const ConsoleObservation &consoleResult) {
+    SosBootResult sosBootResult;
+    runSosBootSurvey(service, pci, state, mmio, vram, mib, ap, proof, stateResult, consoleResult, sosBootResult);
+    if (!consoleGuard(pci, state, mmio, vram)) {
+        sosBootResult.success = false; sosBootResult.contextLost = true; sosBootResult.status = "device-context-changed";
+    }
+    publishSosBoot(service, sosBootResult);
+    if (!consoleGuard(pci, state, mmio, vram)) {
+        sosBootResult.success = false; sosBootResult.contextLost = true; sosBootResult.status = "device-context-changed";
+        publishSosBoot(service, sosBootResult);
+    }
+}
+
 bool criticalIps(const IpDiscovery &d) {
     const uint16_t ids[] = {IpDiscovery::HwGc, IpDiscovery::HwMp0,
         IpDiscovery::HwMp1, IpDiscovery::HwSdma0, IpDiscovery::HwDmu};
@@ -3648,6 +4388,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     clearKdbProperties(this);
     clearKdbSplProperties(this);
     clearPreSosProperties(this);
+    clearSosBootProperties(this);
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -3800,9 +4541,9 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     if (collectState) {
         stateFailure = passiveState(pci, s, mmio, vram, parser, stateResult);
     }
-    const bool collectAperture = apertureArmed() || kdbArmed() || splArmed() || preSosArmed();
+    const bool collectAperture = apertureArmed() || kdbArmed() || splArmed() || preSosArmed() || sosArmed();
     const ApertureProof proof = collectAperture ? apertureProof(parser, stateResult, mmio) : ApertureProof {};
-    const KdbProof kdbIp = (kdbArmed() || splArmed() || preSosArmed()) ? kdbProof(parser, proof, mmio) : KdbProof {};
+    const KdbProof kdbIp = (kdbArmed() || splArmed() || preSosArmed() || sosArmed()) ? kdbProof(parser, proof, mmio) : KdbProof {};
     ApertureResult apertureResult;
     StagingResult stagingResult;
     KdbResult kdbResult;
@@ -3843,17 +4584,10 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
             else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
             else if (collectAperture) {
-                if (preSosArmed()) {
-                    PreSosResult preSosResult;
-                    runPreSosSurvey(this, pci, s, mmio, vram, first, proof, kdbIp, stateResult, consoleResult, preSosResult);
-                    if (!consoleGuard(pci, s, mmio, vram)) {
-                        preSosResult.success = false; preSosResult.contextLost = true; preSosResult.status = "device-context-changed";
-                    }
-                    publishPreSos(this, preSosResult);
-                    if (!consoleGuard(pci, s, mmio, vram)) {
-                        preSosResult.success = false; preSosResult.contextLost = true; preSosResult.status = "device-context-changed";
-                        publishPreSos(this, preSosResult);
-                    }
+                if (sosArmed()) {
+                    runAndPublishSosBoot(this, pci, s, mmio, vram, first, proof, kdbIp, stateResult, consoleResult);
+                } else if (preSosArmed()) {
+                    runAndPublishPreSos(this, pci, s, mmio, vram, first, proof, kdbIp, stateResult, consoleResult);
                 } else if (splArmed()) {
                     runKdbSpl(this, pci, s, mmio, vram, first, proof, kdbIp, stateResult, consoleResult, pairResult);
                     if (!consoleGuard(pci, s, mmio, vram)) {
@@ -3910,6 +4644,7 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     clearKdbProperties(this);
     clearKdbSplProperties(this);
     clearPreSosProperties(this);
+    clearSosBootProperties(this);
     status("stopped");
     super::stop(provider);
 }
