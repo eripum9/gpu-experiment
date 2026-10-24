@@ -1143,6 +1143,28 @@ static Bytes kdbDiscoveryFixture() {
     b.resize(10240);
     return b;
 }
+static Bytes mode1DiscoveryFixture() {
+    Bytes b = kdbDiscoveryFixture();
+    // MP1 (HW ID 1, record 2) segment-1 debug registers intentionally share
+    // the PSP RO page, as they do on the target. The map API still requests
+    // separate typed RO and bounded RW mappings of that same physical page.
+    const size_t mp0 = die + 4 + 12;
+    put32(b, mp0 + 8, 0x400);
+    const size_t mp1 = die + 4 + 2 * 12;
+    b.insert(b.begin() + static_cast<std::ptrdiff_t>(mp1 + 12), 4, 0);
+    b[mp1 + 3] = 2;
+    put32(b, mp1 + 12, 0x400);
+    const size_t shiftedGc = gc + 56;
+    put16(b, prefix + 10, uint16_t(shiftedGc + gcSize - prefix));
+    put16(b, prefix + 16, uint16_t(ipdsSize + 56));
+    put16(b, prefix + 20, uint16_t(shiftedGc - prefix));
+    put16(b, ipds + 6, uint16_t(ipdsSize + 56));
+    put16(b, prefix + 14, sum(b, ipds, ipds + ipdsSize + 56));
+    put16(b, prefix + 22, sum(b, shiftedGc, shiftedGc + gcSize));
+    put16(b, prefix + 8, sum(b, prefix + 10, shiftedGc + gcSize));
+    b.resize(10240);
+    return b;
+}
 static void apertureDevice(Device &d, bool nativeRoute=false, uint32_t nbifSegmentBase=0xd20) {
     consoleFixture(d); d.load(apertureFixture(nbifSegmentBase)); d.indexed();
     d.mmio.length=d.mmio.contiguous=0x80000; d.pci.subsystem=0x86011eae;
@@ -1178,6 +1200,44 @@ static void kdbDevice(Device &d, bool nativeRoute=false) {
         if (offset == 0xa71c) return 0x1234u;
         throw std::runtime_error("unexpected KDB state offset");
     };
+}
+static void mode1Device(Device &d) {
+    consoleFixture(d);
+    d.load(mode1DiscoveryFixture());
+    d.indexed();
+    d.pci.command = 6; // memory decoding and bus mastering were enabled at boot.
+    testState.mode1BootPresent = true;
+    testState.mode1Boot = "1";
+    testState.stateBootPresent = true;
+    testState.stateBoot = "1";
+    testState.stateAllowedOffsets = {0x118c, 0x1244, 0xa950, 0xa954};
+    testState.stateRead = [](uint32_t offset, uint32_t) {
+        if (offset == 0x118c) return 0x80000000u;
+        if (offset == 0x1244) return 0u;
+        if (offset == 0xa950) return 0x8000u;
+        if (offset == 0xa954) return 0x83fbu;
+        throw std::runtime_error(std::string("unexpected passive Mode 1 state offset ") + std::to_string(offset));
+    };
+    testState.mode1Read = [](uint32_t offset, uint32_t) {
+        if (offset == 0x118c) return 0x80000000u; // PSP bootloader ready
+        if (offset == 0x1244) return 0u;          // SOS initially stopped
+        if (offset == 0xa950) return 0x8000u;     // MC framebuffer base
+        if (offset == 0xa954) return 0x83fbu;     // MC framebuffer top
+        if (offset == 0xa71c) return 0x1234u;     // MC framebuffer offset
+        if (offset == 0x6dd4) return 0x1800u;     // DCN framebuffer base
+        if (offset == 0x378c) return 16384u;     // VRAM size in MiB
+        throw std::runtime_error("unexpected Mode 1 register offset");
+    };
+}
+static uint32_t mode1RegisterValue(uint32_t offset, uint32_t fallback) {
+    if (offset == 0x118c) return 0x80000000u;
+    if (offset == 0x1244) return 0u;
+    if (offset == 0xa950) return 0x8000u;
+    if (offset == 0xa954) return 0x83fbu;
+    if (offset == 0xa71c) return 0x1234u;
+    if (offset == 0x6dd4) return 0x1800u;
+    if (offset == 0x378c) return 16384u;
+    return fallback;
 }
 static void preSosDevice(Device &d, bool nativeRoute) {
     kdbDevice(d, nativeRoute);
@@ -3350,6 +3410,365 @@ static void stagingTests() {
     }
 }
 
+static bool mode1CleanupFailed = false;
+struct Mode1Cleanup {
+    Device &device;
+    ~Mode1Cleanup() {
+        if (device.service.startCalls) {
+            try {
+                device.service.stop(&device.pci);
+                device.service.free();
+            } catch (const std::exception &e) {
+                mode1CleanupFailed = true;
+                std::cerr << "Mode1Cleanup: " << e.what() << "\n";
+            }
+        }
+    }
+};
+
+static OSDictionary *mode1Request(uint64_t value=1, const char *key="CobaltSurvey,RunMode1Reset") {
+    auto *request = OSDictionary::withCapacity(1);
+    auto *number = OSNumber::withNumber(value, 64);
+    request->setObject(key, number);
+    number->release();
+    return request;
+}
+static IOReturn requestMode1(Device &d, OSObject *properties) {
+    const IOReturn result = d.service.setProperties(properties);
+    properties->release();
+    return result;
+}
+static void mode1Start(Device &d) {
+    CHECK(d.service.start(&d.pci));
+    CHECK(d.service.registered);
+    CHECK(d.service.strings.at("CobaltSurvey,Status") == "discovery-snapshot-validated");
+    CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+    CHECK(testState.mapsLive == 0 && testState.backingDescriptorsLive == 0);
+    CHECK(testState.openLive == 0 && testState.allocations == 0);
+    CHECK(testState.mode1MapsLive == 0);
+}
+static void mode1ResourceFree() {
+    CHECK(testState.mapsLive == 0 && testState.mode1MapsLive == 0);
+    CHECK(testState.backingDescriptorsLive == 0 && testState.allocations == 0);
+    CHECK(testState.openLive == 0 && testState.iteratorsLive == 0);
+}
+static void mode1Tests() {
+    activeTestPhase = "mode1Tests.boot-is-inert";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d);
+        testState.mode1BootPresent = false;
+        d.run("discovery-snapshot-validated");
+        CHECK(testState.mode1LockAllocations == 0 && testState.mode1Writes.empty());
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnUnsupported);
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d);
+        mode1Start(d);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetArmed") == 1);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "armed-awaiting-request");
+        CHECK(testState.mode1Writes.empty() && testState.mode1SaveCalls == 0 && testState.mode1RestoreCalls == 0);
+        CHECK(testState.sosWrites == 0 && testState.kdbWrites == 0 && testState.splWrites == 0);
+        CHECK(testState.apertureCpuWrites == 0 && testState.apertureFlushWrites == 0);
+        mode1ResourceFree();
+    }
+    activeTestPhase = "mode1Tests.explicit-success-and-one-shot";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        IOReturn nestedRequest = kIOReturnSuccess;
+        testState.mode1Write = [&d, &nestedRequest](uint32_t offset, uint32_t) {
+            if (offset == 0x11d8) nestedRequest = requestMode1(d, mode1Request());
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnSuccess);
+        CHECK(nestedRequest == kIOReturnBusy);
+        CHECK(testState.mode1Writes.size() == 3);
+        CHECK(testState.mode1Writes[0] == std::make_pair(0x11d4u, 0u));
+        CHECK(testState.mode1Writes[1] == std::make_pair(0x122cu, 2u));
+        CHECK(testState.mode1Writes[2] == std::make_pair(0x11d8u, 0u));
+        CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
+        CHECK(testState.mode1BusMasterPrevious && testState.mode1BusMasterState);
+        CHECK(d.pci.command == 6 && testState.mode1SleepCalls == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 11);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetStoresIssued") == 3);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciRestored") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetReadOnly") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ReadOnly") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetRecoveryObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetResetTransitionObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetColdCycleReplacementValidated") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "mode1-issued-recovery-observed");
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnNotReady);
+        CHECK(testState.mode1Writes.size() == 3);
+        mode1ResourceFree();
+        d.service.stop(&d.pci);
+        CHECK(!d.service.numbers.count("CobaltSurvey,Mode1ResetSuccess"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,Mode1ResetArmed"));
+        CHECK(!d.service.blobs.count("CobaltSurvey,DiscoverySnapshot"));
+        d.service.free();
+        CHECK(testState.mode1LocksLive == 0);
+    }
+    activeTestPhase = "mode1Tests.bad-flags-and-provider-marker";
+    for (unsigned variant=0; variant<3; ++variant) {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d);
+        if (variant == 0) testState.kdbBootPresent = true, testState.kdbBoot = "1";
+        if (variant == 1) testState.mode1Boot = "2";
+        if (variant == 2) d.pci.setProperty("CobaltSurvey,Mode1ResetAttempt-v1", true);
+        if (variant < 2) {
+            CHECK(d.service.start(&d.pci));
+            CHECK(d.service.registered);
+            CHECK(d.service.strings.at("CobaltSurvey,Status") == "mode1-flags-refused");
+        } else mode1Start(d);
+        CHECK(testState.mode1Writes.empty());
+        if (variant < 2) CHECK(!d.service.numbers.count("CobaltSurvey,Mode1ResetArmed"));
+        else {
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetArmed") == 0);
+            CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "arm-refused");
+        }
+        mode1ResourceFree();
+    }
+    activeTestPhase = "mode1Tests.request-validation-and-privilege";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        CHECK(requestMode1(d, OSData::withBytes("x", 1)) == kIOReturnBadArgument);
+        CHECK(requestMode1(d, mode1Request(1, "CobaltSurvey,Unrecognized")) == kIOReturnUnsupported);
+        auto *wrongType = OSDictionary::withCapacity(1);
+        auto *data = OSData::withBytes("x", 1); wrongType->setObject("CobaltSurvey,RunMode1Reset", data); data->release();
+        CHECK(requestMode1(d, wrongType) == kIOReturnBadArgument);
+        CHECK(requestMode1(d, mode1Request(0)) == kIOReturnBadArgument);
+        CHECK(requestMode1(d, mode1Request(2)) == kIOReturnBadArgument);
+        auto *many = OSDictionary::withCapacity(2);
+        auto *one = OSNumber::withNumber(1, 64); many->setObject("CobaltSurvey,RunMode1Reset", one); one->release();
+        auto *two = OSNumber::withNumber(1, 64); many->setObject("extra", two); two->release();
+        CHECK(requestMode1(d, many) == kIOReturnBadArgument);
+        testState.mode1RequestAdmin = false;
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnNotPrivileged);
+        testState.mode1RequestAdmin = true;
+        CHECK(testState.mode1Writes.empty() && testState.mode1SaveCalls == 0);
+        testState.mode1LockBusy = true;
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnBusy);
+        testState.mode1LockBusy = false;
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnSuccess);
+        CHECK(testState.mode1Writes.size() == 3);
+        mode1ResourceFree();
+    }
+    activeTestPhase = "mode1Tests.preflight-save-disable-and-restore-faults";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        testState.mode1Read = [](uint32_t, uint32_t) { return UINT32_MAX; };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1SaveCalls == 0 && testState.mode1Writes.empty());
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "preflight-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetReadOnly") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 0);
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        testState.mode1SaveFail = true;
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 0);
+        CHECK(testState.mode1Writes.empty() && d.pci.command == 6);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pci-save-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetReadOnly") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 0);
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        bool commandRestored = false;
+        d.pci.onRead = [&d, &commandRestored](uint8_t offset) {
+            if (offset == 4 && !commandRestored && !testState.mode1BusMasterState) {
+                d.pci.command = 6; commandRestored = true;
+            }
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(commandRestored && testState.mode1Writes.empty());
+        CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1 && d.pci.command == 6);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "bus-master-disable-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetReadOnly") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 1);
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        unsigned reads = 0;
+        testState.mode1Read = [&reads](uint32_t offset, uint32_t value) {
+            if (reads++ >= 14 && offset == 0x118c) return UINT32_MAX;
+            return value;
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1Writes.empty() && testState.mode1RestoreCalls == 1 && d.pci.command == 6);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pre-burst-guard-failed");
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        testState.mode1RestoreFail = true;
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 1);
+        CHECK(testState.mode1SleepCalls == 1 && testState.mode1ReadCalls == 28);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pci-restore-failed");
+        mode1ResourceFree();
+    }
+    activeTestPhase = "mode1Tests.transition-busy-timeout-and-metadata-fallback";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        unsigned reads = 0;
+        testState.mode1Read = [&reads](uint32_t offset, uint32_t value) {
+            const unsigned index = reads++;
+            if (offset == 0x1244 && index < 28) return 1u;
+            if (offset == 0x118c) return 0x80000000u;
+            if (offset == 0x1244) return 0u;
+            if (offset == 0xa950) return 0x8000u;
+            if (offset == 0xa954) return 0x83fbu;
+            if (offset == 0xa71c) return 0x1234u;
+            if (offset == 0x6dd4) return 0x1800u;
+            if (offset == 0x378c) return 16384u;
+            return value;
+        };
+        const IOReturn transitionResult = requestMode1(d, mode1Request());
+        if (transitionResult != kIOReturnSuccess) {
+            std::cerr << "Mode 1 transition diagnostic: result=" << transitionResult
+                << " status=" << d.service.strings["CobaltSurvey,Mode1ResetStatus"]
+                << " reason=" << d.service.strings["CobaltSurvey,Mode1ResetReason"]
+                << " reads=" << testState.mode1ReadCalls << " injected=" << reads << '\n';
+        }
+        CHECK(transitionResult == kIOReturnSuccess);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetResetTransitionObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetInitialSosRaw") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetFinalSosRaw") == 0);
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        unsigned reads = 0, recoveryBootSamples = 0;
+        testState.mode1Read = [&reads, &recoveryBootSamples](uint32_t offset, uint32_t value) {
+            const unsigned index = reads++;
+            if (offset == 0x118c && index >= 28 && recoveryBootSamples++ == 0) return UINT32_MAX;
+            if (offset == 0x118c) return 0x80000000u;
+            if (offset == 0x1244) return 0u;
+            if (offset == 0xa950) return 0x8000u;
+            if (offset == 0xa954) return 0x83fbu;
+            if (offset == 0xa71c) return 0x1234u;
+            if (offset == 0x6dd4) return 0x1800u;
+            if (offset == 0x378c) return 16384u;
+            return value;
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnSuccess);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPolls") == 3);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetRecoveryObserved") == 1);
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        d.pci.command = 2; // PCI API returns the prior BM state; false is valid.
+        testState.mode1BusMasterState = false;
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnSuccess);
+        CHECK(!testState.mode1BusMasterPrevious && !testState.mode1BusMasterState);
+        CHECK(d.pci.command == 2 && testState.mode1Writes.size() == 3);
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        testState.mode1Write = [&d](uint32_t offset, uint32_t) {
+            if (offset == 0x11d8) d.service.providerService = nullptr;
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1);
+        CHECK(testState.mode1RestoreCalls == 0 && testState.mode1ReadCalls == 28);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pci-restore-failed");
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        const uint32_t originalBar = d.pci.bars[5];
+        bool sawRestoredBar = false, changedBar = false;
+        testState.onMode1Sleep = [&d, originalBar, &changedBar] {
+            if (changedBar) return;
+            changedBar = true;
+            CHECK(testState.mode1Quiet);
+            d.pci.bars[5] = originalBar + 0x10;
+        };
+        testState.mode1Read = [&d, originalBar, &sawRestoredBar](uint32_t offset, uint32_t value) {
+            if (testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls)
+                sawRestoredBar = d.pci.bars[5] == originalBar;
+            if (offset == 0x118c) return 0x80000000u;
+            if (offset == 0x1244) return 0u;
+            if (offset == 0xa950) return 0x8000u;
+            if (offset == 0xa954) return 0x83fbu;
+            if (offset == 0xa71c) return 0x1234u;
+            if (offset == 0x6dd4) return 0x1800u;
+            if (offset == 0x378c) return 16384u;
+            return value;
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnSuccess);
+        CHECK(sawRestoredBar && d.pci.bars[5] == originalBar);
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        testState.mode1Write = [&d](uint32_t offset, uint32_t) {
+            if (offset == 0x11d8) d.pci.identity = 0xffffffffu;
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1);
+        CHECK(testState.mode1RestoreCalls == 0 && testState.mode1ReadCalls == 28);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pci-restore-failed");
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        bool changed = false;
+        testState.onConsole = [&changed](unsigned, PE_Video &video) {
+            if (!changed && testState.mode1Writes.size() == 3 && testState.mode1ReadCalls >= 34) {
+                changed = true;
+                ++testState.console.v_width;
+                video.v_width = testState.console.v_width;
+            }
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 1);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "postflight-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 0);
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        unsigned reads = 0;
+        testState.mode1Read = [&reads](uint32_t offset, uint32_t value) {
+            const unsigned index = reads++;
+            if (index >= 34 && offset == 0xa950) return 0x8001u;
+            return mode1RegisterValue(offset, value);
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "postflight-failed");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 0);
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        unsigned reads = 0;
+        testState.mode1Read = [&reads](uint32_t offset, uint32_t value) {
+            ++reads;
+            if (reads > 28 && offset == 0x1244) return 1u;
+            return mode1RegisterValue(offset, value);
+        };
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "recovery-timeout");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPolls") == 5000);
+        mode1ResourceFree();
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        d.service.numbers["CobaltSurvey,Schema"] = 11;
+        testState.propertyFailKey = "CobaltSurvey,Mode1ResetSuccess";
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "metadata-publication-failed");
+        mode1ResourceFree();
+    }
+    CHECK(!mode1CleanupFailed);
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--kdb-only") {
@@ -3372,6 +3791,11 @@ int main(int argc, char **argv) {
             std::cout << "CobaltNavi44Survey SOS host checks passed: " << checks << "\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--mode1-only") {
+            mode1Tests();
+            std::cout << "CobaltNavi44Survey Mode 1 host checks passed: " << checks << "\n";
+            return 0;
+        }
         activeTestPhase = "gates"; gates();
         activeTestPhase = "pciGuards"; pciGuards();
         activeTestPhase = "mappingFailures"; mappingFailures();
@@ -3391,6 +3815,7 @@ int main(int argc, char **argv) {
         activeTestPhase = "kdbSplTests"; kdbSplTests();
         activeTestPhase = "preSosTests"; preSosTests();
         activeTestPhase = "sosTests"; sosTests();
+        activeTestPhase = "mode1Tests"; mode1Tests();
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << "phase=" << activeTestPhase << ": " << e.what() << "\n"; return 1;

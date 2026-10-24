@@ -33,9 +33,10 @@ def main():
     parser.add_argument("--spl-only", action="store_true", help="run only focused KDB-to-SPL service-host checks")
     parser.add_argument("--presos-only", action="store_true", help="run only focused complete pre-SOS service-host checks")
     parser.add_argument("--sos-only", action="store_true", help="run only focused SOS-startup service-host checks")
+    parser.add_argument("--mode1-only", action="store_true", help="run only focused software Mode 1 reset service-host checks")
     args = parser.parse_args()
-    if sum((args.kdb_only, args.spl_only, args.presos_only, args.sos_only)) > 1:
-        parser.error("--kdb-only, --spl-only, --presos-only, and --sos-only are mutually exclusive")
+    if sum((args.kdb_only, args.spl_only, args.presos_only, args.sos_only, args.mode1_only)) > 1:
+        parser.error("--kdb-only, --spl-only, --presos-only, --sos-only, and --mode1-only are mutually exclusive")
     cxx = args.cxx or next((name for name in ("clang++", "g++", "c++", "cl") if shutil.which(name)), None)
     if not cxx:
         parser.error("No host C++17 compiler found; use --cxx in a compiler developer shell.")
@@ -60,9 +61,9 @@ def main():
         run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1", "-DCOBALT_SURVEY_HOSTTEST=1",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              *[part for path in includes for part in ("-I", path)], *[source for _, source in sources], "-o", executable])
-    focused = "--sos-only" if args.sos_only else "--presos-only" if args.presos_only else "--spl-only" if args.spl_only else "--kdb-only" if args.kdb_only else None
+    focused = "--mode1-only" if args.mode1_only else "--sos-only" if args.sos_only else "--presos-only" if args.presos_only else "--spl-only" if args.spl_only else "--kdb-only" if args.kdb_only else None
     run([executable, focused] if focused else [executable])
-    if args.kdb_only or args.spl_only or args.presos_only or args.sos_only:
+    if args.kdb_only or args.spl_only or args.presos_only or args.sos_only or args.mode1_only:
         return
 
     # Keep the pure aperture planner check independent from the service test:
@@ -79,6 +80,21 @@ def main():
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              "-I", SERVICE / "src", plan_source, "-o", plan_executable])
     run([plan_executable])
+
+    # Keep the portable reset-protocol contract test in the normal host suite;
+    # it remains independent from IOKit shims and never touches hardware.
+    mode1_source = SERVICE / "hosttest/mode1_reset_test.cpp"
+    mode1_executable = BUILD / ("mode1-reset-test.exe" if os.name == "nt" else "mode1-reset-test")
+    if Path(cxx).stem.lower() in ("cl", "clang-cl"):
+        mode1_object = BUILD / "mode1_reset_test.obj"
+        run([cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/Zc:__cplusplus",
+             f"/I{SERVICE / 'src'}", "/c", mode1_source, f"/Fo{mode1_object}"])
+        run([cxx, "/nologo", mode1_object, f"/Fe{mode1_executable}"])
+    else:
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1",
+             "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+             "-I", SERVICE / "src", mode1_source, "-o", mode1_executable])
+    run([mode1_executable])
 
 
 if __name__ == "__main__":

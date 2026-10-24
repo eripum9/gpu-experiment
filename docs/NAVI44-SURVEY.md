@@ -11,7 +11,8 @@ a separately armed one-command KDB firmware diagnostic. Embedding firmware
 does not activate that mode. Version 0.8.0 adds a separately armed KDB and SPL
 diagnostic using two buffers. Version 0.9.0 adds the complete pinned pre-SOS
 batch, separately armed with seven independent buffers. Version 0.10.0 adds
-a separately armed SOS-startup checkpoint with eight buffers.
+a separately armed SOS-startup checkpoint with eight buffers. Version 0.11.0
+also provides a separate [manual software-reset test](MODE1-RESET.md).
 
 ## One-command KDB checkpoint (0.7.0)
 

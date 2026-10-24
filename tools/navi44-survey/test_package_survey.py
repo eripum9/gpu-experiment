@@ -22,6 +22,8 @@ class SurveyPackageTests(unittest.TestCase):
         self.executable = self.kext / "Contents/MacOS/CobaltNavi44Survey"
         self.executable.parent.mkdir(parents=True)
         self.executable.write_bytes(struct.pack("<8I", 0xFEEDFACF, 0x01000007, 3, 11, 0, 0, 0, 0))
+        self.reset_client = self.root / "mode1-reset"
+        self.reset_client.write_bytes(struct.pack("<8I", 0xFEEDFACF, 0x01000007, 3, 2, 0, 0, 0, 0))
         signature = self.kext / "Contents/_CodeSignature/CodeResources"
         signature.parent.mkdir()
         signature.write_bytes(b"fixture-signature-resource")
@@ -32,7 +34,7 @@ class SurveyPackageTests(unittest.TestCase):
                 "IOClass": "CobaltNavi44Survey", "IOProviderClass": "IOPCIDevice",
                 "IOPCIPrimaryMatch": "0x75901002", "IOMatchCategory": "CobaltNavi44Survey"}},
         }
-        for relative in ("tools/navi44-survey/collect-survey.sh", "docs/NAVI44-SURVEY.md",
+        for relative in ("tools/navi44-survey/collect-survey.sh", "tools/navi44-survey/test-software-reset.sh", "docs/NAVI44-SURVEY.md", "docs/MODE1-RESET.md",
                          "src/navi48-bringup/LICENSE", "src/navi48-bringup/NOTICE",
                          "src/navi48-bringup/firmware/LICENSE.amdgpu",
                          "third-party/THIRD-PARTY-LICENSES.txt"):
@@ -42,6 +44,7 @@ class SurveyPackageTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(PACKAGE, "ROOT", self.root).start()
         patch.object(PACKAGE, "KEXT", self.kext).start()
+        patch.object(PACKAGE, "RESET_CLIENT", self.reset_client).start()
         patch.object(PACKAGE.subprocess, "check_output", return_value="a" * 40).start()
 
     def payload(self):
@@ -52,13 +55,17 @@ class SurveyPackageTests(unittest.TestCase):
         files = self.payload()
         self.assertIn("collect-gpu-survey.sh", files)
         self.assertIn("SHA256SUMS.txt", files)
-        self.assertEqual(len(files), 11)
+        self.assertEqual(len(files), 14)
+        self.assertEqual(files["mode1-reset"], self.reset_client.read_bytes())
+        self.assertIn("test-software-reset.sh", files)
+        self.assertIn("MODE1-RESET.md", files)
         self.assertEqual(files["licenses/LICENSE.amdgpu"], b"fixture\n")
         self.assertIn("licenses/THIRD-PARTY-LICENSES.txt", files)
         self.assertIn(b"Contains embedded AMD firmware", files["BUILD-INFO.txt"])
         self.assertIn(b"Optional cobalt-survey-spl=1", files["BUILD-INFO.txt"])
         self.assertIn(b"Optional cobalt-survey-presos=1", files["BUILD-INFO.txt"])
         self.assertIn(b"Optional cobalt-survey-sos=1", files["BUILD-INFO.txt"])
+        self.assertIn(b"never resets at boot", files["BUILD-INFO.txt"])
         self.assertNotIn(b"Contains no GPU firmware", files["BUILD-INFO.txt"])
         self.assertNotIn("Navi48Bringup", " ".join(files))
         manifest = files["SHA256SUMS.txt"].decode()
@@ -68,6 +75,17 @@ class SurveyPackageTests(unittest.TestCase):
 
     def test_missing_firmware_license_refuses_packaging(self):
         (self.root / "src/navi48-bringup/firmware/LICENSE.amdgpu").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.payload()
+
+    def test_missing_or_wrong_reset_client_refuses_packaging(self):
+        for magic, cpu, kind in ((0xFEEDFACF, 0x0100000C, 2),
+                                 (0xFEEDFACF, 0x01000007, 11),
+                                 (0, 0x01000007, 2)):
+            self.reset_client.write_bytes(struct.pack("<8I", magic, cpu, 3, kind, 0, 0, 0, 0))
+            with self.assertRaisesRegex(ValueError, "Mach-O executable"):
+                self.payload()
+        self.reset_client.unlink()
         with self.assertRaises(FileNotFoundError):
             self.payload()
 

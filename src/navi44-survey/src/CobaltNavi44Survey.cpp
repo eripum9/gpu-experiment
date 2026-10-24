@@ -2,9 +2,12 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSIterator.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
 #include <libkern/OSByteOrder.h>
 #include <pexpert/pexpert.h>
 #include "ipdiscovery.hpp"
@@ -17,6 +20,10 @@
 #include "psp_firmware.hpp"
 #include "presos_manifest.hpp"
 #include "sos_manifest.hpp"
+#include "mode1_reset.hpp"
+#if defined(COBALT_SURVEY_HOSTTEST)
+#include <atomic>
+#endif
 
 #if defined(_MSC_VER)
 #define COBALT_SURVEY_NOINLINE __declspec(noinline)
@@ -85,6 +92,28 @@ bool preSosArmed() {
 bool sosArmed() {
     uint32_t value = 0;
     return PE_parse_boot_argn("cobalt-survey-sos", &value, sizeof(value)) && value == 1u;
+}
+
+bool mode1Selected() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-mode1", &value, sizeof(value)) && value != 0;
+}
+
+bool mode1FlagsValid() {
+    uint32_t value = 0;
+    if (!armed() || !indexedArmed() || !stateArmed() ||
+        !PE_parse_boot_argn("cobalt-survey-mode1", &value, sizeof(value)) || value != 1) return false;
+    const char *others[] = {"cobalt-survey-aperture", "cobalt-survey-staging", "cobalt-survey-kdb",
+        "cobalt-survey-spl", "cobalt-survey-presos", "cobalt-survey-sos"};
+    for (const char *name : others) {
+        value = 0;
+        if (PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0) return false;
+    }
+    return true;
+}
+
+bool mode1PreviouslyAttempted(IOPCIDevice *pci) {
+    return pci->getProperty("CobaltSurvey,Mode1ResetAttempt-v1") != nullptr;
 }
 
 constexpr unsigned kSosCount = cobalt::survey::kSosImageCount;
@@ -184,6 +213,38 @@ struct KdbMailboxTarget {
             (addressOffset & ~0xfffu) == page() && (sosOffset & ~0xfffu) == page() &&
             commandOffset != addressOffset && commandOffset != sosOffset && addressOffset != sosOffset;
     }
+};
+
+struct Mode1DebugTarget {
+    uint32_t parameter {0}, message {0}, response {0};
+    uint32_t page() const { return parameter & ~0xfffu; }
+    bool valid() const {
+        return page() && page() != 0x7f000 && !(parameter & 3u) && !(message & 3u) &&
+            !(response & 3u) && (message & ~0xfffu) == page() && (response & ~0xfffu) == page() &&
+            parameter != message && parameter != response && message != response;
+    }
+};
+
+// No writable pointer or variable command escapes this fixed debug transport.
+class Mode1DebugMapping {
+    volatile uint8_t *bytes {nullptr};
+    Mode1DebugTarget target {};
+    friend class Map;
+    Mode1DebugMapping(volatile uint8_t *p, Mode1DebugTarget t) : bytes(p), target(t) {}
+    void store(uint32_t offset, uint32_t value) const {
+        auto *word = reinterpret_cast<volatile uint32_t *>(bytes + (offset & 0xfff));
+#if defined(COBALT_SURVEY_HOSTTEST)
+        cobaltSurveyTestMode1Write32(word, value, offset);
+#else
+        *word = value;
+#endif
+    }
+public:
+    Mode1DebugMapping() = default;
+    bool valid() const { return bytes && !(reinterpret_cast<uintptr_t>(bytes) & 3u) && target.valid(); }
+    void parameterZero() const { store(target.parameter, 0); }
+    void mode1Command() const { store(target.message, 2); }
+    void clearDebugResponse() const { store(target.response, 0); }
 };
 
 // Only two fixed mailbox endpoints are writable. The guard and one-attempt
@@ -303,6 +364,9 @@ public:
     bool createKdbMailboxPage(const Aperture &a, const KdbMailboxTarget &target) {
         return target.valid() && createPolicy(a, target.page(), 4096, true);
     }
+    bool createMode1DebugPage(const Aperture &a, const Mode1DebugTarget &target) {
+        return target.valid() && createPolicy(a, target.page(), 4096, true);
+    }
 private:
     bool createPolicy(const Aperture &a, uint64_t offset, uint64_t length, bool indexed) {
         requestedOptions = indexed ? (kMapOptions & ~kIOMapReadOnly) : kMapOptions;
@@ -358,6 +422,11 @@ private:
         return true;
     }
 public:
+    Mode1DebugMapping mode1Debug(const Mode1DebugTarget &target) const {
+        if (!value || !target.valid() || requestedOffset != target.page() || requestedLength != 4096 ||
+            requestedOptions != (kMapOptions & ~kIOMapReadOnly)) return {};
+        return Mode1DebugMapping(const_cast<volatile uint8_t *>(bytes()), target);
+    }
     void publishFailure(IOService *service, const char *stage, const char *reason = nullptr) {
         if (reason) fail(reason);
         // Bounded metadata only: never publish kernel pointers or mapped bytes.
@@ -2984,7 +3053,7 @@ void runApertureExperiment(IOService *service, IOPCIDevice *pci, const PciState 
     if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
         !apertureOnlyClient(pci, service)) { result.status = "device-context-changed"; return; }
     const char *attemptKey = staging ? "CobaltSurvey,StagingAttempt-v1" : "CobaltSurvey,ApertureAttempt-v1";
-    if (pci->getProperty(attemptKey)) { result.status = "already-attempted"; return; }
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey)) { result.status = "already-attempted"; return; }
     ConsoleObservation freshConsole {};
     result.status = passiveConsole(pci, state, mmio, vram, freshConsole);
     if (result.status) return;
@@ -3071,7 +3140,7 @@ void runApertureExperiment(IOService *service, IOPCIDevice *pci, const PciState 
         result.status = transaction.prepare();
         if (result.status) return;
         if (!transaction.guard()) { result.status = "device-context-changed"; return; }
-        if (pci->getProperty(attemptKey)) { result.status = "already-attempted"; return; }
+        if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey)) { result.status = "already-attempted"; return; }
         // Publish required authorization metadata before claiming or issuing
         // selectors/VRAM writes. Missing metadata never starts the experiment.
         if (!service->setProperty("CobaltSurvey,Ready", false) ||
@@ -3098,7 +3167,7 @@ void runApertureExperiment(IOService *service, IOPCIDevice *pci, const PciState 
     result.status = transaction.saveSelectors();
     if (result.status) return;
     if (!transaction.guard()) { result.status = "device-context-changed"; return; }
-    if (pci->getProperty("CobaltSurvey,ApertureAttempt-v1")) { result.status = "already-attempted"; return; }
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty("CobaltSurvey,ApertureAttempt-v1")) { result.status = "already-attempted"; return; }
     if (!pci->setProperty("CobaltSurvey,ApertureAttempt-v1", true)) {
         result.status = "attempt-claim-failed"; return;
     }
@@ -3173,7 +3242,7 @@ void runKdb(IOService *service, IOPCIDevice *pci, const PciState &state,
         result.status = "device-context-changed"; return;
     }
     constexpr const char *attemptKey = "CobaltSurvey,KdbAttempt-v1";
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") ||
         pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3234,7 +3303,7 @@ void runKdb(IOService *service, IOPCIDevice *pci, const PciState &state,
         result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
         result.status = "psp-preflight-refused"; return;
     }
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") ||
         pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3308,7 +3377,7 @@ void runKdbSpl(IOService *service, IOPCIDevice *pci, const PciState &state,
         result.status = "device-context-changed"; return;
     }
     constexpr const char *attemptKey = "CobaltSurvey,KdbSplAttempt-v1";
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
         pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3371,7 +3440,7 @@ void runKdbSpl(IOService *service, IOPCIDevice *pci, const PciState &state,
         result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
         result.status = "psp-preflight-refused"; return;
     }
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
         pci->getProperty("CobaltSurvey,PreSosAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3452,7 +3521,7 @@ void runPreSosSurvey(IOService *service, IOPCIDevice *pci, const PciState &state
         result.status = "device-context-changed"; return;
     }
     constexpr const char *attemptKey = "CobaltSurvey,PreSosAttempt-v1";
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
         pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3521,7 +3590,7 @@ void runPreSosSurvey(IOService *service, IOPCIDevice *pci, const PciState &state
         result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
         result.status = "psp-preflight-refused"; return;
     }
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
         pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,SosBootAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3607,7 +3676,7 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
         result.status = "device-context-changed"; return;
     }
     constexpr const char *attemptKey = "CobaltSurvey,SosBootAttempt-v1";
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
         pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -3676,7 +3745,7 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
         result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
         result.status = "psp-preflight-refused"; return;
     }
-    if (pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
         pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
         result.status = "already-attempted"; return;
     }
@@ -4352,6 +4421,7 @@ bool criticalIps(const IpDiscovery &d) {
     }
     return true;
 }
+#include "mode1_reset_adapter.inc"
 } // namespace
 
 IOService *CobaltNavi44Survey::probe(IOService *provider, SInt32 *score) {
@@ -4372,6 +4442,10 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci || pci->configRead32(static_cast<UInt8>(0)) != kIdentity) return false;
     if (!super::start(provider)) return false;
+    if (mode1Lock) IOLockLock(mode1Lock);
+    mode1Accepting = false;
+    if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
+    if (mode1Lock) IOLockUnlock(mode1Lock);
     removeProperty("CobaltSurvey,DiscoverySnapshot");
     const char *indexedProperties[] = {"AccessMode", "DiscoverySize", "IndexedOwnership", "IndexedCleanup",
         "IndexedAttempted", "IndexedSelectorWritesIssued", "IndexedDataReads", "IndexedPeers",
@@ -4389,11 +4463,23 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     clearKdbSplProperties(this);
     clearPreSosProperties(this);
     clearSosBootProperties(this);
+    clearMode1Properties(this);
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);
     setProperty("CobaltSurvey,Ready", false);
+    if (mode1Selected()) {
+        if (!mode1FlagsValid()) {
+            setProperty("CobaltSurvey,Mode1ResetStatus", "mixed-or-invalid-boot-flags");
+            status("mode1-flags-refused"); registerService(); return true;
+        }
+        if (!mode1Lock) mode1Lock = IOLockAlloc();
+        if (!mode1Lock) {
+            setProperty("CobaltSurvey,Mode1ResetStatus", "lock-allocation-failed");
+            status("mode1-lock-unavailable"); registerService(); return true;
+        }
+    }
     survey(pci);
     registerService(); // Partial observations are useful; this never means ready.
     return true;
@@ -4556,6 +4642,9 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     IOFree(snapshot, allocationSize);
     if (!data) { status("snapshot-publication-allocation-failed"); return; }
     const bool published = setProperty("CobaltSurvey,DiscoverySnapshot", data);
+    if (published && mode1Selected() && mode1FlagsValid()) {
+        data->retain(); mode1Snapshot = data;
+    }
     data->release();
     if (!published) { status("snapshot-publication-failed"); return; }
     setProperty("CobaltSurvey,DiscoveryBinaryOffset", binaryOffset, 64);
@@ -4583,7 +4672,20 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             if (consoleFailure) publishConsoleFailure(this, consoleFailure);
             else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
             else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
-            else if (collectAperture) {
+            else if (mode1Selected() && mode1FlagsValid() && mode1Lock && mode1Snapshot) {
+                IOLockLock(mode1Lock);
+                if (!mode1Attempted && !mode1AnyAttempt(pci) &&
+                    setProperty("CobaltSurvey,Mode1ResetArmed", true) &&
+                    setProperty("CobaltSurvey,Mode1ResetAttempted", false) &&
+                    setProperty("CobaltSurvey,Mode1ResetStatus", "armed-awaiting-request")) {
+                    mode1Accepting = true;
+                } else {
+                    removeProperty("CobaltSurvey,Mode1ResetArmed");
+                    setProperty("CobaltSurvey,Mode1ResetArmed", false);
+                    setProperty("CobaltSurvey,Mode1ResetStatus", "arm-refused");
+                }
+                IOLockUnlock(mode1Lock);
+            } else if (collectAperture) {
                 if (sosArmed()) {
                     runAndPublishSosBoot(this, pci, s, mmio, vram, first, proof, kdbIp, stateResult, consoleResult);
                 } else if (preSosArmed()) {
@@ -4636,6 +4738,9 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
 }
 
 void CobaltNavi44Survey::stop(IOService *provider) {
+    if (mode1Lock) IOLockLock(mode1Lock);
+    mode1Accepting = false;
+    if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
     removeProperty("CobaltSurvey,DiscoverySnapshot");
     clearStateProperties(this);
     clearConsoleProperties(this);
@@ -4645,6 +4750,54 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     clearKdbSplProperties(this);
     clearPreSosProperties(this);
     clearSosBootProperties(this);
+    clearMode1Properties(this);
+    removeProperty("CobaltSurvey,Schema");
+    setProperty("CobaltSurvey,Schema", 1ULL, 32);
+    setProperty("CobaltSurvey,Ready", false);
     status("stopped");
     super::stop(provider);
+    if (mode1Lock) IOLockUnlock(mode1Lock);
+}
+
+IOReturn CobaltNavi44Survey::setProperties(OSObject *properties) {
+    if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    auto *request = OSDynamicCast(OSDictionary, properties);
+    if (!request || request->getCount() != 1) return kIOReturnBadArgument;
+    OSObject *value = request->getObject("CobaltSurvey,RunMode1Reset");
+    if (!value) return kIOReturnUnsupported;
+    auto *number = OSDynamicCast(OSNumber, value);
+    if (!number || number->unsigned64BitValue() != 1ULL) return kIOReturnBadArgument;
+    if (!mode1Lock) return kIOReturnUnsupported;
+    if (!IOLockTryLock(mode1Lock)) return kIOReturnBusy;
+    IOReturn rc = kIOReturnNotReady;
+    if (mode1Accepting && !mode1Attempted && mode1FlagsValid() && mode1Snapshot && !isInactive()) {
+        // This latch is permanent for the instance, including helper failures.
+        mode1Attempted = true; mode1Accepting = false;
+        OSData *snapshot = mode1Snapshot; mode1Snapshot = nullptr;
+        auto *pci = OSDynamicCast(IOPCIDevice, getProvider());
+        if (pci) {
+            pci->retain();
+            rc = runAndPublishMode1(this, pci, snapshot) ? kIOReturnSuccess : kIOReturnError;
+        } else {
+            snapshot->release();
+            Mode1AdapterResult result; result.reason = "provider-unavailable";
+            publishMode1(this, result);
+            rc = kIOReturnNoDevice;
+        }
+    }
+    IOLockUnlock(mode1Lock);
+    return rc;
+}
+
+void CobaltNavi44Survey::free() {
+    // IOKit's service lifetime keeps the object alive during dispatched
+    // methods. stop drains an in-flight request before final free.
+    if (mode1Lock) IOLockLock(mode1Lock);
+    mode1Accepting = false;
+    if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
+    if (mode1Lock) {
+        IOLockUnlock(mode1Lock); IOLockFree(mode1Lock); mode1Lock = nullptr;
+    }
+    super::free();
 }

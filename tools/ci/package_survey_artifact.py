@@ -13,6 +13,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
 KEXT = ROOT / "src/navi44-survey/build/CobaltNavi44Survey.kext"
+RESET_CLIENT = ROOT / "src/navi44-survey/build/mode1-reset"
 BUNDLE_FILES = {
     "Contents/Info.plist", "Contents/MacOS/CobaltNavi44Survey",
     "Contents/_CodeSignature/CodeResources",
@@ -50,9 +51,19 @@ def payload() -> dict[str, bytes]:
             files["CobaltNavi44Survey.kext/" + relative] = path.read_bytes()
     if len(files) != len(BUNDLE_FILES):
         raise ValueError("survey bundle is missing an executable, plist, or signature resource")
+    if RESET_CLIENT.is_symlink():
+        raise ValueError("reset client must not be a symlink")
+    reset_client = RESET_CLIENT.read_bytes()
+    if len(reset_client) < 32 or struct.unpack_from("<IIII", reset_client)[:2] != (0xFEEDFACF, 0x01000007):
+        raise ValueError("reset client must be an x86_64 Mach-O executable")
+    if struct.unpack_from("<I", reset_client, 12)[0] != 2:
+        raise ValueError("reset client must be an x86_64 Mach-O executable")
+    files["mode1-reset"] = reset_client
     extras = {
         "collect-gpu-survey.sh": ROOT / "tools/navi44-survey/collect-survey.sh",
+        "test-software-reset.sh": ROOT / "tools/navi44-survey/test-software-reset.sh",
         "SURVEY-TEST.md": ROOT / "docs/NAVI44-SURVEY.md",
+        "MODE1-RESET.md": ROOT / "docs/MODE1-RESET.md",
         "licenses/LICENSE": ROOT / "src/navi48-bringup/LICENSE",
         "licenses/NOTICE": ROOT / "src/navi48-bringup/NOTICE",
         "licenses/LICENSE.amdgpu": ROOT / "src/navi48-bringup/firmware/LICENSE.amdgpu",
@@ -72,6 +83,7 @@ def payload() -> dict[str, bytes]:
         "Optional cobalt-survey-spl=1: prepare two separate 1 MiB windows, then issue only KDB and SPL; requires all six prior survey flags; preserves both windows after any mailbox attempt; no SYS or SOS startup\n"
         "Optional cobalt-survey-presos=1: prepare all seven separate 1 MiB windows before the complete pinned pre-SOS batch; requires all seven prior survey flags; preserves every window after any mailbox attempt; no SOS startup\n"
         "Optional cobalt-survey-sos=1: prepare all eight separate 1 MiB windows before the seven pre-SOS commands and final SOS command; requires all eight prior survey flags; no writes after SOS command; observes a fresh readable nonzero SOS transition only; no queues, display programming or acceleration\n"
+        "Optional cobalt-survey-mode1=1: arms a manually triggered administrator-only SMU debug Mode 1 reset test; requires survey/indexed/state flags and all firmware/staging experiments off; never resets at boot; test helper captures before/after and attempts a normal reboot; hardware recovery and cold-cycle equivalence remain unvalidated\n"
         "Contains embedded AMD firmware under licenses/LICENSE.amdgpu; no Navi48Bringup executable\n"
     ).encode("utf-8")
     files["SHA256SUMS.txt"] = "".join(
@@ -90,7 +102,7 @@ def main() -> None:
         for name, data in sorted(files.items()):
             item = tarfile.TarInfo(name)
             item.size = len(data)
-            item.mode = 0o755 if name.endswith("/CobaltNavi44Survey") else 0o644
+            item.mode = 0o755 if name.endswith("/CobaltNavi44Survey") or name == "mode1-reset" or name.endswith(".sh") else 0o644
             archive.addfile(item, io.BytesIO(data))
     with tarfile.open(args.output, "r:gz") as archive:
         if archive.getnames() != sorted(files):

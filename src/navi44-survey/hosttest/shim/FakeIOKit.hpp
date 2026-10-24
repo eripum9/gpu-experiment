@@ -26,6 +26,13 @@ class IOService;
 class IOPlatformExpert;
 using IOReturn = int32_t;
 constexpr IOReturn kIOReturnSuccess = 0;
+constexpr IOReturn kIOReturnUnsupported = -1000;
+constexpr IOReturn kIOReturnBadArgument = -1001;
+constexpr IOReturn kIOReturnNotPrivileged = -1002;
+constexpr IOReturn kIOReturnBusy = -1003;
+constexpr IOReturn kIOReturnNotReady = -1004;
+constexpr IOReturn kIOReturnError = -1005;
+constexpr IOReturn kIOReturnNoDevice = -1006;
 // Match the production LP64 scalar width even when Windows unsigned long is32bit.
 struct PE_Video {
     uint64_t v_baseAddr=0, v_rowBytes=0, v_width=0, v_height=0, v_depth=0, v_display=0;
@@ -34,6 +41,7 @@ struct PE_Video {
     uint8_t v_rotate=0, v_scale=0;
 };
 struct MmioEvent { char operation; uint32_t offset, value; };
+struct Mode1Page { uint64_t offset; IOOptionBits options; uintptr_t address; };
 
 struct TestState {
     std::string boot = "1";
@@ -55,6 +63,24 @@ struct TestState {
     bool preSosBootPresent = false, preSosEnabled = false, preSosClaimFail = false, preSosClaimed = false;
     std::string sosBoot = "1";
     bool sosBootPresent = false, sosEnabled = false, sosClaimFail = false, sosClaimed = false;
+    std::string mode1Boot = "1";
+    bool mode1BootPresent = false, mode1Enabled = false, mode1Claimed = false, mode1ClaimFail = false;
+    bool mode1Quiet = false, mode1RequestAdmin = true, mode1LockBusy = false;
+    unsigned mode1ReadCalls = 0, mode1WriteCalls = 0, mode1SaveCalls = 0, mode1RestoreCalls = 0;
+    unsigned mode1SleepCalls = 0, mode1PropertyCalls = 0, mode1PrivilegeCalls = 0;
+    unsigned mode1LockAllocations = 0, mode1LocksLive = 0, mode1ProvidersLive = 0;
+    unsigned mode1MapsLive = 0;
+    bool mode1SaveFail = false, mode1RestoreFail = false, mode1BusMasterState = true;
+    bool mode1BusMasterPrevious = true, mode1MmioBeforeRestore = false;
+    bool mode1SavedBusMaster = true;
+    std::vector<std::pair<uint32_t, uint32_t>> mode1Writes;
+    std::vector<std::pair<const volatile uint32_t *, uint32_t>> mode1WritePointers;
+    std::vector<std::pair<uint64_t, IOOptionBits>> mode1MapRequests;
+    std::vector<Mode1Page> mode1MappedPages;
+    std::vector<std::string> mode1Events;
+    std::function<void()> onMode1Sleep;
+    std::function<uint32_t(uint32_t, uint32_t)> mode1Read;
+    std::function<void(uint32_t, uint32_t)> mode1Write;
     bool sosFinalStoreSeen = false;
     unsigned sosWrites = 0;
     struct SosEvent { uint32_t offset, value; };
@@ -143,6 +169,25 @@ struct TestState {
     std::function<void(unsigned)> onMemsize;
 };
 inline TestState testState;
+struct IOLock { bool held = false; };
+inline IOLock *IOLockAlloc() {
+    ++testState.mode1LockAllocations;
+    auto *lock = new IOLock;
+    ++testState.mode1LocksLive;
+    return lock;
+}
+inline bool IOLockTryLock(IOLock *lock) {
+    if (!lock || testState.mode1LockBusy || lock->held) return false;
+    lock->held = true; return true;
+}
+inline void IOLockLock(IOLock *lock) { if (!lock || lock->held) throw std::runtime_error("invalid blocking lock operation"); lock->held = true; }
+inline void IOLockUnlock(IOLock *lock) { if (!lock || !lock->held) throw std::runtime_error("unlock of unheld lock"); lock->held = false; }
+inline void IOLockFree(IOLock *lock) {
+    if (!lock || lock->held) throw std::runtime_error("free of invalid/held lock");
+    delete lock; --testState.mode1LocksLive;
+}
+inline task_t current_task() { return reinterpret_cast<task_t>(2); }
+constexpr const char *kIOClientPrivilegeAdministrator = "admin";
 inline bool aperturePhase() {
     return testState.apertureBootPresent && testState.openCalls >= 2 && testState.openLive == 1;
 }
@@ -190,6 +235,8 @@ public:
 class OSData : public OSObject {
 public:
     std::vector<uint8_t> bytes;
+    unsigned getLength() const { return static_cast<unsigned>(bytes.size()); }
+    const void *getBytesNoCopy() const { return bytes.empty() ? nullptr : bytes.data(); }
     static OSData *withBytes(const void *p, unsigned n) {
         if (testState.dataFail) return nullptr;
         auto *data = new OSData;
@@ -199,17 +246,49 @@ public:
     }
 };
 
+class OSNumber : public OSObject {
+    uint64_t value_ = 0;
+    unsigned bits_ = 64;
+public:
+    OSNumber(uint64_t value, unsigned bits) : value_(value), bits_(bits) {}
+    static OSNumber *withNumber(uint64_t value, unsigned bits) { return new OSNumber(value, bits); }
+    uint64_t unsigned64BitValue() const { return value_; }
+    unsigned numberOfBits() const { return bits_; }
+};
+
+class OSDictionary : public OSObject {
+    std::map<std::string, OSObject *> objects_;
+public:
+    static OSDictionary *withCapacity(unsigned) { return new OSDictionary; }
+    void setObject(const char *key, OSObject *value) {
+        auto found = objects_.find(key);
+        if (found != objects_.end()) found->second->release();
+        value->retain(); objects_[key] = value;
+    }
+    unsigned getCount() const { return static_cast<unsigned>(objects_.size()); }
+    OSObject *getObject(const char *key) const {
+        const auto found = objects_.find(key);
+        return found == objects_.end() ? nullptr : found->second;
+    }
+    ~OSDictionary() override { for (auto &entry : objects_) entry.second->release(); }
+};
+
 class IOService : public OSObject {
 public:
     bool registered = false;
     bool inactive = false;
     unsigned stopCalls = 0, startCalls = 0;
+    IOService *providerService = nullptr;
     std::map<std::string, std::string> strings;
     std::map<std::string, uint64_t> numbers;
     std::map<std::string, std::vector<uint8_t>> blobs;
     virtual IOService *probe(IOService *, SInt32 *) { return this; }
-    virtual bool start(IOService *) { ++startCalls; return testState.superStart; }
-    virtual void stop(IOService *) { ++stopCalls; }
+    virtual bool start(IOService *newProvider) { ++startCalls; if (testState.superStart) providerService = newProvider; return testState.superStart; }
+    virtual void stop(IOService *) { ++stopCalls; providerService = nullptr; }
+    virtual IOReturn setProperties(OSObject *) { ++testState.mode1PropertyCalls; return kIOReturnUnsupported; }
+    IOService *getProvider() { return providerService; }
+    virtual bool clientHasPrivilege(task_t, const char *) { ++testState.mode1PrivilegeCalls; return testState.mode1RequestAdmin; }
+    bool isInactive() const { return inactive; }
     static IOPlatformExpert *getPlatform();
     void consolePublication(const char *key) {
         if ((std::string(key).find("CobaltSurvey,Aperture") == 0 ||
@@ -227,6 +306,12 @@ public:
                 testState.openLive || testState.iteratorsLive)
                 throw std::runtime_error("GPU resources retained at aperture/staging publication");
             if (testState.onAperturePublication) testState.onAperturePublication(key);
+        }
+        if (std::string(key).find("CobaltSurvey,Mode1Reset") == 0 &&
+            std::string(key) != "CobaltSurvey,Mode1ResetAttempt-v1") {
+            if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
+                testState.openLive || testState.iteratorsLive || testState.mode1MapsLive)
+                throw std::runtime_error("Mode 1 metadata published while GPU/provider resources remain live");
         }
         if (std::string(key).find("CobaltSurvey,Console") != 0) return;
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
@@ -262,12 +347,13 @@ public:
         if (std::string(key) == "CobaltSurvey,PreSosAttempt-v1") testState.preSosClaimed = true;
         if (std::string(key) == "CobaltSurvey,SosBootAttempt-v1" && testState.sosClaimFail) return false;
         if (std::string(key) == "CobaltSurvey,SosBootAttempt-v1") testState.sosClaimed = true;
+        if (std::string(key) == "CobaltSurvey,Mode1ResetAttempt-v1" && testState.mode1ClaimFail) return false;
+        if (std::string(key) == "CobaltSurvey,Mode1ResetAttempt-v1") testState.mode1Claimed = true;
         numbers[key] = value ? 1 : 0; return true;
     }
     OSObject *getProperty(const char *key) {
         return numbers.count(key) || strings.count(key) || blobs.count(key) ? this : nullptr;
     }
-    bool isInactive() const { return inactive; }
     bool setProperty(const char *key, OSObject *object) {
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at snapshot publication");
@@ -284,6 +370,15 @@ public:
             testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at registerService");
         registered = true;
+    }
+    virtual void free() {}
+};
+
+class IOUserClient {
+public:
+    static IOReturn clientHasPrivilege(task_t, const char *) {
+        ++testState.mode1PrivilegeCalls;
+        return testState.mode1RequestAdmin ? kIOReturnSuccess : -1002;
     }
 };
 inline void requireExplicitWritableMode() {
@@ -305,8 +400,10 @@ public:
             (testState.mapsLive == 12 || testState.mapsLive == 13);
         const bool sosTransactionLive = testState.sosEnabled && testState.openLive == 1 &&
             (testState.mapsLive == 13 || testState.mapsLive == 14);
-        if ((!kdbTransactionLive && !preSosTransactionLive && !sosTransactionLive && (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)) ||
-            (testState.openLive && !aperturePhase()) || testState.iteratorsLive)
+        const bool mode1TransactionLive = testState.mode1Enabled && testState.openLive == 1 && testState.mode1MapsLive == 5;
+        if ((!kdbTransactionLive && !preSosTransactionLive && !sosTransactionLive && !mode1TransactionLive &&
+             (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)) ||
+            (testState.openLive && !aperturePhase() && !mode1TransactionLive) || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at console API");
         ++testState.consoleCalls;
         *video = testState.console;
@@ -331,6 +428,7 @@ public:
     IOByteCount descriptorOffset = 0;
     bool fragmented = false, wrongSegment = false;
     bool indexedMapping = false, splMapping = false;
+    bool mode1Mapping = false;
     bool probeMapping = false, flushMapping = false, nbifMapping = false, nativeFlushMapping = false;
     bool kdbMailboxMapping = false, preSosWindowMapping = false, sosWindowMapping = false;
     unsigned preSosWindowIndex = 0;
@@ -407,6 +505,12 @@ public:
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
         const bool nativeFlush = aperturePhase() && physical == 0xc0000000 && offset == 0x3000 && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const bool mode1ReadPage = testState.mode1Enabled && physical == 0xc0000000 &&
+            (offset == 0x1000 || offset == 0x3000 || offset == 0x6000 || offset == 0xa000) && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
+        const bool mode1WritePage = testState.mode1Enabled && physical == 0xc0000000 && offset == 0x1000 && n == 4096 &&
+            options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
+        const bool mode1Map = mode1ReadPage || mode1WritePage;
         const bool stateMap = testState.stateBootPresent && n == 4096 && offset != 0x3000 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache);
         if (kdbMailbox) {
@@ -417,9 +521,10 @@ public:
             testState.stateMapRequests.emplace_back(offset, options);
             testState.stateMapBases.emplace_back(offset, reinterpret_cast<uintptr_t>(storage.data()));
         }
+        if (mode1Map) testState.mode1MapRequests.emplace_back(offset, options);
         if (nativeFlush && testState.apertureNbifReadLive)
             throw std::runtime_error("native flush RW map aliases a live read-only NBIF map");
-        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !kdbMailbox && !probe && !staging && !preSosWindow && !sosWindow && !flush && !nbifRead && !nativeFlush &&
+        if (task != kernel_task || address != 0 || (!indexed && !stateMap && !mode1Map && !kdbMailbox && !probe && !staging && !preSosWindow && !sosWindow && !flush && !nbifRead && !nativeFlush &&
             (offset != expectedOffset || n != expectedLength ||
              options != (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache))))
             throw std::runtime_error("unexpected mapping request");
@@ -470,6 +575,12 @@ public:
             testState.indexedMapLive = true;
             testState.indexedPage = selectorStorage.data();
         }
+        if (mode1Map) {
+            map->mode1Mapping = true;
+            ++testState.mode1MapsLive;
+            testState.mode1Events.push_back("map-" + std::to_string(offset));
+            testState.mode1MappedPages.push_back({offset, options, map->address});
+        }
         if (preSosWindow) {
             map->preSosWindowMapping = true;
             map->preSosWindowIndex = preSosIndex;
@@ -511,6 +622,14 @@ public:
     }
 };
 inline IOMemoryMap::~IOMemoryMap() {
+    if (mode1Mapping) {
+        --testState.mode1MapsLive;
+        const uint64_t offset = physical - 0xc0000000ULL;
+        testState.mode1Events.push_back("unmap-" + std::to_string(offset));
+        testState.mode1MappedPages.erase(std::remove_if(testState.mode1MappedPages.begin(), testState.mode1MappedPages.end(),
+            [offset, this](const auto &page) { return page.offset == offset && page.options == options && page.address == address; }),
+            testState.mode1MappedPages.end());
+    }
     if (indexedMapping) testState.indexedMapLive = false;
     if (probeMapping) testState.probeMapLive = false;
     if (splMapping) { testState.splMapLive = false; testState.splPage = nullptr; }
@@ -576,12 +695,17 @@ public:
     }
     uint32_t identity = 0x75901002, classRevision = 0x030000c0, subsystem = 0x12341002;
     uint16_t command = 2;
+    uint16_t savedCommand = 2;
+    uint32_t savedBars[6] = {};
     uint8_t header = 0;
     uint32_t bars[6] = {0x0c, 0x10, 0, 0, 0, 0xc0000000};
     IODeviceMemory *memories[6] = {};
     unsigned identityReads = 0, otherReads = 0, descriptorReads = 0;
     std::function<void(uint8_t)> onRead;
     uint32_t configRead32(uint8_t offset) {
+        if (testState.mode1Quiet) throw std::runtime_error("PCI config read during Mode 1 quiet interval");
+        if (testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 0 && offset != 0)
+            throw std::runtime_error("PCI config read before Mode 1 PCI restore");
         if (onRead) onRead(offset);
         if (offset == 0) { ++identityReads; return identity; }
         ++otherReads;
@@ -591,21 +715,56 @@ public:
         throw std::runtime_error("unexpected config32 read");
     }
     uint16_t configRead16(uint8_t offset) {
+        if (testState.mode1Quiet) throw std::runtime_error("PCI config read during Mode 1 quiet interval");
+        if (testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 0)
+            throw std::runtime_error("PCI config read before Mode 1 PCI restore");
         ++otherReads;
         if (onRead) onRead(offset);
         if (offset == 4) return command;
         throw std::runtime_error("unexpected config16 read");
     }
     uint8_t configRead8(uint8_t offset) {
+        if (testState.mode1Quiet) throw std::runtime_error("PCI config read during Mode 1 quiet interval");
+        if (testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 0)
+            throw std::runtime_error("PCI config read before Mode 1 PCI restore");
         ++otherReads;
         if (onRead) onRead(offset);
         if (offset == 0x0e) return header;
         throw std::runtime_error("unexpected config8 read");
     }
     IODeviceMemory *getDeviceMemoryWithRegister(uint8_t offset) {
+        if (testState.mode1Quiet) throw std::runtime_error("PCI descriptor read during Mode 1 quiet interval");
+        if (testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 0)
+            throw std::runtime_error("PCI descriptor read before Mode 1 PCI restore");
         ++descriptorReads;
         if (offset < 0x10 || offset > 0x24 || offset % 4) throw std::runtime_error("unexpected descriptor");
         return memories[(offset - 0x10) / 4];
+    }
+    IOReturn saveDeviceState(IOOptionBits options) {
+        if (options != 0) throw std::runtime_error("nonzero saveDeviceState options");
+        ++testState.mode1SaveCalls; testState.mode1Events.push_back("save-pci");
+        if (testState.mode1SaveFail) return -1003;
+        savedCommand = command; std::copy(std::begin(bars), std::end(bars), savedBars);
+        testState.mode1SavedBusMaster = (command & 4u) != 0;
+        return kIOReturnSuccess;
+    }
+    IOReturn restoreDeviceState(IOOptionBits options) {
+        if (options != 0) throw std::runtime_error("nonzero restoreDeviceState options");
+        ++testState.mode1RestoreCalls; testState.mode1Events.push_back("restore-pci");
+        if (testState.mode1RestoreFail) return -1004;
+        command = savedCommand; std::copy(std::begin(savedBars), std::end(savedBars), bars);
+        testState.mode1BusMasterState = testState.mode1SavedBusMaster;
+        return kIOReturnSuccess;
+    }
+    bool setBusMasterEnable(bool enabled) {
+        if (!testState.mode1SaveCalls) throw std::runtime_error("bus-master change before PCI state save");
+        const bool previous = (command & 4u) != 0;
+        testState.mode1BusMasterPrevious = previous;
+        testState.mode1BusMasterState = enabled;
+        testState.mode1Events.push_back(enabled ? "bus-master-on" : "bus-master-off");
+        if (enabled) command = static_cast<uint16_t>(command | 4u);
+        else command = static_cast<uint16_t>(command & ~4u);
+        return previous;
     }
     // Deliberately no config-write, enable, DMA or IRQ methods.
 };
@@ -899,15 +1058,16 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool spl = std::string(key) == "cobalt-survey-spl";
     const bool preSos = std::string(key) == "cobalt-survey-presos";
     const bool sos = std::string(key) == "cobalt-survey-sos";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos) throw std::runtime_error("unexpected boot argument");
+    const bool mode1 = std::string(key) == "cobalt-survey-mode1";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1) throw std::runtime_error("unexpected boot argument");
     if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
-        sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
+        mode1 ? !testState.mode1BootPresent : sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
         spl ? !testState.splBootPresent : kdb ? !testState.kdbBootPresent :
         aperture ? !testState.apertureBootPresent : staging ? !testState.stagingBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
         aperture ? testState.apertureBoot : staging ? testState.stagingBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
@@ -919,6 +1079,7 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (spl) testState.splEnabled = integer == 1;
         if (preSos) testState.preSosEnabled = integer == 1 && !testState.sosEnabled;
         if (sos) testState.sosEnabled = integer == 1;
+        if (mode1) testState.mode1Enabled = integer == 1;
         std::memcpy(out, &integer, static_cast<size_t>(n) < sizeof(integer) ? static_cast<size_t>(n) : sizeof(integer));
     } else {
         if (staging) testState.stagingEnabled = false;
@@ -926,6 +1087,7 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (spl) testState.splEnabled = false;
         if (preSos) testState.preSosEnabled = false;
         if (sos) testState.sosEnabled = false;
+        if (mode1) testState.mode1Enabled = false;
         std::memset(out, 0, static_cast<size_t>(n));
         std::memcpy(out, token.data(), token.size() < static_cast<size_t>(n) ? token.size() : static_cast<size_t>(n));
     }
@@ -943,10 +1105,66 @@ inline void IOFree(void *p, uint64_t n) {
         throw std::runtime_error("invalid IOFree");
     --testState.allocations; std::free(p);
 }
-inline void IOLog(const char *, ...) {}
-inline void IOSleep(unsigned) { ++testState.sleepCalls; if (testState.onSleep) testState.onSleep(); }
+inline void IOLog(const char *, ...) { if (testState.mode1Quiet) throw std::runtime_error("IOLog during Mode 1 quiet interval"); }
+inline void IOSleep(unsigned milliseconds) {
+    ++testState.sleepCalls;
+    if (testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 0) {
+        if (milliseconds < 1000) throw std::runtime_error("Mode 1 quiet interval shorter than one second");
+        testState.mode1Quiet = true;
+        testState.mode1Events.push_back("quiet-begin");
+        ++testState.mode1SleepCalls;
+    }
+    if (testState.onMode1Sleep) testState.onMode1Sleep();
+    if (testState.onSleep) testState.onSleep();
+    if (testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && testState.mode1Quiet) {
+        testState.mode1Quiet = false;
+        testState.mode1Events.push_back("quiet-end");
+    }
+}
 inline uint32_t OSSwapLittleToHostInt32(uint32_t value) {
     const unsigned index = testState.memsizeReads++;
     if (testState.onMemsize) testState.onMemsize(index);
     return index < testState.memsizeValues.size() ? testState.memsizeValues[index] : value;
+}
+
+inline uint32_t cobaltSurveyTestMode1Read32(const volatile uint32_t *word, uint32_t byteOffset) {
+    if (!testState.mode1Enabled || testState.mode1Quiet)
+        throw std::runtime_error("Mode 1 read outside active/nonquiet test window");
+    if (testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls == 0)
+        throw std::runtime_error("Mode 1 MMIO read before PCI restore");
+    if (!word) throw std::runtime_error("null Mode 1 read word");
+    const uint64_t pageOffset = byteOffset & ~uint64_t(0xfff);
+    const uint32_t within = byteOffset & 0xfffu;
+    const auto page = std::find_if(testState.mode1MappedPages.begin(), testState.mode1MappedPages.end(),
+        [pageOffset](const auto &entry) { return entry.offset == pageOffset &&
+            entry.options == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache); });
+    if (page == testState.mode1MappedPages.end() ||
+        reinterpret_cast<uintptr_t>(word) != page->address + within)
+        throw std::runtime_error("Mode 1 read outside one of four fixed read-only pages");
+    ++testState.mode1ReadCalls;
+    testState.mode1Events.push_back("read-" + std::to_string(byteOffset));
+    const uint32_t value = testState.mode1Read ? testState.mode1Read(byteOffset, *word) : *word;
+    return value;
+}
+inline void cobaltSurveyTestMode1Write32(volatile uint32_t *word, uint32_t value, uint32_t byteOffset) {
+    static constexpr uint32_t expectedOffsets[] = {0x11d4u, 0x122cu, 0x11d8u};
+    static constexpr uint32_t expectedValues[] = {0u, 2u, 0u};
+    const unsigned index = static_cast<unsigned>(testState.mode1Writes.size());
+    if (!testState.mode1Enabled || !word || index >= 3 || byteOffset != expectedOffsets[index] || value != expectedValues[index])
+        throw std::runtime_error("Mode 1 store outside exact three-register burst");
+    if (index && testState.mode1RestoreCalls == 0 && testState.mode1SleepCalls)
+        throw std::runtime_error("Mode 1 store after quiet interval");
+    const uint64_t pageOffset = byteOffset & ~uint64_t(0xfff);
+    const uint32_t within = byteOffset & 0xfffu;
+    const auto page = std::find_if(testState.mode1MappedPages.begin(), testState.mode1MappedPages.end(),
+        [pageOffset](const auto &entry) { return entry.offset == pageOffset &&
+            entry.options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache); });
+    if (page == testState.mode1MappedPages.end() ||
+        reinterpret_cast<uintptr_t>(word) != page->address + within)
+        throw std::runtime_error("Mode 1 write outside the fixed MP1 debug page");
+    testState.mode1Writes.emplace_back(byteOffset, value);
+    testState.mode1WritePointers.emplace_back(word, value);
+    testState.mode1Events.push_back("write-" + std::to_string(byteOffset));
+    *word = value;
+    if (testState.mode1Write) testState.mode1Write(byteOffset, value);
 }

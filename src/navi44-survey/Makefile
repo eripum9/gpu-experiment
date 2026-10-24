@@ -11,6 +11,8 @@ CC := clang
 PYTHON ?= python3
 KEXT := $(BUILD)/$(PRODUCT).kext
 EXEC := $(KEXT)/Contents/MacOS/$(PRODUCT)
+MODE1_RESET := $(BUILD)/mode1-reset
+MODE1_RESET_SRC := ../../tools/navi44-survey/mode1-reset.c
 SHARED := ../navi48-bringup/src
 PSP_FIRMWARE := $(BUILD)/psp_firmware.generated.cpp
 PSP_INPUT := ../navi48-bringup/firmware/psp_14_0_2_sos.bin
@@ -26,7 +28,7 @@ CFLAGS := $(COMMON)
 LDFLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -nostdlib -Xlinker -kext -L$(MKSDK)/Library/x86_64 -lkmodc++ -lkmod -Wl,-no_deduplicate
 
-all: $(KEXT)
+all: $(KEXT) $(MODE1_RESET)
 $(BUILD)/CobaltNavi44Survey.o: src/CobaltNavi44Survey.cpp
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
@@ -45,6 +47,13 @@ $(BUILD)/psp_firmware.generated.o: $(PSP_FIRMWARE)
 $(BUILD)/kmod_info.o: src/kmod_info.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+$(MODE1_RESET): $(MODE1_RESET_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+	  -mmacosx-version-min=$(DEPLOY) -std=c11 -Wall -Wextra -Werror -pedantic -O2 \
+	  -framework IOKit -framework CoreFoundation $< -o $@
+	codesign --force --sign - $@
+	codesign --verify --strict --verbose=2 $@
 -include $(OBJS:.o=.d)
 $(KEXT): $(OBJS) Info.plist
 	@mkdir -p $(KEXT)/Contents/MacOS
