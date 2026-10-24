@@ -6,6 +6,7 @@
 #include "presos_manifest.hpp"
 #include "sos_manifest.hpp"
 #include <iostream>
+#include <chrono>
 
 static unsigned checks = 0;
 static const char *activeTestPhase = "startup";
@@ -3769,53 +3770,65 @@ static void mode1Tests() {
     CHECK(!mode1CleanupFailed);
 }
 
+static void runPhase(const char *name, void (*test)()) {
+    activeTestPhase = name;
+    const unsigned before = checks;
+    const auto started = std::chrono::steady_clock::now();
+    std::cout << "[service test] START " << name << std::endl;
+    test();
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "[service test] PASS " << name << ": " << (checks - before)
+              << " checks in " << elapsed << "s" << std::endl;
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--kdb-only") {
-            kdbTests();
+            runPhase("kdbTests", kdbTests);
             std::cout << "CobaltNavi44Survey KDB host checks passed: " << checks << "\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--spl-only") {
-            kdbSplTests();
+            runPhase("kdbSplTests", kdbSplTests);
             std::cout << "CobaltNavi44Survey KDB-to-SPL host checks passed: " << checks << "\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--presos-only") {
-            preSosTests();
+            runPhase("preSosTests", preSosTests);
             std::cout << "CobaltNavi44Survey pre-SOS host checks passed: " << checks << "\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--sos-only") {
-            sosTests();
+            runPhase("sosTests", sosTests);
             std::cout << "CobaltNavi44Survey SOS host checks passed: " << checks << "\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--mode1-only") {
-            mode1Tests();
+            runPhase("mode1Tests", mode1Tests);
             std::cout << "CobaltNavi44Survey Mode 1 host checks passed: " << checks << "\n";
             return 0;
         }
-        activeTestPhase = "gates"; gates();
-        activeTestPhase = "pciGuards"; pciGuards();
-        activeTestPhase = "mappingFailures"; mappingFailures();
-        activeTestPhase = "memsizeGuards"; memsizeGuards();
-        activeTestPhase = "apertureGuards"; apertureGuards();
-        activeTestPhase = "revalidation"; revalidation();
-        activeTestPhase = "parserAndPublication"; parserAndPublication();
-        activeTestPhase = "indexedGatesAndPreflight"; indexedGatesAndPreflight();
-        activeTestPhase = "indexedExactTransfer"; indexedExactTransfer();
-        activeTestPhase = "indexedFaults"; indexedFaults();
-        activeTestPhase = "passiveState"; passiveState();
-        activeTestPhase = "passiveConsoleTests"; passiveConsoleTests();
-        activeTestPhase = "apertureTests"; apertureTests();
-        activeTestPhase = "nativeApertureTests"; nativeApertureTests();
-        activeTestPhase = "stagingTests"; stagingTests();
-        activeTestPhase = "kdbTests"; kdbTests();
-        activeTestPhase = "kdbSplTests"; kdbSplTests();
-        activeTestPhase = "preSosTests"; preSosTests();
-        activeTestPhase = "sosTests"; sosTests();
-        activeTestPhase = "mode1Tests"; mode1Tests();
+        runPhase("gates", gates);
+        runPhase("pciGuards", pciGuards);
+        runPhase("mappingFailures", mappingFailures);
+        runPhase("memsizeGuards", memsizeGuards);
+        runPhase("apertureGuards", apertureGuards);
+        runPhase("revalidation", revalidation);
+        runPhase("parserAndPublication", parserAndPublication);
+        runPhase("indexedGatesAndPreflight", indexedGatesAndPreflight);
+        runPhase("indexedExactTransfer", indexedExactTransfer);
+        runPhase("indexedFaults", indexedFaults);
+        runPhase("passiveState", passiveState);
+        runPhase("passiveConsoleTests", passiveConsoleTests);
+        runPhase("apertureTests", apertureTests);
+        runPhase("nativeApertureTests", nativeApertureTests);
+        runPhase("stagingTests", stagingTests);
+        runPhase("kdbTests", kdbTests);
+        runPhase("kdbSplTests", kdbSplTests);
+        runPhase("preSosTests", preSosTests);
+        runPhase("sosTests", sosTests);
+        runPhase("mode1Tests", mode1Tests);
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << "phase=" << activeTestPhase << ": " << e.what() << "\n"; return 1;

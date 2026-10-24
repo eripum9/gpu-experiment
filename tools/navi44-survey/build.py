@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVICE = ROOT / "src/navi44-survey"
@@ -23,7 +24,21 @@ BUILD = SERVICE / "build/hosttest"
 def run(parts):
     command = [str(part) for part in parts]
     print("+", subprocess.list2cmdline(command), flush=True)
-    subprocess.run(command, check=True, cwd=ROOT)
+    started = time.monotonic()
+    with subprocess.Popen(command, cwd=ROOT) as process:
+        while True:
+            try:
+                result = process.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                # Child output is inherited; phase messages identify actual
+                # test progress. This heartbeat only reports process liveness.
+                print(f"[host runner] {Path(command[0]).name} still running "
+                      f"after {time.monotonic() - started:.0f}s", flush=True)
+        if result:
+            raise subprocess.CalledProcessError(result, command)
+    print(f"[host runner] {Path(command[0]).name} completed in "
+          f"{time.monotonic() - started:.1f}s", flush=True)
 
 
 def main():
@@ -58,7 +73,9 @@ def main():
             objects.append(obj)
         run([cxx, "/nologo", *objects, f"/Fe{executable}"])
     else:
-        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O1", "-DCOBALT_SURVEY_HOSTTEST=1",
+        # Speed optimization matters for the exhaustive instrumented transfers;
+        # keep both sanitizers and every service test enabled.
+        run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O2", "-DCOBALT_SURVEY_HOSTTEST=1",
              "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
              *[part for path in includes for part in ("-I", path)], *[source for _, source in sources], "-o", executable])
     focused = "--mode1-only" if args.mode1_only else "--sos-only" if args.sos_only else "--presos-only" if args.presos_only else "--spl-only" if args.spl_only else "--kdb-only" if args.kdb_only else None
