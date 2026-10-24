@@ -3492,6 +3492,15 @@ static void mode1Tests() {
         CHECK(d.pci.command == 6 && testState.mode1SleepCalls == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 11);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusIteratorPresent") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusIteratorValid") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusExhausted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusClientCount") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusSelfCount") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusUnexpectedCount") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusFirstUnexpectedClassTruncated") == 0);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusStatus") == "self-only");
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetStoresIssued") == 3);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciRestored") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 1);
@@ -3511,6 +3520,56 @@ static void mode1Tests() {
         CHECK(!d.service.blobs.count("CobaltSurvey,DiscoverySnapshot"));
         d.service.free();
         CHECK(testState.mode1LocksLive == 0);
+    }
+    activeTestPhase = "mode1Tests.peer-census-diagnostics";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        OSObject peer; peer.meta.name = "IOService";
+        d.pci.clients.push_back(&peer); // Arrives after indexed census, before the request-local census.
+        const unsigned opens = testState.openCalls;
+        const size_t mapRequests = testState.mode1MapRequests.size();
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetReason") == "peer-refused");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPhase") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetStoresIssued") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 0);
+        CHECK(testState.openCalls == opens && testState.mode1MapRequests.size() == mapRequests);
+        CHECK(testState.mode1MapsLive == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusClientCount") == 2);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusSelfCount") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusUnexpectedCount") == 1);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusFirstUnexpectedClass") == "IOService");
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusStatus") == "additional-clients");
+        mode1ResourceFree();
+    }
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
+        if (kind == 0) d.pci.iteratorFail = true;
+        if (kind == 1) d.pci.iteratorInvalid = true;
+        if (kind == 2) d.pci.clients.clear();
+        if (kind == 3) d.pci.clients.assign(64, &d.service);
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPhase") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetStoresIssued") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPciMutationAttempted") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(testState.mode1MapsLive == 0 && testState.openLive == 0);
+        if (kind == 0) {
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusIteratorPresent") == 0);
+            CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusStatus") == "iterator-unavailable");
+        } else if (kind == 1) {
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusIteratorPresent") == 1);
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusIteratorValid") == 0);
+            CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusStatus") == "iterator-invalid");
+        } else if (kind == 2) {
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusExhausted") == 1);
+            CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusStatus") == "self-missing");
+        } else {
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusClientCount") == 64);
+            CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusExhausted") == 0);
+            CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusStatus") == "client-limit");
+        }
+        mode1ResourceFree();
     }
     activeTestPhase = "mode1Tests.bad-flags-and-provider-marker";
     for (unsigned variant=0; variant<3; ++variant) {
@@ -3758,10 +3817,10 @@ static void mode1Tests() {
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPolls") == 5000);
         mode1ResourceFree();
     }
-    {
+    for (const char *failedKey : {"CobaltSurvey,Mode1ResetSuccess", "CobaltSurvey,Mode1ResetPeerCensusStatus"}) {
         Device d; Mode1Cleanup cleanup{d}; mode1Device(d); mode1Start(d);
         d.service.numbers["CobaltSurvey,Schema"] = 11;
-        testState.propertyFailKey = "CobaltSurvey,Mode1ResetSuccess";
+        testState.propertyFailKey = failedKey;
         CHECK(requestMode1(d, mode1Request()) == kIOReturnError);
         CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "metadata-publication-failed");

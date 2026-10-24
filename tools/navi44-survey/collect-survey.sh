@@ -66,6 +66,11 @@ ioreg_rc=$?
 [ "$ioreg_rc" -eq 0 ] || failed=1
 capture ioreg-service-xml ioreg -r -c CobaltNavi44Survey -a || failed=1
 
+# Optional on older bundles; peer inspection is read-only and best effort.
+if [ -x "$script_dir/mode1-reset" ]; then
+    capture gpu-provider-clients "$script_dir/mode1-reset" --inspect-peers || :
+fi
+
 # These diagnostics are useful when available; preserve failures and continue.
 capture kmutil-showloaded kmutil showloaded || :
 capture boot-log log show --last 15m --style compact --predicate 'process == "kernel" AND eventMessage CONTAINS "CobaltNavi44Survey"' || :

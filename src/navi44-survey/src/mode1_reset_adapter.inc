@@ -6,7 +6,51 @@ struct Mode1AdapterResult {
     const char *reason {"prerequisites-unavailable"};
     bool consoleRecovered {false};
     bool pciMutationAttempted {false};
+    struct PeerCensus {
+        bool observed {false}, iteratorPresent {false}, iteratorValid {false}, exhausted {false};
+        uint32_t clientCount {0}, selfCount {0}, unexpectedCount {0};
+        char firstUnexpectedClass[96] {};
+        bool firstUnexpectedClassTruncated {false};
+        const char *status {"not-observed"};
+    } peerCensus;
 };
+
+using Mode1PeerCensus = Mode1AdapterResult::PeerCensus;
+
+bool mode1PeerCensus(IOPCIDevice *pci, IOService *service, Mode1PeerCensus &census) {
+    census.observed = true;
+    OSIterator *iterator = pci->getClientIterator();
+    if (!iterator) {
+        census.status = "iterator-unavailable";
+        return false;
+    }
+    census.iteratorPresent = true;
+    OSObject *entry = nullptr;
+    while (census.clientCount < 64 && (entry = iterator->getNextObject())) {
+        ++census.clientCount;
+        if (entry == service) ++census.selfCount;
+        else {
+            ++census.unexpectedCount;
+            if (census.unexpectedCount == 1) {
+                const char *className = entry->getMetaClass()->getClassName();
+                const int written = snprintf(census.firstUnexpectedClass,
+                    sizeof(census.firstUnexpectedClass), "%s", className ? className : "unknown");
+                census.firstUnexpectedClassTruncated = written < 0 ||
+                    static_cast<size_t>(written) >= sizeof(census.firstUnexpectedClass);
+            }
+        }
+    }
+    census.iteratorValid = iterator->isValid();
+    census.exhausted = census.iteratorValid && census.clientCount < 64 && entry == nullptr;
+    iterator->release();
+    if (!census.iteratorValid) census.status = "iterator-invalid";
+    else if (!census.exhausted) census.status = "client-limit";
+    else if (census.unexpectedCount) census.status = "additional-clients";
+    else if (census.selfCount != 1) census.status = "self-missing";
+    else census.status = "self-only";
+    return census.iteratorValid && census.exhausted && census.clientCount == 1 &&
+        census.selfCount == 1 && census.unexpectedCount == 0;
+}
 
 bool mode1AnyAttempt(IOPCIDevice *pci) {
     const char *keys[] = {"CobaltSurvey,Mode1ResetAttempt-v1", "CobaltSurvey,ApertureAttempt-v1",
@@ -20,7 +64,10 @@ const char *const kMode1Properties[] = {"Armed", "Attempted", "Phase", "StoresIs
     "BusMasterDisabled", "PciRestored", "PciMutationAttempted", "Quiesced", "RecoveryObserved", "ResetTransitionObserved",
     "ColdCycleReplacementValidated", "InitialBootloaderRaw", "FinalBootloaderRaw", "InitialSosRaw",
     "FinalSosRaw", "InitialMemsizeMiB", "FinalMemsizeMiB", "Polls", "Status", "Reason",
-    "ParameterByteOffset", "MessageByteOffset", "ResponseByteOffset", "ConsoleRecovered", "ReadOnly", "Success"};
+    "ParameterByteOffset", "MessageByteOffset", "ResponseByteOffset", "ConsoleRecovered", "ReadOnly", "Success",
+    "PeerCensusObserved", "PeerCensusIteratorPresent", "PeerCensusIteratorValid", "PeerCensusExhausted",
+    "PeerCensusClientCount", "PeerCensusSelfCount", "PeerCensusUnexpectedCount", "PeerCensusFirstUnexpectedClass",
+    "PeerCensusFirstUnexpectedClassTruncated", "PeerCensusStatus"};
 
 void clearMode1Properties(IOService *service) {
     for (const char *name : kMode1Properties) {
@@ -63,6 +110,18 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
     MODE1_BOOL("ConsoleRecovered", result.consoleRecovered);
     MODE1_BOOL("ReadOnly", !result.pciMutationAttempted && r.storesIssued == 0);
     MODE1_BOOL("Success", r.success);
+    const auto &census = result.peerCensus;
+    MODE1_BOOL("PeerCensusObserved", census.observed);
+    MODE1_BOOL("PeerCensusIteratorPresent", census.iteratorPresent);
+    MODE1_BOOL("PeerCensusIteratorValid", census.iteratorValid);
+    MODE1_BOOL("PeerCensusExhausted", census.exhausted);
+    MODE1_NUM("PeerCensusClientCount", census.clientCount);
+    MODE1_NUM("PeerCensusSelfCount", census.selfCount);
+    MODE1_NUM("PeerCensusUnexpectedCount", census.unexpectedCount);
+    MODE1_BOOL("PeerCensusFirstUnexpectedClassTruncated", census.firstUnexpectedClassTruncated);
+    published = service->setProperty("CobaltSurvey,Mode1ResetPeerCensusFirstUnexpectedClass",
+        census.firstUnexpectedClass) && published;
+    published = service->setProperty("CobaltSurvey,Mode1ResetPeerCensusStatus", census.status) && published;
 #undef MODE1_BOOL
 #undef MODE1_NUM
     published = service->setProperty("CobaltSurvey,AccessMode", "smu-debug-mode1-reset") && published;
@@ -309,7 +368,7 @@ COBALT_SURVEY_NOINLINE void runMode1(IOService *service, IOPCIDevice *pci, OSDat
             result.reason = "register-endpoint-collision"; return;
         }
     }
-    if (!apertureOnlyClient(pci, service)) { result.reason = "peer-refused"; return; }
+    if (!mode1PeerCensus(pci, service, result.peerCensus)) { result.reason = "peer-refused"; return; }
     ProviderSession session(pci, service);
     if (!session.open()) { result.reason = "provider-busy"; return; }
     if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {

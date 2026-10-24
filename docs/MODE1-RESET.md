@@ -5,6 +5,10 @@ for Navi44 / MP1 14.0.2. It tests the SMU debug route selected by Linux for
 this hardware. It does not enable graphics acceleration, load firmware after
 the reset, or establish that software reset can replace a cold power cycle.
 
+Version 0.11.1 adds diagnostics for the initial provider-client ownership
+check. It preserves the requirement that the survey be the GPU's only attached
+IOService client and does not add any peer exceptions or reset retries.
+
 ## Arming and running
 
 The diagnostic requires these four boot arguments, each equal to numeric 1:
@@ -69,6 +73,27 @@ Final console and framebuffer-layout checks must also pass. All temporary
 maps and ownership are released before result publication.
 
 ## Interpreting results
+
+A request can reach the driver and still return an IOKit error before any
+reset operation. In particular, `Reason=peer-refused`, `Status=not-run`,
+`StoresIssued=0` and `PciMutationAttempted=false` mean that the initial
+ownership check refused the request. They do not establish which peer or
+iterator condition caused the refusal. The `Mode1ResetPeerCensus` properties
+record that exact check's iterator state, bounded counts and first unexpected
+class, and distinguish an extra client from an unavailable or invalid census.
+An invalid iterator's partial counts cannot establish that peers are absent.
+
+The helper also supports a read-only inspection:
+
+```sh
+/Volumes/TAHOE/mode1-reset --inspect-peers
+```
+
+This lists the survey's PCI provider and its direct IOService-plane children
+without requesting a reset or opening the device. The trigger prints this
+inventory before its single request, and the collector saves it when the
+helper is available. These user-space observations happen at a different time
+from the kernel check and do not override its decision.
 
 `Mode1Reset` properties record the attempted writes, PCI save/restore,
 quiet interval, initial/final raw observations, recovery polling and status.

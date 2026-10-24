@@ -88,6 +88,7 @@ class SurveyCollectorTests(unittest.TestCase):
         self.assertIn("exit 71", (report / "status.txt").read_text())
         self.assertIn("exit 43", (report / "status.txt").read_text())
         self.assertIn("log fixture diagnostic", (report / "boot-log.stderr.txt").read_text())
+        self.assertFalse((report / "gpu-provider-clients.txt").exists())
         self.assertIn("instance output captured", (report / "README.txt").read_text())
         self.assertEqual(
             (self.root / "ioreg.args").read_text(),
@@ -99,6 +100,18 @@ class SurveyCollectorTests(unittest.TestCase):
             'CALL\n<show>\n<--last>\n<15m>\n<--style>\n<compact>\n'
             '<--predicate>\n<process == "kernel" AND eventMessage CONTAINS "CobaltNavi44Survey">\n',
         )
+
+    @unittest.skipIf(os.name == "nt", "Windows filesystems do not expose executable mode bits to POSIX sh")
+    def test_optional_peer_inventory_is_captured_and_failure_is_best_effort(self):
+        self.base_commands()
+        client = self.script.parent / "mode1-reset"
+        client.write_text('#!/bin/sh\necho "peer inventory refused" >&2\nexit 5\n', encoding="utf-8")
+        client.chmod(0o755)
+        completed, report = self.run_collector(output=self.root / "peer output")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("peer inventory refused", (report / "gpu-provider-clients.stderr.txt").read_text())
+        self.assertTrue((report / "gpu-provider-clients.txt").exists())
+        self.assertIn("gpu-provider-clients: exit 5", (report / "status.txt").read_text())
 
     def test_empty_service_output_is_unambiguously_exit_two(self):
         self.base_commands(service=False)
