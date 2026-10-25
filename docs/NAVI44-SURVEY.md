@@ -15,6 +15,8 @@ a separately armed SOS-startup checkpoint with eight buffers. Version 0.11.0
 also provides a separate [manual software-reset test](MODE1-RESET.md).
 Version 0.11.1 records the initial reset ownership census and adds a read-only
 provider-child inventory to explain refusals without relaxing the check.
+Version 0.12.0 adds a separate [early-boot reset experiment](EARLY-MODE1-RESET.md)
+with passive bootstrap and a one-time capture helper.
 
 ## One-command KDB checkpoint (0.7.0)
 

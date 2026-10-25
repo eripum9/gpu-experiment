@@ -3453,6 +3453,165 @@ static void mode1ResourceFree() {
     CHECK(testState.backingDescriptorsLive == 0 && testState.allocations == 0);
     CHECK(testState.openLive == 0 && testState.iteratorsLive == 0);
 }
+static void mode1EarlyDevice(Device &d) {
+    mode1Device(d);
+    testState.mode1BootPresent = false;
+    testState.mode1EarlyBootPresent = true;
+    testState.mode1EarlyBoot = "1";
+}
+static void mode1EarlyTests() {
+    activeTestPhase = "mode1Tests.early-opt-in-and-boundary";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1Device(d);
+        testState.mode1EarlyBootPresent = true; testState.mode1EarlyBoot = "0";
+        mode1Start(d);
+        CHECK(testState.mode1Writes.empty() && testState.consolePauseCalls == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetArmed") == 1);
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1EarlyDevice(d);
+        bool snapshotPublished = false;
+        testState.onDiscoverySnapshotPublication = [&snapshotPublished] { snapshotPublished = true; };
+        testState.mode1Read = [&d, &snapshotPublished](uint32_t offset, uint32_t value) {
+            CHECK(snapshotPublished && !d.service.registered);
+            CHECK(testState.mapsLive == 5 && testState.mode1MapsLive == 5);
+            CHECK(testState.allocations == 0 && testState.openLive == 1);
+            return mode1RegisterValue(offset, value);
+        };
+        IOReturn nestedRequest = kIOReturnSuccess;
+        testState.mode1Write = [&d, &nestedRequest](uint32_t offset, uint32_t) {
+            CHECK(testState.consolePaused && !d.service.registered);
+            if (offset == 0x11d8) nestedRequest = requestMode1(d, mode1Request());
+        };
+        bool quietObserved = false;
+        testState.onMode1Sleep = [&quietObserved] {
+            if (testState.mode1Quiet) {
+                quietObserved = true;
+                CHECK(testState.consolePaused);
+                CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 0);
+            }
+        };
+        mode1Start(d);
+        CHECK(nestedRequest == kIOReturnUnsupported);
+        CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && quietObserved);
+        CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
+        CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
+        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.12.0");
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetTrigger") == "early-boot");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePauseAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePaused") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsoleResumeAttempted") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsoleResumed") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetArmed") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 12);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetColdCycleReplacementValidated") == 0);
+        const auto &events = testState.mode1Events;
+        const auto pause = std::find(events.begin(), events.end(), "console-pause");
+        const auto burst = std::find(events.begin(), events.end(), "write-4564");
+        const auto restored = std::find(events.begin(), events.end(), "restore-pci");
+        const auto resume = std::find(events.begin(), events.end(), "console-resume");
+        const auto published = std::find(events.begin(), events.end(), "register-service");
+        CHECK(pause < burst && burst + 4 < events.end());
+        CHECK(burst[1] == "write-4652" && burst[2] == "write-4568" &&
+            burst[3] == "quiet-begin" && burst[4] == "quiet-end");
+        CHECK(burst + 4 < restored && restored < resume && resume < published);
+        CHECK(requestMode1(d, mode1Request()) == kIOReturnUnsupported);
+        CHECK(testState.mode1Writes.size() == 3);
+        mode1ResourceFree();
+        d.service.stop(&d.pci);
+        CHECK(!d.service.numbers.count("CobaltSurvey,Mode1ResetEarlyRequested"));
+        CHECK(!d.service.strings.count("CobaltSurvey,Mode1ResetTrigger"));
+        CHECK(!d.service.strings.count("CobaltSurvey,BuildVersion"));
+    }
+    activeTestPhase = "mode1Tests.early-mixed-flags";
+    for (unsigned kind = 0; kind < 11; ++kind) {
+        Device d; Mode1Cleanup cleanup{d}; mode1EarlyDevice(d);
+        if (kind == 0) testState.mode1BootPresent = true;
+        if (kind == 1) testState.mode1EarlyBoot = "2";
+        if (kind == 2) testState.indexedBoot = "0";
+        if (kind == 3) testState.stateBoot = "0";
+        if (kind == 4) testState.apertureBootPresent = true;
+        if (kind == 5) testState.stagingBootPresent = true;
+        if (kind == 6) testState.kdbBootPresent = true;
+        if (kind == 7) testState.splBootPresent = true;
+        if (kind == 8) testState.preSosBootPresent = true;
+        if (kind == 9) testState.sosBootPresent = true;
+        if (kind == 10) { testState.apertureBootPresent = true; testState.apertureBoot = "2"; }
+        CHECK(d.service.start(&d.pci));
+        CHECK(d.service.strings.at("CobaltSurvey,Status") == "mode1-flags-refused");
+        CHECK(testState.selectorWrites == 0 && testState.mapRequests == 0);
+        CHECK(testState.mode1Writes.empty() && testState.mode1SaveCalls == 0);
+        CHECK(testState.consolePauseCalls == 0 && testState.consoleResumeCalls == 0);
+        CHECK(testState.apertureCpuWrites == 0 && testState.kdbWrites == 0 && testState.sosWrites == 0);
+        mode1ResourceFree();
+    }
+    activeTestPhase = "mode1Tests.early-checkpoint-and-peer-refusal";
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1EarlyDevice(d);
+        testState.failConsoleSchema = true;
+        mode1Start(d);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "early-prerequisites-unavailable");
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 3);
+        CHECK(testState.mode1SaveCalls == 0 && testState.mode1Writes.empty());
+    }
+    {
+        Device d; Mode1Cleanup cleanup{d}; mode1EarlyDevice(d);
+        OSObject peer; peer.meta.name = "AMDSupport";
+        testState.onConsolePublication = [&d, &peer](const std::string &key) {
+            if (key == "CobaltSurvey,ConsoleStatus") d.pci.clients.push_back(&peer);
+        };
+        mode1Start(d);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetReason") == "peer-refused");
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetPeerCensusFirstUnexpectedClass") == "AMDSupport");
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetPeerCensusClientCount") == 2);
+        CHECK(testState.mode1SaveCalls == 0 && testState.mode1Writes.empty());
+        CHECK(testState.consolePauseCalls == 0 && testState.consoleResumeCalls == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+    }
+    activeTestPhase = "mode1Tests.early-console-and-recovery-failures";
+    for (unsigned kind = 0; kind < 6; ++kind) {
+        Device d; Mode1Cleanup cleanup{d}; mode1EarlyDevice(d);
+        if (kind == 0) testState.consolePauseFail = true;
+        if (kind == 1) testState.onConsoleControl = [&d](unsigned op) {
+            if (op == kPEDisableScreen) d.pci.command = 6; // invalid disabled-BM guard
+        };
+        if (kind == 2) testState.mode1RestoreFail = true;
+        if (kind == 3) testState.mode1Read = [](uint32_t offset, uint32_t value) {
+            const auto actual = mode1RegisterValue(offset, value);
+            return !testState.mode1Writes.empty() && offset == 0xa71c ? actual ^ 1u : actual;
+        };
+        if (kind == 4) testState.onMode1Sleep = [&d] { d.pci.inactive = true; };
+        if (kind == 5) testState.consoleResumeFail = true;
+        mode1Start(d);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetReadOnly") == 0);
+        CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == (kind == 5 ? 1u : 0u));
+        CHECK(testState.mode1Writes.size() == (kind < 2 ? 0u : 3u));
+        CHECK(testState.mode1RestoreCalls == (kind == 4 ? 0u : 1u));
+        CHECK(testState.consolePaused == (kind != 0));
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsoleResumed") == 0);
+        if (kind == 0) CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetReason") == "console-pause-failed");
+        if (kind == 1) CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pre-burst-guard-failed");
+        if (kind == 2 || kind == 4) CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "pci-restore-failed");
+        if (kind == 3) CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetReason") == "postflight-layout-changed");
+        if (kind == 5) CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetReason") == "console-resume-failed");
+        mode1ResourceFree();
+    }
+    for (const char *key : {"CobaltSurvey,Mode1ResetConsoleResumed", "CobaltSurvey,Mode1ResetTrigger", "CobaltSurvey,BuildVersion"}) {
+        Device d; Mode1Cleanup cleanup{d}; mode1EarlyDevice(d);
+        testState.propertyFailKey = key;
+        mode1Start(d);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 4);
+        CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "metadata-publication-failed");
+        CHECK(testState.consoleResumeCalls == 1 && !testState.consolePaused);
+        CHECK(!d.service.numbers.count("CobaltSurvey,Mode1ResetSuccess") ||
+            d.service.numbers.at("CobaltSurvey,Mode1ResetSuccess") == 0);
+        mode1ResourceFree();
+    }
+}
 static void mode1Tests() {
     activeTestPhase = "mode1Tests.boot-is-inert";
     {
@@ -3826,6 +3985,7 @@ static void mode1Tests() {
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetStatus") == "metadata-publication-failed");
         mode1ResourceFree();
     }
+    mode1EarlyTests();
     CHECK(!mode1CleanupFailed);
 }
 

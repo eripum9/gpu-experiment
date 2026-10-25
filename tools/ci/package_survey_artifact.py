@@ -62,8 +62,11 @@ def payload() -> dict[str, bytes]:
     extras = {
         "collect-gpu-survey.sh": ROOT / "tools/navi44-survey/collect-survey.sh",
         "test-software-reset.sh": ROOT / "tools/navi44-survey/test-software-reset.sh",
+        "install-early-reset-test.sh": ROOT / "tools/navi44-survey/install-early-reset-test.sh",
+        "capture-early-reset.sh": ROOT / "tools/navi44-survey/capture-early-reset.sh",
         "SURVEY-TEST.md": ROOT / "docs/NAVI44-SURVEY.md",
         "MODE1-RESET.md": ROOT / "docs/MODE1-RESET.md",
+        "EARLY-MODE1-RESET.md": ROOT / "docs/EARLY-MODE1-RESET.md",
         "licenses/LICENSE": ROOT / "src/navi48-bringup/LICENSE",
         "licenses/NOTICE": ROOT / "src/navi48-bringup/NOTICE",
         "licenses/LICENSE.amdgpu": ROOT / "src/navi48-bringup/firmware/LICENSE.amdgpu",
@@ -84,6 +87,7 @@ def payload() -> dict[str, bytes]:
         "Optional cobalt-survey-presos=1: prepare all seven separate 1 MiB windows before the complete pinned pre-SOS batch; requires all seven prior survey flags; preserves every window after any mailbox attempt; no SOS startup\n"
         "Optional cobalt-survey-sos=1: prepare all eight separate 1 MiB windows before the seven pre-SOS commands and final SOS command; requires all eight prior survey flags; no writes after SOS command; observes a fresh readable nonzero SOS transition only; no queues, display programming or acceleration\n"
         "Optional cobalt-survey-mode1=1: arms a manually triggered administrator-only SMU debug Mode 1 reset test; requires survey/indexed/state flags and all firmware/staging experiments off; never resets at boot; test helper captures before/after and attempts a normal reboot; hardware recovery and cold-cycle equivalence remain unvalidated\n"
+        "Optional cobalt-survey-mode1boot=1: separately selected early-boot Mode 1 reset attempt inside service start, before publication; requires survey/indexed/state and manual/firmware modes off; strict live ownership checks and OS console pause remain required; install the one-time capture agent from a passive bootstrap first; a hang before userland can prevent automatic capture/disarming\n"
         "Contains embedded AMD firmware under licenses/LICENSE.amdgpu; no Navi48Bringup executable\n"
     ).encode("utf-8")
     files["SHA256SUMS.txt"] = "".join(

@@ -16,7 +16,7 @@ public:
 private:
     IOLock *mode1Lock {nullptr};
     class OSData *mode1Snapshot {nullptr};
-    bool mode1Accepting {false}, mode1Attempted {false};
+    bool mode1Accepting {false}, mode1Attempted {false}, mode1BootCheckpoint {false};
     void survey(class IOPCIDevice *pci);
     void status(const char *value);
 };

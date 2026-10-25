@@ -99,10 +99,28 @@ bool mode1Selected() {
     return PE_parse_boot_argn("cobalt-survey-mode1", &value, sizeof(value)) && value != 0;
 }
 
+bool mode1BootSelected() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-mode1boot", &value, sizeof(value)) && value != 0;
+}
+
 bool mode1FlagsValid() {
     uint32_t value = 0;
-    if (!armed() || !indexedArmed() || !stateArmed() ||
+    if (mode1BootSelected() || !armed() || !indexedArmed() || !stateArmed() ||
         !PE_parse_boot_argn("cobalt-survey-mode1", &value, sizeof(value)) || value != 1) return false;
+    const char *others[] = {"cobalt-survey-aperture", "cobalt-survey-staging", "cobalt-survey-kdb",
+        "cobalt-survey-spl", "cobalt-survey-presos", "cobalt-survey-sos"};
+    for (const char *name : others) {
+        value = 0;
+        if (PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0) return false;
+    }
+    return true;
+}
+
+bool mode1BootFlagsValid() {
+    uint32_t value = 0;
+    if (mode1Selected() || !armed() || !indexedArmed() || !stateArmed() ||
+        !PE_parse_boot_argn("cobalt-survey-mode1boot", &value, sizeof(value)) || value != 1) return false;
     const char *others[] = {"cobalt-survey-aperture", "cobalt-survey-staging", "cobalt-survey-kdb",
         "cobalt-survey-spl", "cobalt-survey-presos", "cobalt-survey-sos"};
     for (const char *name : others) {
@@ -4444,6 +4462,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     if (!super::start(provider)) return false;
     if (mode1Lock) IOLockLock(mode1Lock);
     mode1Accepting = false;
+    mode1BootCheckpoint = false;
     if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
     if (mode1Lock) IOLockUnlock(mode1Lock);
     removeProperty("CobaltSurvey,DiscoverySnapshot");
@@ -4464,23 +4483,43 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     clearPreSosProperties(this);
     clearSosBootProperties(this);
     clearMode1Properties(this);
+    removeProperty("CobaltSurvey,BuildVersion");
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
+    setProperty("CobaltSurvey,BuildVersion", "0.12.0");
+    setProperty("CobaltSurvey,Mode1ResetEarlyRequested", mode1BootSelected());
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);
     setProperty("CobaltSurvey,Ready", false);
-    if (mode1Selected()) {
-        if (!mode1FlagsValid()) {
+    if (mode1Selected() || mode1BootSelected()) {
+        if ((mode1Selected() && !mode1FlagsValid()) || (mode1BootSelected() && !mode1BootFlagsValid())) {
             setProperty("CobaltSurvey,Mode1ResetStatus", "mixed-or-invalid-boot-flags");
             status("mode1-flags-refused"); registerService(); return true;
         }
-        if (!mode1Lock) mode1Lock = IOLockAlloc();
-        if (!mode1Lock) {
+        if (mode1Selected() && !mode1Lock) mode1Lock = IOLockAlloc();
+        if (mode1Selected() && !mode1Lock) {
             setProperty("CobaltSurvey,Mode1ResetStatus", "lock-allocation-failed");
             status("mode1-lock-unavailable"); registerService(); return true;
         }
     }
     survey(pci);
+    if (mode1BootSelected() && mode1BootFlagsValid()) {
+        // start() is synchronous. Its boot survey has returned and released
+        // every map/session before this separate opt-in transaction. Matching
+        // order is not assumed: all live ownership guards still apply.
+        if (!mode1Attempted && mode1BootCheckpoint && mode1Snapshot) {
+            mode1Attempted = true;
+            OSData *snapshot = mode1Snapshot; mode1Snapshot = nullptr;
+            pci->retain();
+            runAndPublishMode1(this, pci, snapshot, true);
+        } else {
+            setProperty("CobaltSurvey,Mode1ResetTrigger", "early-boot");
+            setProperty("CobaltSurvey,Mode1ResetArmed", false);
+            setProperty("CobaltSurvey,Mode1ResetAttempted", mode1Attempted);
+            setProperty("CobaltSurvey,Mode1ResetStatus", "early-prerequisites-unavailable");
+            if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
+        }
+    }
     registerService(); // Partial observations are useful; this never means ready.
     return true;
 }
@@ -4642,7 +4681,8 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
     IOFree(snapshot, allocationSize);
     if (!data) { status("snapshot-publication-allocation-failed"); return; }
     const bool published = setProperty("CobaltSurvey,DiscoverySnapshot", data);
-    if (published && mode1Selected() && mode1FlagsValid()) {
+    if (published && ((mode1Selected() && mode1FlagsValid()) ||
+        (mode1BootSelected() && mode1BootFlagsValid()))) {
         data->retain(); mode1Snapshot = data;
     }
     data->release();
@@ -4672,7 +4712,11 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             if (consoleFailure) publishConsoleFailure(this, consoleFailure);
             else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
             else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
-            else if (mode1Selected() && mode1FlagsValid() && mode1Lock && mode1Snapshot) {
+            else if (mode1BootSelected() && mode1BootFlagsValid() && mode1Snapshot) {
+                // This private checkpoint is set only after the complete
+                // Schema 4 console publication and its final live PCI guard.
+                mode1BootCheckpoint = true;
+            } else if (mode1Selected() && mode1FlagsValid() && mode1Lock && mode1Snapshot) {
                 IOLockLock(mode1Lock);
                 if (!mode1Attempted && !mode1AnyAttempt(pci) &&
                     setProperty("CobaltSurvey,Mode1ResetArmed", true) &&
@@ -4740,6 +4784,7 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
 void CobaltNavi44Survey::stop(IOService *provider) {
     if (mode1Lock) IOLockLock(mode1Lock);
     mode1Accepting = false;
+    mode1BootCheckpoint = false;
     if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
     removeProperty("CobaltSurvey,DiscoverySnapshot");
     clearStateProperties(this);
@@ -4751,6 +4796,7 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     clearPreSosProperties(this);
     clearSosBootProperties(this);
     clearMode1Properties(this);
+    removeProperty("CobaltSurvey,BuildVersion");
     removeProperty("CobaltSurvey,Schema");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,Ready", false);
@@ -4778,7 +4824,7 @@ IOReturn CobaltNavi44Survey::setProperties(OSObject *properties) {
         auto *pci = OSDynamicCast(IOPCIDevice, getProvider());
         if (pci) {
             pci->retain();
-            rc = runAndPublishMode1(this, pci, snapshot) ? kIOReturnSuccess : kIOReturnError;
+            rc = runAndPublishMode1(this, pci, snapshot, false) ? kIOReturnSuccess : kIOReturnError;
         } else {
             snapshot->release();
             Mode1AdapterResult result; result.reason = "provider-unavailable";

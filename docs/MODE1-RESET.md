@@ -9,6 +9,11 @@ Version 0.11.1 adds diagnostics for the initial provider-client ownership
 check. It preserves the requirement that the survey be the GPU's only attached
 IOService client and does not add any peer exceptions or reset retries.
 
+If AMDSupport or the fallback IONDRVFramebuffer has attached, a desktop
+request still refuses. Version 0.12.0 provides a separately selected
+[early-boot experiment](EARLY-MODE1-RESET.md); it does not make those peers
+exceptions to the manual ownership policy.
+
 ## Arming and running
 
 The diagnostic requires these four boot arguments, each equal to numeric 1:

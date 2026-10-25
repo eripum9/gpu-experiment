@@ -35,6 +35,7 @@ class SurveyPackageTests(unittest.TestCase):
                 "IOPCIPrimaryMatch": "0x75901002", "IOMatchCategory": "CobaltNavi44Survey"}},
         }
         for relative in ("tools/navi44-survey/collect-survey.sh", "tools/navi44-survey/test-software-reset.sh", "docs/NAVI44-SURVEY.md", "docs/MODE1-RESET.md",
+                         "tools/navi44-survey/install-early-reset-test.sh", "tools/navi44-survey/capture-early-reset.sh", "docs/EARLY-MODE1-RESET.md",
                          "src/navi48-bringup/LICENSE", "src/navi48-bringup/NOTICE",
                          "src/navi48-bringup/firmware/LICENSE.amdgpu",
                          "third-party/THIRD-PARTY-LICENSES.txt"):
@@ -55,10 +56,14 @@ class SurveyPackageTests(unittest.TestCase):
         files = self.payload()
         self.assertIn("collect-gpu-survey.sh", files)
         self.assertIn("SHA256SUMS.txt", files)
-        self.assertEqual(len(files), 14)
+        self.assertEqual(len(files), 17)
         self.assertEqual(files["mode1-reset"], self.reset_client.read_bytes())
         self.assertIn("test-software-reset.sh", files)
         self.assertIn("MODE1-RESET.md", files)
+        self.assertIn("EARLY-MODE1-RESET.md", files)
+        self.assertIn("install-early-reset-test.sh", files)
+        self.assertIn("capture-early-reset.sh", files)
+        self.assertIn(b"Optional cobalt-survey-mode1boot=1", files["BUILD-INFO.txt"])
         self.assertEqual(files["licenses/LICENSE.amdgpu"], b"fixture\n")
         self.assertIn("licenses/THIRD-PARTY-LICENSES.txt", files)
         self.assertIn(b"Contains embedded AMD firmware", files["BUILD-INFO.txt"])

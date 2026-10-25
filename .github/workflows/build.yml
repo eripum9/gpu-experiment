@@ -87,6 +87,10 @@ jobs:
           make -C src/navi44-survey MKSDK="$GITHUB_WORKSPACE/build/ci-deps/MacKernelSDK" all
           src/navi44-survey/build/mode1-reset --help
           /bin/sh -n tools/navi44-survey/test-software-reset.sh
+          /bin/sh -n tools/navi44-survey/install-early-reset-test.sh
+          /bin/sh -n tools/navi44-survey/capture-early-reset.sh
+          /bin/sh tools/navi44-survey/install-early-reset-test.sh --help
+          /bin/sh tools/navi44-survey/capture-early-reset.sh --help
 
       - name: Record optimized survey stack frames
         run: |

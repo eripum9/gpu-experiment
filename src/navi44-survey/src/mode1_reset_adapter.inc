@@ -6,6 +6,9 @@ struct Mode1AdapterResult {
     const char *reason {"prerequisites-unavailable"};
     bool consoleRecovered {false};
     bool pciMutationAttempted {false};
+    bool earlyBoot {false};
+    bool consolePauseAttempted {false}, consolePaused {false};
+    bool consoleResumeAttempted {false}, consoleResumed {false};
     struct PeerCensus {
         bool observed {false}, iteratorPresent {false}, iteratorValid {false}, exhausted {false};
         uint32_t clientCount {0}, selfCount {0}, unexpectedCount {0};
@@ -67,7 +70,8 @@ const char *const kMode1Properties[] = {"Armed", "Attempted", "Phase", "StoresIs
     "ParameterByteOffset", "MessageByteOffset", "ResponseByteOffset", "ConsoleRecovered", "ReadOnly", "Success",
     "PeerCensusObserved", "PeerCensusIteratorPresent", "PeerCensusIteratorValid", "PeerCensusExhausted",
     "PeerCensusClientCount", "PeerCensusSelfCount", "PeerCensusUnexpectedCount", "PeerCensusFirstUnexpectedClass",
-    "PeerCensusFirstUnexpectedClassTruncated", "PeerCensusStatus"};
+    "PeerCensusFirstUnexpectedClassTruncated", "PeerCensusStatus", "EarlyRequested", "Trigger",
+    "ConsolePauseAttempted", "ConsolePaused", "ConsoleResumeAttempted", "ConsoleResumed"};
 
 void clearMode1Properties(IOService *service) {
     for (const char *name : kMode1Properties) {
@@ -85,6 +89,12 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
 #define MODE1_NUM(name, value) published = service->setProperty("CobaltSurvey,Mode1Reset" name, value, 32) && published
     MODE1_BOOL("Armed", false);
     MODE1_BOOL("Attempted", true);
+    MODE1_BOOL("EarlyRequested", result.earlyBoot);
+    MODE1_BOOL("Trigger", result.earlyBoot ? "early-boot" : "manual");
+    MODE1_BOOL("ConsolePauseAttempted", result.consolePauseAttempted);
+    MODE1_BOOL("ConsolePaused", result.consolePaused);
+    MODE1_BOOL("ConsoleResumeAttempted", result.consoleResumeAttempted);
+    MODE1_BOOL("ConsoleResumed", result.consoleResumed);
     MODE1_NUM("Phase", r.phase);
     MODE1_NUM("StoresIssued", r.storesIssued);
     MODE1_BOOL("PciSaved", r.pciSaved);
@@ -108,7 +118,8 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
     MODE1_NUM("MessageByteOffset", result.debug.message);
     MODE1_NUM("ResponseByteOffset", result.debug.response);
     MODE1_BOOL("ConsoleRecovered", result.consoleRecovered);
-    MODE1_BOOL("ReadOnly", !result.pciMutationAttempted && r.storesIssued == 0);
+    MODE1_BOOL("ReadOnly", !result.pciMutationAttempted && !result.consolePauseAttempted &&
+        !result.consoleResumeAttempted && r.storesIssued == 0);
     MODE1_BOOL("Success", r.success);
     const auto &census = result.peerCensus;
     MODE1_BOOL("PeerCensusObserved", census.observed);
@@ -125,13 +136,16 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
 #undef MODE1_BOOL
 #undef MODE1_NUM
     published = service->setProperty("CobaltSurvey,AccessMode", "smu-debug-mode1-reset") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.12.0") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;
     // Indexed boot collection already used selector stores, including when
     // the later reset request is refused without touching PCI or debug MMIO.
     published = service->setProperty("CobaltSurvey,ReadOnly", false) && published;
-    if (published && r.success && result.consoleRecovered &&
-        service->setProperty("CobaltSurvey,Schema", 11ULL, 32)) return true;
+    const bool consoleBoundaryComplete = !result.earlyBoot ||
+        (result.consolePauseAttempted && result.consolePaused && result.consoleResumeAttempted && result.consoleResumed);
+    if (published && r.success && result.consoleRecovered && consoleBoundaryComplete &&
+        service->setProperty("CobaltSurvey,Schema", result.earlyBoot ? 12ULL : 11ULL, 32)) return true;
     // Failure must not leave an apparently committed success, even if the
     // property setter failed partway through the transaction.
     service->removeProperty("CobaltSurvey,Schema");
@@ -231,7 +245,21 @@ public:
     }
     bool readyToWrite() override {
         if (!stableState(disabled, false) || !stableConsole(disabled, false) || !guard(disabled)) return false;
-        IOLog("CobaltNavi44Survey: issuing manually requested SMU debug Mode1 reset\n");
+        IOLog("CobaltNavi44Survey: issuing %s SMU debug Mode1 reset\n", result.earlyBoot ? "early-boot" : "manually requested");
+        if (result.earlyBoot) {
+            IOPlatformExpert *platform = IOService::getPlatform();
+            if (!platform) return fail("console-pause-platform-unavailable");
+            // Pinned xnu-12377.1.9 PE_initialize_console/gc_pause disable
+            // kernel text/progress rendering under their console locks. A
+            // nullptr leaves PE_state.video unchanged, so the complete console
+            // and MC/DCN comparisons remain required while paused. This is a
+            // cooperative OS-console boundary, not proof that firmware or all
+            // possible GPU users are quiescent. Do not call it in the burst.
+            result.consolePauseAttempted = true;
+            if (platform->setConsoleInfo(nullptr, kPEDisableScreen) != kIOReturnSuccess)
+                return fail("console-pause-failed");
+            result.consolePaused = true;
+        }
         return guard(disabled);
     }
     void parameterZero() override { debug.parameterZero(); }
@@ -289,6 +317,27 @@ public:
             if (n >= 2 && value != initial[n]) return fail("postflight-layout-changed");
         }
         result.consoleRecovered = guard(saved);
+        if (result.consoleRecovered && result.earlyBoot) {
+            if (!result.consolePaused) return fail("console-was-not-paused");
+            IOPlatformExpert *platform = IOService::getPlatform();
+            if (!platform || !guard(saved)) {
+                result.consoleRecovered = false;
+                return fail("console-resume-context-unavailable");
+            }
+            // Resume only after restored PCI, recovery and the full stable
+            // postflight. Every earlier failure deliberately leaves the OS
+            // console paused for headless capture; no GPU restoration is tried.
+            result.consoleResumeAttempted = true;
+            if (platform->setConsoleInfo(nullptr, kPEEnableScreen) != kIOReturnSuccess) {
+                result.consoleRecovered = false;
+                return fail("console-resume-failed");
+            }
+            result.consoleResumed = true;
+            if (!guard(saved) || !stableConsole(saved, false)) {
+                result.consoleRecovered = false;
+                return false;
+            }
+        }
         if (result.consoleRecovered) result.reason = "stable-pci-memory-and-console-observed";
         return result.consoleRecovered;
     }
@@ -401,8 +450,9 @@ COBALT_SURVEY_NOINLINE void runMode1(IOService *service, IOPCIDevice *pci, OSDat
 // Consumes the caller's two retained references. No GPU mappings, provider
 // opens, temporary snapshot references or retained PCI references survive into
 // result publication (the immutable registry snapshot is observational data).
-COBALT_SURVEY_NOINLINE bool runAndPublishMode1(IOService *service, IOPCIDevice *pci, OSData *snapshot) {
+COBALT_SURVEY_NOINLINE bool runAndPublishMode1(IOService *service, IOPCIDevice *pci, OSData *snapshot, bool earlyBoot) {
     Mode1AdapterResult result;
+    result.earlyBoot = earlyBoot;
     runMode1(service, pci, snapshot, result);
     if (snapshot) snapshot->release();
     if (pci) pci->release();

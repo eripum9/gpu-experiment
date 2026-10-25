@@ -33,6 +33,7 @@ constexpr IOReturn kIOReturnBusy = -1003;
 constexpr IOReturn kIOReturnNotReady = -1004;
 constexpr IOReturn kIOReturnError = -1005;
 constexpr IOReturn kIOReturnNoDevice = -1006;
+constexpr unsigned kPEDisableScreen = 7, kPEEnableScreen = 6;
 // Match the production LP64 scalar width even when Windows unsigned long is32bit.
 struct PE_Video {
     uint64_t v_baseAddr=0, v_rowBytes=0, v_width=0, v_height=0, v_depth=0, v_display=0;
@@ -65,6 +66,11 @@ struct TestState {
     bool sosBootPresent = false, sosEnabled = false, sosClaimFail = false, sosClaimed = false;
     std::string mode1Boot = "1";
     bool mode1BootPresent = false, mode1Enabled = false, mode1Claimed = false, mode1ClaimFail = false;
+    std::string mode1EarlyBoot = "1";
+    bool mode1EarlyBootPresent = false;
+    bool consolePaused = false, consolePauseFail = false, consoleResumeFail = false;
+    unsigned consolePauseCalls = 0, consoleResumeCalls = 0;
+    std::function<void(unsigned)> onConsoleControl;
     bool mode1Quiet = false, mode1RequestAdmin = true, mode1LockBusy = false;
     unsigned mode1ReadCalls = 0, mode1WriteCalls = 0, mode1SaveCalls = 0, mode1RestoreCalls = 0;
     unsigned mode1SleepCalls = 0, mode1PropertyCalls = 0, mode1PrivilegeCalls = 0;
@@ -370,6 +376,7 @@ public:
             testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at registerService");
         registered = true;
+        if (testState.mode1Enabled) testState.mode1Events.push_back("register-service");
     }
     virtual void free() {}
 };
@@ -394,6 +401,8 @@ inline void requireExplicitWritableMode() {
 class IOPlatformExpert {
 public:
     IOReturn getConsoleInfo(PE_Video *video) {
+        if (testState.mode1Quiet || (!testState.mode1Writes.empty() && testState.mode1SleepCalls == 0))
+            throw std::runtime_error("console API during Mode 1 burst or quiet interval");
         const bool kdbTransactionLive = testState.kdbEnabled && testState.openLive == 1 &&
             testState.mapsLive >= 4 && testState.mapsLive <= 8;
         const bool preSosTransactionLive = testState.preSosEnabled && testState.openLive == 1 &&
@@ -409,6 +418,26 @@ public:
         *video = testState.console;
         if (testState.onConsole) testState.onConsole(testState.consoleCalls, *video);
         return testState.consoleResult;
+    }
+    IOReturn setConsoleInfo(PE_Video *video, unsigned operation) {
+        if (video || (operation != kPEDisableScreen && operation != kPEEnableScreen) ||
+            !testState.mode1EarlyBootPresent || !testState.mode1Enabled || testState.openLive != 1 ||
+            testState.mode1MapsLive != 5 || testState.iteratorsLive)
+            throw std::runtime_error("console control outside owned early Mode 1 transaction");
+        if (testState.mode1Quiet || (!testState.mode1Writes.empty() && testState.mode1SleepCalls == 0))
+            throw std::runtime_error("console control during Mode 1 burst or quiet interval");
+        const bool pause = operation == kPEDisableScreen;
+        if (!pause && (testState.mode1RestoreCalls != 1 || testState.mode1Writes.size() != 3 ||
+            testState.mode1ReadCalls < 48))
+            throw std::runtime_error("console resume before PCI recovery and full postflight");
+        if (pause) ++testState.consolePauseCalls;
+        else ++testState.consoleResumeCalls;
+        testState.mode1Events.push_back(pause ? "console-pause" : "console-resume");
+        if (testState.onConsoleControl) testState.onConsoleControl(operation);
+        if (pause ? testState.consolePauseFail : testState.consoleResumeFail) return kIOReturnError;
+        // Like PE_initialize_console(nullptr,...), preserve PE_Video geometry.
+        testState.consolePaused = pause;
+        return kIOReturnSuccess;
     }
 };
 inline IOPlatformExpert fakePlatform;
@@ -1050,6 +1079,14 @@ inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
 }
 
 inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
+    const auto enabled = [](bool present, const std::string &argument) {
+        const std::string token = argument.substr(0, argument.find_first_of(" \t"));
+        char *end = nullptr;
+        const auto numeric = std::strtoll(token.c_str(), &end, 0);
+        return present && !token.empty() && end && *end == '\0' && numeric == 1;
+    };
+    testState.mode1Enabled = enabled(testState.mode1BootPresent, testState.mode1Boot) ||
+        enabled(testState.mode1EarlyBootPresent, testState.mode1EarlyBoot);
     const bool indexed = std::string(key) == "cobalt-survey-indexed";
     const bool state = std::string(key) == "cobalt-survey-state";
     const bool aperture = std::string(key) == "cobalt-survey-aperture";
@@ -1059,15 +1096,16 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool preSos = std::string(key) == "cobalt-survey-presos";
     const bool sos = std::string(key) == "cobalt-survey-sos";
     const bool mode1 = std::string(key) == "cobalt-survey-mode1";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1) throw std::runtime_error("unexpected boot argument");
+    const bool mode1Early = std::string(key) == "cobalt-survey-mode1boot";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1 && !mode1Early) throw std::runtime_error("unexpected boot argument");
     if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
-        mode1 ? !testState.mode1BootPresent : sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
+        mode1Early ? !testState.mode1EarlyBootPresent : mode1 ? !testState.mode1BootPresent : sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
         spl ? !testState.splBootPresent : kdb ? !testState.kdbBootPresent :
         aperture ? !testState.apertureBootPresent : staging ? !testState.stagingBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : mode1Early ? testState.mode1EarlyBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
         aperture ? testState.apertureBoot : staging ? testState.stagingBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
@@ -1079,7 +1117,6 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (spl) testState.splEnabled = integer == 1;
         if (preSos) testState.preSosEnabled = integer == 1 && !testState.sosEnabled;
         if (sos) testState.sosEnabled = integer == 1;
-        if (mode1) testState.mode1Enabled = integer == 1;
         std::memcpy(out, &integer, static_cast<size_t>(n) < sizeof(integer) ? static_cast<size_t>(n) : sizeof(integer));
     } else {
         if (staging) testState.stagingEnabled = false;
@@ -1087,7 +1124,6 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (spl) testState.splEnabled = false;
         if (preSos) testState.preSosEnabled = false;
         if (sos) testState.sosEnabled = false;
-        if (mode1) testState.mode1Enabled = false;
         std::memset(out, 0, static_cast<size_t>(n));
         std::memcpy(out, token.data(), token.size() < static_cast<size_t>(n) ? token.size() : static_cast<size_t>(n));
     }
