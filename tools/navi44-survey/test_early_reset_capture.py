@@ -176,6 +176,7 @@ esac
         collector.write_text('#!/bin/sh\nmkdir -p "$1"\necho baseline >> "$TRACE"\nexit 0\n', encoding="utf-8")
         client = payload / "mode1-reset"
         client.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        client.chmod(0o755)
         capture = payload / AGENT.name
         shutil.copyfile(AGENT, capture)
         installer = payload / INSTALLER.name
@@ -307,6 +308,7 @@ if [ "$1" = -m ]; then shift 2; fi
         collector.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         client = resident / "mode1-reset"
         client.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        client.chmod(0o755)
         agent = self.root / AGENT.name
         text = AGENT.read_text(encoding="utf-8")
         text = text.replace("/Library/Application Support/CobaltEarlyResetTest", shell_path(resident))
@@ -376,6 +378,7 @@ if [ "$1" = -m ]; then shift 2; fi
             'echo "collector-call" >> "$TRACE"\nexit 42\n', encoding="utf-8")
         client = resident / "mode1-reset"
         client.write_text('#!/bin/sh\necho "client:$*" >> "$TRACE"\nexit 0\n', encoding="utf-8")
+        client.chmod(0o755)
         agent = self.root / AGENT.name
         text = AGENT.read_text(encoding="utf-8")
         replacements = {
@@ -469,7 +472,8 @@ esac
         self.assertEqual(config.read_bytes(), baseline)
         self.assertTrue((session_dir / f"completion-{session}.txt").exists())
         self.assertTrue((session_dir / "capture-agent.log").exists())
-        self.assertIn("client:--inspect-peers", trace_text)
+        self.assertIn("client:--inspect-peers", trace_text,
+                      (session_dir / "peer-inventory.txt").read_text(encoding="utf-8"))
         self.assertNotIn("--run", trace_text)
 
 
