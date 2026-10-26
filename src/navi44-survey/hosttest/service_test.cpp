@@ -3497,7 +3497,7 @@ static void mode1EarlyTests() {
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && quietObserved);
         CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
         CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
-        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.12.0");
+        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.13.0");
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetTrigger") == "early-boot");
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePauseAttempted") == 1);
@@ -3989,6 +3989,156 @@ static void mode1Tests() {
     CHECK(!mode1CleanupFailed);
 }
 
+static void earlyInitDevice(Device &d, bool nativeRoute=false) {
+    mode1Device(d);
+    testState.mode1BootPresent = false;
+    testState.earlyInitBootPresent = true;
+    testState.earlyInitBoot = "1";
+    d.mmio.length = d.mmio.contiguous = 0x80000;
+    d.pci.subsystem = 0x86011eae;
+    testState.apertureNativeRoute = nativeRoute;
+    if (nativeRoute) testState.apertureRemap = (testState.apertureNbifSegmentBase + 0xf7) * 4;
+    testState.apertureFlush[0x78c/4] = 16304;
+    testState.kdbAddressByteOffset = 0x1190;
+    testState.kdbCommandByteOffset = 0x118c;
+    testState.kdbStateOffsets = {0x118c,0x1244,0xa950,0xa954,0xa71c,0x6dd4};
+    testState.sosCpu.assign(8, std::vector<uint32_t>(262144, 0x27182818));
+    testState.sosGpu.assign(8, std::vector<uint32_t>(262144, 0x27182818));
+    testState.stateRead = [](uint32_t offset, uint32_t value) {
+        if (offset == 0x1244 && testState.sosFinalStoreSeen) return 0x17u;
+        if (offset == 0x6dd4) return 0x8000u;
+        return mode1RegisterValue(offset,value);
+    };
+    testState.mode1Read = [](uint32_t offset, uint32_t value) {
+        if (offset == 0x6dd4) return 0x8000u;
+        return offset == 0x378c ? 16304u : mode1RegisterValue(offset,value);
+    };
+}
+
+static void earlyInitResourceFree() {
+    mode1ResourceFree();
+    CHECK(testState.metadataAllocations == 0 && testState.metadataPointers.empty());
+}
+
+static void earlyInitTests() {
+    const Bytes &fake = syntheticPreSosPspFirmware();
+    for (bool native : {false,true}) {
+        activeTestPhase = native ? "earlyInit.native-success" : "earlyInit.isolated-success";
+        FirmwareOverrideScope firmware(fake);
+        Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d,native);
+        mode1Start(d);
+        if (d.service.numbers["CobaltSurvey,EarlyInitSuccess"] != 1)
+            throw std::runtime_error("compound failed: " + d.service.strings["CobaltSurvey,EarlyInitStatus"] +
+                " reset=" + d.service.strings["CobaltSurvey,Mode1ResetReason"] +
+                " sos=" + d.service.strings["CobaltSurvey,SosBootStatus"]);
+        CHECK(d.service.numbers.at("CobaltSurvey,Schema") == 13);
+        CHECK(d.service.numbers.at("CobaltSurvey,Ready") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,ColdCycleReplacementValidated") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitColdCycleReplacementValidated") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetResetTransitionObserved") == 0);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,SosBootFinalSosRaw") == 0x17);
+        CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1);
+        CHECK(testState.mode1RestoreCalls == 1 && testState.sosWrites == 16);
+        CHECK(testState.earlyInitRefreshDataReads == 5120);
+        CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitDiscoveryVerified") == 1);
+        CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitDiscoveryDataReads") == 5120);
+        CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitDiscoverySelectorWrites") == 5124);
+        CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
+        CHECK(std::find(testState.earlyInitSchemaWrites.begin(),testState.earlyInitSchemaWrites.end(),10) == testState.earlyInitSchemaWrites.end());
+        CHECK(std::find(testState.earlyInitSchemaWrites.begin(),testState.earlyInitSchemaWrites.end(),12) == testState.earlyInitSchemaWrites.end());
+        const auto &events = testState.earlyInitEvents;
+        const auto restored = std::find(events.begin(),events.end(),"restore-pci");
+        const auto refresh = std::find(events.begin(),events.end(),"phase-2");
+        const auto visible = std::find(events.begin(),events.end(),"all-eight-images-visible");
+        const auto command = std::find(events.begin(),events.end(),"sos-final-command");
+        const auto resume = std::find(events.begin(),events.end(),"console-resume");
+        CHECK(restored < refresh && refresh < visible && visible < command && command < resume);
+        CHECK(testState.openCalls == 2 && testState.closeCalls == 2);
+        CHECK(requestMode1(d,mode1Request()) == kIOReturnUnsupported);
+        for (unsigned n=0;n<8;++n) {
+            CHECK(testState.sosEvents[2*n].offset == 0x1190);
+            CHECK(testState.sosEvents[2*n+1].value == cobalt::survey::kSosImages[n].command);
+            const auto &spec = cobalt::survey::kSosImages[n];
+            for (size_t word=0;word<testState.sosCpu[n].size();++word) {
+                uint32_t expected=0;
+                if (word*4<spec.bytes) std::memcpy(&expected,fake.data()+spec.fileOffset+word*4,4);
+                if (testState.sosCpu[n][word]!=expected || testState.sosGpu[n][word]!=expected)
+                    throw std::runtime_error("compound staging payload/tail mismatch");
+            }
+        }
+        earlyInitResourceFree();
+    }
+    for (unsigned invalid=0;invalid<11;++invalid) {
+        activeTestPhase = "earlyInit.flag-refusal";
+        Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d);
+        if (invalid==0) testState.earlyInitBoot="2";
+        if (invalid==1) testState.indexedBoot="0";
+        if (invalid==2) testState.stateBoot="0";
+        if (invalid==3) testState.mode1BootPresent=true;
+        if (invalid==4) testState.mode1EarlyBootPresent=true;
+        if (invalid==5) testState.apertureBootPresent=true;
+        if (invalid==6) testState.stagingBootPresent=true;
+        if (invalid==7) testState.kdbBootPresent=true;
+        if (invalid==8) testState.splBootPresent=true;
+        if (invalid==9) testState.preSosBootPresent=true;
+        if (invalid==10) testState.sosBootPresent=true;
+        CHECK(d.service.start(&d.pci));
+        CHECK(d.service.strings.at("CobaltSurvey,Status")=="early-init-flags-refused");
+        CHECK(testState.mapRequests==0 && testState.selectorWrites==0 && testState.mode1Writes.empty() && testState.sosWrites==0);
+        earlyInitResourceFree();
+    }
+    for (unsigned fault=0;fault<13;++fault) {
+        const char *faultNames[] = {"earlyInit.reset-failure", "earlyInit.discovery-change", "earlyInit.map-failure",
+            "earlyInit.mailbox-context-loss", "earlyInit.schema-failure", "earlyInit.metadata-failure",
+            "earlyInit.peer-arrival", "earlyInit.resume-postflight", "earlyInit.existing-marker",
+            "earlyInit.changed-memsize", "earlyInit.changed-remap", "earlyInit.repause-failure", "earlyInit.late-publication"};
+        activeTestPhase = faultNames[fault];
+        FirmwareOverrideScope firmware(fake);
+        Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d);
+        OSObject peer;
+        if (fault==0) testState.mode1SaveFail=true;
+        if (fault==1) testState.dataRead=[](unsigned index,uint32_t value) { return index>=5120 ? value^1u : value; };
+        if (fault==2) testState.preSosMapFailIndex=7;
+        if (fault==3) testState.onSos=[&d](const TestState::SosEvent &) { d.pci.command=0; };
+        if (fault==4) testState.failEarlyInitSchema13=true;
+        if (fault==5) testState.propertyFailKey="CobaltSurvey,EarlyInitSuccess";
+        if (fault==6) testState.onMode1Sleep=[&d,&peer] { d.pci.clients.push_back(&peer); };
+        if (fault==7) testState.onConsoleControl=[&d](unsigned op) { if (op==kPEEnableScreen) d.pci.command=0; };
+        if (fault==8) d.pci.numbers["CobaltSurvey,PreSosAttempt-v1"]=1;
+        if (fault==9) testState.onMemsize=[](unsigned) {
+            if (testState.mode1RestoreCalls) testState.apertureFlush[0x78c/4]=0;
+        };
+        if (fault==10) testState.apertureRegisterRead=[](uint32_t offset,uint32_t value) {
+            return testState.earlyInitPhase>=3 && offset==0x3934 ? 0xffffffffu : value;
+        };
+        if (fault==11) testState.onConsoleControl=[&d](unsigned op) {
+            if (op==kPEEnableScreen) { d.pci.command=0; testState.consolePauseFail=true; }
+        };
+        if (fault==12) testState.onSos=[](const TestState::SosEvent &) {
+            testState.propertyFailKey="CobaltSurvey,EarlyInitDiscoveryVerified";
+        };
+        CHECK(d.service.start(&d.pci));
+        CHECK(!d.service.numbers.count("CobaltSurvey,Schema") || d.service.numbers.at("CobaltSurvey,Schema")!=13);
+        CHECK(!d.service.numbers.count("CobaltSurvey,EarlyInitSuccess") || d.service.numbers.at("CobaltSurvey,EarlyInitSuccess")==0);
+        if (fault==0 || fault==1 || fault==6 || fault==8 || fault==9 || fault==10) CHECK(testState.sosWrites==0 && testState.apertureCpuWrites==0);
+        if (fault==2) CHECK(testState.sosWrites==0);
+        if (fault==3) CHECK(testState.sosWrites==1 && testState.consoleResumeCalls==0);
+        if (fault==7) {
+            CHECK(testState.consolePauseCalls==2 && testState.consoleResumeCalls==1 && testState.consolePaused);
+            CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitConsoleRePaused")==1);
+        }
+        if (fault==11) {
+            CHECK(testState.consolePauseCalls==2 && testState.consoleResumeCalls==1 && !testState.consolePaused);
+            CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitConsoleRePauseAttempted")==1);
+            CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitConsoleRePaused")==0);
+        }
+        if (fault==12) CHECK(testState.sosWrites==16 && testState.consoleResumeCalls==1);
+        earlyInitResourceFree();
+    }
+    CHECK(!mode1CleanupFailed);
+}
+
 static void runPhase(const char *name, void (*test)()) {
     activeTestPhase = name;
     const unsigned before = checks;
@@ -4003,6 +4153,11 @@ static void runPhase(const char *name, void (*test)()) {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--early-init-only") {
+            runPhase("earlyInitTests", earlyInitTests);
+            std::cout << "CobaltNavi44Survey early-init host checks passed: " << checks << "\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--kdb-only") {
             runPhase("kdbTests", kdbTests);
             std::cout << "CobaltNavi44Survey KDB host checks passed: " << checks << "\n";
@@ -4048,6 +4203,7 @@ int main(int argc, char **argv) {
         runPhase("preSosTests", preSosTests);
         runPhase("sosTests", sosTests);
         runPhase("mode1Tests", mode1Tests);
+        runPhase("earlyInitTests", earlyInitTests);
         std::cout << "CobaltNavi44Survey actual-service host checks passed: " << checks << "\n";
     } catch (const std::exception &e) {
         std::cerr << "phase=" << activeTestPhase << ": " << e.what() << "\n"; return 1;

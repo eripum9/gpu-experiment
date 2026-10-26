@@ -134,12 +134,17 @@ json.dump(modes,open(db,'w'))
 args=sys.argv[1:]
 if args[0]=='-lint':
  plistlib.loads(open(args[1],'rb').read()); sys.exit(0)
+if args[0]=='-type':
+ obj=plistlib.loads(open(args[2],'rb').read())
+ value=obj[args[1]]
+ print('string' if isinstance(value,str) else 'integer' if isinstance(value,int) else 'boolean' if isinstance(value,bool) else 'array' if isinstance(value,list) else 'dictionary'); sys.exit(0)
 key=args[1]; path=args[-1]
 data=sys.stdin.buffer.read() if path=='-' else open(path,'rb').read()
 obj=plistlib.loads(data)
 try:
  for part in key.split('.'):
   obj=obj[int(part)] if isinstance(obj,list) else obj[part]
+ if args[0]=='-extract' and args[2]=='xml1': print('<string>'+str(obj)+'</string>'); sys.exit(0)
  print(obj)
 except (KeyError,ValueError,IndexError,TypeError): sys.exit(1)
 """)
@@ -158,9 +163,14 @@ print(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+str(path))
  echo 'driver-ioreg' >> "$TRACE"
  [ "${DRIVER_MISSING-0}" != 1 ] || { echo 'ioreg driver missing' >&2; exit 7; }
  echo '+-o CobaltNavi44Survey  <class CobaltNavi44Survey, id 0x1>'
- echo '\"CobaltSurvey,BuildVersion\" = \"0.12.0\"'
- echo '\"CobaltSurvey,Mode1ResetEarlyRequested\" = Yes'
- echo '\"CobaltSurvey,Mode1ResetTrigger\" = \"early-boot\"';;
+ echo '\"CobaltSurvey,BuildVersion\" = \"0.13.0\"'
+ if [ "${TEST_KIND-mode1}" = reset-sos ]; then
+  echo '\"CobaltSurvey,EarlyInitRequested\" = Yes'
+  echo '\"CobaltSurvey,EarlyInitTrigger\" = \"early-boot\"'
+ else
+  echo '\"CobaltSurvey,Mode1ResetEarlyRequested\" = Yes'
+  echo '\"CobaltSurvey,Mode1ResetTrigger\" = \"early-boot\"'
+ fi;;
 esac
 """)
         self.fake("sysctl", 'echo "$BOOTARGS"\n')
@@ -172,7 +182,7 @@ esac
 case "$1" in
 bootstrap) [ "$2" = system ] && [ "$3" = "$PREFLIGHT" ];;
 kickstart) [ "$2" = system/com.cobalt.early-reset-preflight ] || exit 2
- BACKGROUND=1 "$LAUNCHER" --probe-agent || true
+ BACKGROUND=1 BOOTARGS="${PROBE_BOOTARGS-$BOOTARGS}" "$LAUNCHER" --probe-agent || true
  # kickstart reports job dispatch success; installer observes probe result file.
  exit 0;;
 bootout) [ "$2" = system/com.cobalt.early-reset-preflight ];;
@@ -221,7 +231,7 @@ esac
         launcher.chmod(0o755)
         (source_app / "Info.plist").write_bytes(plistlib.dumps(dict(CFBundleVersion="1.0.0")))
         (source_app / "_CodeSignature" / "CodeResources").write_bytes(b"fixture signature")
-        self.values = dict(PlanVersion=1, BundleVersion="0.12.0", BuildRevision="0123456789abcdef0123456789abcdef01234567",
+        self.values = dict(PlanVersion=1, BundleVersion="0.13.0", TestKind="mode1", BuildRevision="0123456789abcdef0123456789abcdef01234567",
                            SessionID=SESSION, PartitionGUID=PARTITION, ExpectedSystemUUID=SYSTEM_UUID)
         for name, content, key in (("config-baseline.plist", b"base\n", "BaselineConfigSHA256"),
                                    ("config-bootstrap.plist", b"bootstrap\n", "BootstrapConfigSHA256"),
@@ -269,7 +279,7 @@ esac
         self.daemon.write_text("known job")
 
     def run_agent(self, **extra):
-        defaults = dict(BACKGROUND="1", BOOTARGS="cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-mode1boot=1")
+        defaults = dict(BACKGROUND="1", TEST_KIND=self.values.get("TestKind", "mode1"), BOOTARGS="cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-mode1boot=1")
         defaults.update(extra)
         return self.run_script(self.resident / AGENT.name, "--capture-once", **defaults)
 
@@ -291,6 +301,44 @@ esac
             self.assertIn(message, result.stderr)
             self.assertFalse(self.resident.exists())
             self.values[key] = saved
+
+    def test_test_kind_validation_and_bootstrap_flag_mismatch_refuse_before_mutation(self):
+        self.values["TestKind"] = "reset-sos-typo"
+        self.write_plan()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown TestKind", result.stderr)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.resident.exists())
+        self.values["TestKind"] = "reset-sos"
+        self.write_plan()
+        result = self.install(BOOTARGS="cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-mode1boot=1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test/write flag is active", result.stderr)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.resident.exists())
+
+    def test_initboot_flag_refuses_setup_and_background_preflight(self):
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-initboot=1"
+        result = self.install(BOOTARGS=args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test/write flag is active", result.stderr)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.resident.exists())
+        result = self.install(PROBE_BOOTARGS=args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Full Disk Access", result.stderr)
+        self.assertEqual(self.config.read_bytes(), b"bootstrap\n")
+        self.assertTrue(self.app.is_dir())
+        self.assertFalse(self.resident.exists())
+        self.assertNotIn("collector:", self.events())
+        self.assertNotIn("shutdown", self.events())
+
+    def test_missing_test_kind_keeps_legacy_mode1(self):
+        self.values.pop("TestKind")
+        self.write_plan()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr + (self.log.read_text() if self.log.exists() else ""))
 
     def test_wrong_machine_uuid_refuses_before_install_mutation(self):
         self.values["ExpectedSystemUUID"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -461,9 +509,53 @@ esac
         self.assertIn("capture_complete=1", receipt)
         self.assertIn("collector_exit=42", receipt)
         self.assertIn("driver_ioreg_exit=7", receipt)
+        self.assertIn("test_kind=mode1", receipt)
+        self.assertIn("expected_trigger=early-boot", receipt)
+        self.assertIn("expected_build_version=0.13.0", receipt)
         self.assertTrue((self.session_dir / ("completion-" + SESSION + ".txt")).exists())
         self.assertIn("client:--inspect-peers", self.events())
         self.assertNotIn("client:--run", self.events())
+
+    def test_reset_sos_capture_and_partial_hardware_evidence(self):
+        self.values["TestKind"] = "reset-sos"
+        self.write_plan()
+        self.prepare_agent()
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-initboot=1"
+        result = self.run_agent(BOOTARGS=args, TEST_KIND="reset-sos")
+        self.assertEqual(result.returncode, 0, result.stderr + self.log.read_text())
+        receipt = (self.resident / ("completion-" + SESSION + ".txt")).read_text()
+        self.assertIn("test_kind=reset-sos", receipt)
+        self.assertIn("expected_trigger=early-boot", receipt)
+        self.assertIn("expected_build_version=0.13.0", receipt)
+        self.assertIn("early_requested=yes", receipt)
+        self.assertIn("EarlyInitRequested", (self.session_dir / "early-driver-ioreg.txt").read_text())
+        self.assertEqual(self.config.read_bytes(), b"base\n")
+
+    def test_reset_sos_mismatched_mode1_flag_retains_pending_capture(self):
+        self.values["TestKind"] = "reset-sos"
+        self.write_plan()
+        self.prepare_agent()
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-initboot=1 cobalt-survey-mode1boot=1"
+        result = self.run_agent(BOOTARGS=args, TEST_KIND="reset-sos")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.resident / "pending-session").exists())
+        self.assertEqual(self.config.read_bytes(), b"armed\n")
+        self.assertFalse((self.resident / ("consumed-session-" + SESSION)).exists())
+
+    def test_reset_sos_captures_evidence_when_driver_fails(self):
+        self.values["TestKind"] = "reset-sos"
+        self.write_plan()
+        self.prepare_agent()
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-initboot=1"
+        result = self.run_agent(BOOTARGS=args, TEST_KIND="reset-sos", DRIVER_MISSING="1", COLLECTOR_EXIT="42")
+        self.assertEqual(result.returncode, 0, result.stderr + self.log.read_text())
+        receipt = (self.resident / ("completion-" + SESSION + ".txt")).read_text()
+        self.assertIn("test_kind=reset-sos", receipt)
+        self.assertIn("build_version=not-observed", receipt)
+        self.assertIn("driver_ioreg_exit=7", receipt)
+        self.assertIn("capture_complete=1", receipt)
+        self.assertTrue((self.session_dir / "early-driver-ioreg.txt").exists())
+        self.assertTrue((self.session_dir / "after-early-test" / "survey.txt").exists())
 
 
 if __name__ == "__main__":

@@ -49,6 +49,16 @@ require_off() {
     done
     [ "$_count" -le 1 ]
 }
+read_test_kind() {
+    if /usr/bin/plutil -extract TestKind raw -o - "$ROOT/plan.plist" >/dev/null 2>&1; then
+        [ "$(/usr/bin/plutil -type TestKind "$ROOT/plan.plist" 2>/dev/null)" = string ] || return 1
+        TEST_KIND=$(get_plan TestKind) || return 1
+    else
+        if /usr/bin/plutil -extract TestKind xml1 -o - "$ROOT/plan.plist" >/dev/null 2>&1; then return 1; fi
+        TEST_KIND=mode1
+    fi
+    case "$TEST_KIND" in mode1|reset-sos) return 0;; *) return 1;; esac
+}
 
 [ "$(uname -s 2>/dev/null)" = Darwin ] || exit 0
 [ "$(/usr/bin/id -u 2>/dev/null)" = 0 ] || exit 0
@@ -66,7 +76,8 @@ PARTITION=$(get_plan PartitionGUID) || exit 1
 SYSTEM_UUID=$(get_plan ExpectedSystemUUID) || exit 1
 REVISION=$(get_plan BuildRevision) || exit 1
 [ "$(get_plan PlanVersion)" = 1 ] || exit 1
-[ "$(get_plan BundleVersion)" = 0.12.0 ] || exit 1
+[ "$(get_plan BundleVersion)" = 0.13.0 ] || exit 1
+read_test_kind || { say 'missing, malformed, or unknown TestKind; session retained'; exit 1; }
 case "$PARTITION" in ????????-????-????-????-????????????) :;; *) exit 1;; esac
 case "$PARTITION" in *[!0-9a-f-]*) exit 1;; esac
 case "$SYSTEM_UUID" in ????????-????-????-????-????????????) :;; *) exit 1;; esac
@@ -99,7 +110,7 @@ probe_usb() {
     [ "$(/usr/bin/stat -f '%u:%g' "$PROBE_DIR")" = 0:0 ] || return 1
     BOOTARGS=$(/usr/sbin/sysctl -n kern.bootargs 2>/dev/null) || return 1
     for _flag in cobalt-survey cobalt-survey-indexed cobalt-survey-state; do require_flag "$_flag" || return 1; done
-    for _flag in cobalt-survey-mode1 cobalt-survey-mode1boot cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do require_off "$_flag" || return 1; done
+    for _flag in cobalt-survey-initboot cobalt-survey-mode1 cobalt-survey-mode1boot cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do require_off "$_flag" || return 1; done
     PLATFORM=$(/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice -a 2>/dev/null) || return 1
     LIVE_UUID=$(extract "$PLATFORM" 0.IOPlatformUUID) || return 1
     [ "$(printf '%s' "$LIVE_UUID" | /usr/bin/tr 'A-F' 'a-f')" = "$(printf '%s' "$SYSTEM_UUID" | /usr/bin/tr 'A-F' 'a-f')" ] || return 1
@@ -174,9 +185,16 @@ fi
 
 # Avoid consuming the one-shot on setup, recovery, or any unintended boot.
 BOOTARGS=$(/usr/sbin/sysctl -n kern.bootargs 2>/dev/null) || { say 'cannot read boot arguments; session retained'; exit 0; }
-for _flag in cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-mode1boot=1; do
+for _flag in cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1; do
     require_flag "${_flag%=*}" || { say "not the intended early boot: missing/invalid $_flag; session retained"; exit 0; }
 done
+if [ "$TEST_KIND" = mode1 ]; then
+    require_flag cobalt-survey-mode1boot || { say 'not the intended early boot: missing/invalid cobalt-survey-mode1boot=1; session retained'; exit 0; }
+    require_off cobalt-survey-initboot || { say 'conflicting boot flag cobalt-survey-initboot; session retained'; exit 0; }
+else
+    require_flag cobalt-survey-initboot || { say 'not the intended reset-sos boot: missing/invalid cobalt-survey-initboot=1; session retained'; exit 0; }
+    require_off cobalt-survey-mode1boot || { say 'conflicting boot flag cobalt-survey-mode1boot; session retained'; exit 0; }
+fi
 for _flag in cobalt-survey-mode1 cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do
     require_off "$_flag" || { say "conflicting boot flag $_flag; session retained"; exit 0; }
 done
@@ -198,25 +216,37 @@ PLATFORM_DRIVER=''
 BUILD_VERSION=not-observed
 EARLY_REQUESTED=not-observed
 TRIGGER=not-observed
+EXPECTED_VERSION=0.13.0
+EXPECTED_TRIGGER=early-boot
 while [ "$POLL" -lt 30 ]; do
     POLL=$((POLL + 1))
+    BUILD_VERSION=not-observed
+    EARLY_REQUESTED=not-observed
+    TRIGGER=not-observed
     PEER_OUTPUT=$("$ROOT/mode1-reset" --inspect-peers 2>&1)
     PEER_STATUS=$?
     PLATFORM_DRIVER=$(/usr/sbin/ioreg -r -c CobaltNavi44Survey -l 2>&1)
     DRIVER_STATUS=$?
-    case "$PLATFORM_DRIVER" in *'CobaltSurvey,BuildVersion" = "0.12.0"'*) BUILD_VERSION=0.12.0;; esac
-    case "$PLATFORM_DRIVER" in *'CobaltSurvey,Mode1ResetEarlyRequested" = Yes'*) EARLY_REQUESTED=yes;;
-        *'CobaltSurvey,Mode1ResetEarlyRequested" = No'*) EARLY_REQUESTED=no;; esac
-    case "$PLATFORM_DRIVER" in *'CobaltSurvey,Mode1ResetTrigger" = "early-boot"'*) TRIGGER=early-boot;;
-        *'CobaltSurvey,Mode1ResetTrigger" = "manual"'*) TRIGGER=manual;; esac
-    [ "$PEER_STATUS" -eq 0 ] && [ "$BUILD_VERSION" = 0.12.0 ] && \
-        [ "$EARLY_REQUESTED" = yes ] && [ "$TRIGGER" = early-boot ] && break
+    case "$PLATFORM_DRIVER" in *"CobaltSurvey,BuildVersion\" = \"$EXPECTED_VERSION\""*) BUILD_VERSION=$EXPECTED_VERSION;; esac
+    if [ "$TEST_KIND" = mode1 ]; then
+        case "$PLATFORM_DRIVER" in *'CobaltSurvey,Mode1ResetEarlyRequested" = Yes'*) EARLY_REQUESTED=yes;;
+            *'CobaltSurvey,Mode1ResetEarlyRequested" = No'*) EARLY_REQUESTED=no;; esac
+        case "$PLATFORM_DRIVER" in *'CobaltSurvey,Mode1ResetTrigger" = "early-boot"'*) TRIGGER=early-boot;;
+            *'CobaltSurvey,Mode1ResetTrigger" = "manual"'*) TRIGGER=manual;; esac
+    else
+        case "$PLATFORM_DRIVER" in *'CobaltSurvey,EarlyInitRequested" = Yes'*) EARLY_REQUESTED=yes;;
+            *'CobaltSurvey,EarlyInitRequested" = No'*) EARLY_REQUESTED=no;; esac
+        case "$PLATFORM_DRIVER" in *'CobaltSurvey,EarlyInitTrigger" = "early-boot"'*) TRIGGER=early-boot;;
+            *'CobaltSurvey,EarlyInitTrigger" = "manual"'*) TRIGGER=manual;; esac
+    fi
+    [ "$PEER_STATUS" -eq 0 ] && [ "$BUILD_VERSION" = "$EXPECTED_VERSION" ] && \
+        [ "$EARLY_REQUESTED" = yes ] && [ "$TRIGGER" = "$EXPECTED_TRIGGER" ] && break
     /bin/sleep 1
 done
 printf '%s\n' "$PLATFORM_DRIVER" > "$SESSION_DIR/early-driver-ioreg.txt"
 printf '%s\n' "$PEER_OUTPUT" > "$SESSION_DIR/peer-inventory.txt"
-printf 'driver_poll_attempts=%s\npeer_inspect_exit=%s\ndriver_ioreg_exit=%s\nbuild_version=%s\nearly_requested=%s\ntrigger=%s\n' \
-    "$POLL" "$PEER_STATUS" "$DRIVER_STATUS" "$BUILD_VERSION" "$EARLY_REQUESTED" "$TRIGGER" >> "$RECEIPT"
+printf 'test_kind=%s\nexpected_trigger=%s\nexpected_build_version=%s\ndriver_poll_attempts=%s\npeer_inspect_exit=%s\ndriver_ioreg_exit=%s\nbuild_version=%s\nearly_requested=%s\ntrigger=%s\n' \
+    "$TEST_KIND" "$EXPECTED_TRIGGER" "$EXPECTED_VERSION" "$POLL" "$PEER_STATUS" "$DRIVER_STATUS" "$BUILD_VERSION" "$EARLY_REQUESTED" "$TRIGGER" >> "$RECEIPT"
 
 COLLECT_STATUS=0
 /bin/sh "$ROOT/collect-gpu-survey.sh" "$SESSION_DIR/after-early-test" > "$SESSION_DIR/collector.stdout.txt" 2> "$SESSION_DIR/collector.stderr.txt" || COLLECT_STATUS=$?
@@ -229,7 +259,8 @@ capture_failure() {
     SESSION_DIR=$(/usr/bin/mktemp -d "$ROOT/evidence-$SESSION.XXXXXXXX") || { say 'cannot create private evidence directory'; exit 1; }
     chmod 700 "$SESSION_DIR"
     RECEIPT=$SESSION_DIR/incomplete-receipt.txt
-    printf 'Session: %s\nusb_restore_verified=0\ncapture_complete=0\nreason=%s\n' "$SESSION" "$*" > "$RECEIPT"
+    EXPECTED_VERSION=0.13.0
+    printf 'Session: %s\nusb_restore_verified=0\ncapture_complete=0\ntest_kind=%s\nexpected_trigger=early-boot\nexpected_build_version=%s\nreason=%s\n' "$SESSION" "$TEST_KIND" "$EXPECTED_VERSION" "$*" > "$RECEIPT"
     collect_evidence
     cp "$LOG" "$SESSION_DIR/capture-agent.log" || true
     /bin/sync || true

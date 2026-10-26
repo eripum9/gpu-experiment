@@ -104,9 +104,28 @@ bool mode1BootSelected() {
     return PE_parse_boot_argn("cobalt-survey-mode1boot", &value, sizeof(value)) && value != 0;
 }
 
+bool initBootSelected() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-initboot", &value, sizeof(value)) && value != 0;
+}
+
+bool initBootFlagsValid() {
+    uint32_t value = 0;
+    if (!armed() || !indexedArmed() || !stateArmed() ||
+        !PE_parse_boot_argn("cobalt-survey-initboot", &value, sizeof(value)) || value != 1) return false;
+    const char *others[] = {"cobalt-survey-aperture", "cobalt-survey-staging", "cobalt-survey-kdb",
+        "cobalt-survey-spl", "cobalt-survey-presos", "cobalt-survey-sos",
+        "cobalt-survey-mode1", "cobalt-survey-mode1boot"};
+    for (const char *name : others) {
+        value = 0;
+        if (PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0) return false;
+    }
+    return true;
+}
+
 bool mode1FlagsValid() {
     uint32_t value = 0;
-    if (mode1BootSelected() || !armed() || !indexedArmed() || !stateArmed() ||
+    if (initBootSelected() || mode1BootSelected() || !armed() || !indexedArmed() || !stateArmed() ||
         !PE_parse_boot_argn("cobalt-survey-mode1", &value, sizeof(value)) || value != 1) return false;
     const char *others[] = {"cobalt-survey-aperture", "cobalt-survey-staging", "cobalt-survey-kdb",
         "cobalt-survey-spl", "cobalt-survey-presos", "cobalt-survey-sos"};
@@ -119,7 +138,7 @@ bool mode1FlagsValid() {
 
 bool mode1BootFlagsValid() {
     uint32_t value = 0;
-    if (mode1Selected() || !armed() || !indexedArmed() || !stateArmed() ||
+    if (initBootSelected() || mode1Selected() || !armed() || !indexedArmed() || !stateArmed() ||
         !PE_parse_boot_argn("cobalt-survey-mode1boot", &value, sizeof(value)) || value != 1) return false;
     const char *others[] = {"cobalt-survey-aperture", "cobalt-survey-staging", "cobalt-survey-kdb",
         "cobalt-survey-spl", "cobalt-survey-presos", "cobalt-survey-sos"};
@@ -131,7 +150,8 @@ bool mode1BootFlagsValid() {
 }
 
 bool mode1PreviouslyAttempted(IOPCIDevice *pci) {
-    return pci->getProperty("CobaltSurvey,Mode1ResetAttempt-v1") != nullptr;
+    return pci->getProperty("CobaltSurvey,Mode1ResetAttempt-v1") != nullptr ||
+        pci->getProperty("CobaltSurvey,EarlyInitAttempt-v1") != nullptr;
 }
 
 constexpr unsigned kSosCount = cobalt::survey::kSosImageCount;
@@ -753,6 +773,85 @@ public:
     void close() { if (opened) { pci->close(owner, 0); opened = false; } }
 };
 
+bool apertureOnlyClient(IOPCIDevice *pci, IOService *service);
+
+// This capability exists only inside one synchronous compound transaction.
+// Registry markers alone never authorize a reset-to-firmware handoff.
+class EarlyInitAuthorization {
+    friend struct EarlyInitContext;
+    IOService *service;
+    IOPCIDevice *pci;
+    ProviderSession &session;
+    OSData *marker {nullptr};
+    enum Phase : uint32_t { Unclaimed, Reset, Discovery, Firmware, Postflight, Complete, Failed };
+    Phase phase {Unclaimed};
+    bool resetClaimed {false}, firmwareClaimed {false};
+    EarlyInitAuthorization(IOService *s, IOPCIDevice *p, ProviderSession &owner)
+        : service(s), pci(p), session(owner) {}
+    bool otherAttemptsAbsent() const {
+        const char *keys[] = {"CobaltSurvey,ApertureAttempt-v1", "CobaltSurvey,StagingAttempt-v1",
+            "CobaltSurvey,KdbAttempt-v1", "CobaltSurvey,KdbSplAttempt-v1", "CobaltSurvey,PreSosAttempt-v1"};
+        for (const char *key : keys) if (pci->getProperty(key)) return false;
+        return pci->getProperty("CobaltSurvey,Mode1ResetAttempt-v1") == (resetClaimed ? marker : nullptr) &&
+            pci->getProperty("CobaltSurvey,SosBootAttempt-v1") == (firmwareClaimed ? marker : nullptr);
+    }
+public:
+    ~EarlyInitAuthorization() { if (marker) marker->release(); }
+    uint32_t currentPhase() const { return phase; }
+    bool owns(IOService *s, IOPCIDevice *p, const ProviderSession &owner) const {
+        return s == service && p == pci && &owner == &session && service->getProvider() == pci &&
+            !service->isInactive() && session.owns() && apertureOnlyClient(pci, service);
+    }
+    bool guard() const {
+        return phase != Unclaimed && phase != Failed && owns(service, pci, session) &&
+            pci->getProperty("CobaltSurvey,EarlyInitAttempt-v1") == marker && otherAttemptsAbsent();
+    }
+    bool claim() {
+        if (phase != Unclaimed || !initBootFlagsValid() || !owns(service, pci, session) ||
+            !pci->getProperty("CobaltSurvey,IndexedAttempt-v1") ||
+            pci->getProperty("CobaltSurvey,EarlyInitAttempt-v1") || !otherAttemptsAbsent()) return false;
+        const uint32_t tag = 0x130001;
+        marker = OSData::withBytes(&tag, sizeof(tag));
+        if (!marker || !pci->setProperty("CobaltSurvey,EarlyInitAttempt-v1", marker)) return false;
+        phase = Reset;
+        return guard();
+    }
+    bool resetAuthorized() const { return phase == Reset && !firmwareClaimed && guard(); }
+    bool claimReset() {
+        if (!resetAuthorized() || resetClaimed || !pci->setProperty("CobaltSurvey,Mode1ResetAttempt-v1", marker)) return false;
+        resetClaimed = true;
+        return resetAuthorized();
+    }
+    bool resetRecovered() {
+        if (!resetAuthorized() || !resetClaimed) return false;
+        phase = Discovery;
+        return guard();
+    }
+    bool discoveryAuthorized() const { return phase == Discovery && resetClaimed && guard(); }
+    bool discoveryVerified() {
+        if (!discoveryAuthorized()) return false;
+        phase = Firmware;
+        return guard();
+    }
+    bool firmwareAuthorized() const { return phase == Firmware && resetClaimed && guard(); }
+    bool claimFirmware() {
+        if (!firmwareAuthorized() || firmwareClaimed || !pci->setProperty("CobaltSurvey,SosBootAttempt-v1", marker)) return false;
+        firmwareClaimed = true;
+        return firmwareAuthorized();
+    }
+    bool firmwareCompleted() {
+        if (!firmwareAuthorized() || !firmwareClaimed) return false;
+        phase = Postflight;
+        return guard();
+    }
+    bool finish() {
+        if (phase != Postflight || !guard()) return false;
+        phase = Complete;
+        return guard();
+    }
+    void fail() { phase = Failed; }
+};
+
 bool onlyClient(IOPCIDevice *pci, IOService *service) {
     OSIterator *iterator = pci->getClientIterator();
     if (!iterator) {
@@ -813,17 +912,22 @@ class IndexedTransaction {
     const PciState &state;
     const Aperture &mmio, &vram;
     ProviderSession &session;
+    EarlyInitAuthorization *early;
     SelectorIO io;
     uint32_t savedLow {0}, savedHigh {0}, writes {0}, reads {0};
     bool dirty {false};
 public:
     IndexedTransaction(IOService *s, IOPCIDevice *p, const PciState &st,
-        const Aperture &m, const Aperture &v, ProviderSession &owner, volatile uint32_t *page)
-        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), io(page) {}
+        const Aperture &m, const Aperture &v, ProviderSession &owner, volatile uint32_t *page,
+        EarlyInitAuthorization *compound = nullptr)
+        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), early(compound), io(page) {}
     bool guard() const {
-        return session.owns() && unchanged(pci, state) &&
+        return (!early || (early->owns(service, pci, session) && early->discoveryAuthorized())) &&
+            session.owns() && unchanged(pci, state) &&
             apertureUnchanged(pci, 5, mmio) && apertureUnchanged(pci, 0, vram);
     }
+    uint32_t dataReads() const { return reads; }
+    uint32_t selectorWrites() const { return writes; }
     bool selectors(uint32_t &low, uint32_t &high) const {
         if (!guard()) return false;
         low = io.low();
@@ -2630,6 +2734,7 @@ class SosBootTransaction final : public n48::HwAccess, public cobalt::psp::Stagi
     const PciState &state;
     const Aperture &mmio, &vram;
     ProviderSession &session;
+    EarlyInitAuthorization *early;
     const ApertureProof &ap;
     const KdbProof &proof;
     const ConsoleObservation &console;
@@ -2659,6 +2764,7 @@ class SosBootTransaction final : public n48::HwAccess, public cobalt::psp::Stagi
     bool lose() { result.contextLost = true; return false; }
     bool baseGuard() {
         if (result.contextLost) return false;
+        if (early && (!early->owns(service, pci, session) || !early->firmwareAuthorized())) return lose();
         if (!session.owns() || !consoleGuard(pci, state, mmio, vram) ||
             !apertureOnlyClient(pci, service)) return lose();
         IOPlatformExpert *platform = IOService::getPlatform();
@@ -2784,8 +2890,9 @@ public:
         HdpFlushTarget selected, SosBootResult &r, uint32_t size, const volatile uint8_t *registers,
         KdbMailboxMapping mailbox, const volatile uint8_t *hub, const volatile uint8_t *display,
         const StagingMapping (&mappings)[kSosCount], volatile uint32_t *flushWord, volatile uint32_t *selectors,
-        uint32_t *const (&backups)[kSosCount], const uint8_t *const (&sources)[kSosCount])
-        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), ap(a), proof(ip), console(co),
+        uint32_t *const (&backups)[kSosCount], const uint8_t *const (&sources)[kSosCount],
+        EarlyInitAuthorization *compound = nullptr)
+        : service(s), pci(p), state(st), mmio(m), vram(v), session(owner), early(compound), ap(a), proof(ip), console(co),
           target(selected), result(r), mib(size), nbif(registers), mmhub(hub), dmu(display), mp0(mailbox),
           flush(flushWord), io(selectors), windows{
               {*this, r.part[0].plan.windowOffset}, {*this, r.part[1].plan.windowOffset},
@@ -3645,10 +3752,14 @@ void runPreSosSurvey(IOService *service, IOPCIDevice *pci, const PciState &state
 }
 
 
-void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &state,
+COBALT_SURVEY_NOINLINE void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &state,
     const Aperture &mmio, const Aperture &vram, uint32_t mib, const ApertureProof &ap,
-    const KdbProof &proof, const StateObservation &prior, const ConsoleObservation &console, SosBootResult &result) {
-    if (!sosArmed() || !preSosArmed() || !splArmed() || !kdbArmed() || !armed() || !indexedArmed() || !stateArmed() || !apertureArmed() || !stagingArmed()) {
+    const KdbProof &proof, const StateObservation &prior, const ConsoleObservation &console, SosBootResult &result,
+    ProviderSession *continued = nullptr, EarlyInitAuthorization *early = nullptr) {
+    if (early && (!continued || !early->owns(service, pci, *continued) || !early->firmwareAuthorized())) {
+        result.status = "compound-firmware-authorization-refused"; return;
+    }
+    if (!early && (!sosArmed() || !preSosArmed() || !splArmed() || !kdbArmed() || !armed() || !indexedArmed() || !stateArmed() || !apertureArmed() || !stagingArmed())) {
         result.status = "all-nine-flags-required"; return;
     }
     if ((state.classRevision & 0xff) != 0xc0 || state.subsystem != 0x86011eae ||
@@ -3688,14 +3799,16 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
         sources[n] = image.data;
     }
     if (!apertureOnlyClient(pci, service)) { result.status = "peer-refused"; return; }
-    ProviderSession session(pci, service);
-    if (!session.open()) { result.status = "provider-busy"; return; }
+    ProviderSession localSession(pci, service);
+    ProviderSession &session = continued ? *continued : localSession;
+    if (!continued && !session.open()) { result.status = "provider-busy"; return; }
     if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {
         result.status = "device-context-changed"; return;
     }
     constexpr const char *attemptKey = "CobaltSurvey,SosBootAttempt-v1";
-    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+    if (early ? !early->firmwareAuthorized() :
+        (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1"))) {
         result.status = "already-attempted"; return;
     }
     Map nbif, selectors, staging[kSosCount], flush, mp0, mmhub, dmu;
@@ -3754,7 +3867,7 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
         backups[n] = storage[n].original;
     }
     SosBootTransaction transaction(service, pci, state, mmio, vram, session, ap, proof, console, target,
-        result, mib, registers, mailbox, mmhub.bytes(), dmu.bytes(), mappings, flushWord, selectorWords, backups, sources);
+        result, mib, registers, mailbox, mmhub.bytes(), dmu.bytes(), mappings, flushWord, selectorWords, backups, sources, early);
     result.status = transaction.prepare(prior);
     if (result.status) return;
     n48::PspLoader loader(transaction);
@@ -3763,8 +3876,9 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
         result.lastStatus = loader.lastBootloaderStatus(); result.lastStep = loader.lastStep();
         result.status = "psp-preflight-refused"; return;
     }
-    if (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
-        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1")) {
+    if (early ? !early->firmwareAuthorized() :
+        (mode1PreviouslyAttempted(pci) || pci->getProperty(attemptKey) || pci->getProperty("CobaltSurvey,KdbAttempt-v1") ||
+        pci->getProperty("CobaltSurvey,KdbSplAttempt-v1") || pci->getProperty("CobaltSurvey,PreSosAttempt-v1"))) {
         result.status = "already-attempted"; return;
     }
     if (!service->setProperty("CobaltSurvey,Ready", false) ||
@@ -3773,7 +3887,7 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
         result.status = "metadata-publication-failed"; return;
     }
     if (!transaction.guard()) { result.status = "device-context-changed"; return; }
-    if (!pci->setProperty(attemptKey, true)) { result.status = "attempt-claim-failed"; return; }
+    if (early ? !early->claimFirmware() : !pci->setProperty(attemptKey, true)) { result.status = "attempt-claim-failed"; return; }
     result.attempted = true;
     if (!transaction.verifyOriginalIndexed()) result.status = "original-indexed-mismatch";
     else {
@@ -3799,7 +3913,7 @@ void runSosBootSurvey(IOService *service, IOPCIDevice *pci, const PciState &stat
     dmu.reset(); mmhub.reset(); mp0.reset(); flush.reset();
     for (auto &image : staging) image.reset();
     selectors.reset(); nbif.reset();
-    session.close();
+    if (!continued) session.close();
 }
 
 
@@ -4270,7 +4384,20 @@ void clearSosBootProperties(IOService *service) {
         }
     }
 }
-void publishSosBoot(IOService *service, SosBootResult &result) {
+bool sosBootComplete(const SosBootResult &result) {
+    bool complete = result.success && result.sharedApiUsed && result.phase == 2 * kSosCount && result.addressWrites == kSosCount &&
+        result.commandWrites == kSosCount && !result.readyObserved && !result.contextLost &&
+        result.sosAliveObserved && result.initialSosRaw == 0 && result.finalSosRaw != 0 && result.finalSosRaw != UINT32_MAX &&
+        !result.part[kSosCount - 1].readyObserved;
+    for (unsigned n = 0; n < kSosCount; ++n) {
+        const auto &image = result.part[n];
+        complete = image.originalStable && image.zeroVerified && image.copyVerified && image.stagingPreserved &&
+            image.addressAttempted && image.commandAttempted && (n == kSosCount - 1 || image.readyObserved) && complete;
+    }
+    return complete;
+}
+
+bool publishSosBoot(IOService *service, SosBootResult &result, bool compound = false) {
     service->removeProperty("CobaltSurvey,Schema");
     bool published = true;
 #define PAIR_PROPERTY(name, value) published = service->setProperty("CobaltSurvey,SosBoot" name, value) && published
@@ -4369,21 +4496,15 @@ void publishSosBoot(IOService *service, SosBootResult &result) {
 #undef PAIR_PROPERTY
 #undef PAIR_NUMBER
     published = service->setProperty("CobaltSurvey,Ready", false) && published;
-    result.success = result.success && result.sharedApiUsed && result.phase == 2 * kSosCount && result.addressWrites == kSosCount &&
-        result.commandWrites == kSosCount && !result.readyObserved && !result.contextLost &&
-        result.sosAliveObserved && result.initialSosRaw == 0 && result.finalSosRaw != 0 && result.finalSosRaw != UINT32_MAX &&
-        !result.part[kSosCount - 1].readyObserved;
-    for (unsigned n = 0; n < kSosCount; ++n) {
-        const auto &image = result.part[n];
-        result.success = image.originalStable && image.zeroVerified && image.copyVerified && image.stagingPreserved &&
-            image.addressAttempted && image.commandAttempted && (n == kSosCount - 1 || image.readyObserved) && result.success;
-    }
+    result.success = sosBootComplete(result);
+    if (compound) return published;
     published = published && service->setProperty("CobaltSurvey,Schema", result.success ? 10ULL : 4ULL, 32);
     if (!published) {
         result.success = false; result.status = "metadata-publication-failed";
         service->removeProperty("CobaltSurvey,SosBootStatus"); service->setProperty("CobaltSurvey,SosBootStatus", result.status);
         service->removeProperty("CobaltSurvey,Schema"); service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
     }
+    return published;
 }
 
 COBALT_SURVEY_NOINLINE void runAndPublishPreSos(IOService *service, IOPCIDevice *pci, const PciState &state,
@@ -4440,6 +4561,7 @@ bool criticalIps(const IpDiscovery &d) {
     return true;
 }
 #include "mode1_reset_adapter.inc"
+#include "early_init_adapter.inc"
 } // namespace
 
 IOService *CobaltNavi44Survey::probe(IOService *provider, SInt32 *score) {
@@ -4463,6 +4585,8 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     if (mode1Lock) IOLockLock(mode1Lock);
     mode1Accepting = false;
     mode1BootCheckpoint = false;
+    earlyInitBootCheckpoint = false;
+    if (earlyInitSnapshot) { earlyInitSnapshot->release(); earlyInitSnapshot = nullptr; }
     if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
     if (mode1Lock) IOLockUnlock(mode1Lock);
     removeProperty("CobaltSurvey,DiscoverySnapshot");
@@ -4483,14 +4607,26 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     clearPreSosProperties(this);
     clearSosBootProperties(this);
     clearMode1Properties(this);
+    clearEarlyInitProperties(this);
     removeProperty("CobaltSurvey,BuildVersion");
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
-    setProperty("CobaltSurvey,BuildVersion", "0.12.0");
+    setProperty("CobaltSurvey,BuildVersion", "0.13.0");
     setProperty("CobaltSurvey,Mode1ResetEarlyRequested", mode1BootSelected());
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);
     setProperty("CobaltSurvey,Ready", false);
+    bool earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitRequested", initBootSelected());
+    earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitTrigger", initBootSelected() ? "early-boot" : "none") && earlyStartupPublished;
+    earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitAttempted", earlyInitAttempted) && earlyStartupPublished;
+    earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitPhase", 0ULL, 32) && earlyStartupPublished;
+    earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitStatus", initBootSelected() ? "awaiting-prerequisites" : "not-requested") && earlyStartupPublished;
+    earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitSuccess", false) && earlyStartupPublished;
+    earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitColdCycleReplacementValidated", false) && earlyStartupPublished;
+    if (initBootSelected() && (!initBootFlagsValid() || !earlyStartupPublished)) {
+        setProperty("CobaltSurvey,EarlyInitStatus", earlyStartupPublished ? "mixed-or-invalid-boot-flags" : "metadata-publication-failed");
+        status("early-init-flags-refused"); registerService(); return true;
+    }
     if (mode1Selected() || mode1BootSelected()) {
         if ((mode1Selected() && !mode1FlagsValid()) || (mode1BootSelected() && !mode1BootFlagsValid())) {
             setProperty("CobaltSurvey,Mode1ResetStatus", "mixed-or-invalid-boot-flags");
@@ -4503,7 +4639,18 @@ bool CobaltNavi44Survey::start(IOService *provider) {
         }
     }
     survey(pci);
-    if (mode1BootSelected() && mode1BootFlagsValid()) {
+    if (initBootSelected() && initBootFlagsValid()) {
+        if (!earlyInitAttempted && earlyInitBootCheckpoint && earlyInitSnapshot) {
+            earlyInitAttempted = true;
+            OSData *snapshot = earlyInitSnapshot; earlyInitSnapshot = nullptr;
+            pci->retain();
+            runAndPublishEarlyInit(this, pci, snapshot);
+        } else {
+            setProperty("CobaltSurvey,EarlyInitAttempted", earlyInitAttempted);
+            setProperty("CobaltSurvey,EarlyInitStatus", "early-prerequisites-unavailable");
+            if (earlyInitSnapshot) { earlyInitSnapshot->release(); earlyInitSnapshot = nullptr; }
+        }
+    } else if (mode1BootSelected() && mode1BootFlagsValid()) {
         // start() is synchronous. Its boot survey has returned and released
         // every map/session before this separate opt-in transaction. Matching
         // order is not assumed: all live ownership guards still apply.
@@ -4685,6 +4832,9 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
         (mode1BootSelected() && mode1BootFlagsValid()))) {
         data->retain(); mode1Snapshot = data;
     }
+    if (published && initBootSelected() && initBootFlagsValid()) {
+        data->retain(); earlyInitSnapshot = data;
+    }
     data->release();
     if (!published) { status("snapshot-publication-failed"); return; }
     setProperty("CobaltSurvey,DiscoveryBinaryOffset", binaryOffset, 64);
@@ -4712,7 +4862,11 @@ void CobaltNavi44Survey::survey(IOPCIDevice *pci) {
             if (consoleFailure) publishConsoleFailure(this, consoleFailure);
             else if (!publishConsole(this, consoleResult)) publishConsoleFailure(this, "metadata-publication-failed");
             else if (!consoleGuard(pci, s, mmio, vram)) publishConsoleFailure(this, "pci-state-changed");
-            else if (mode1BootSelected() && mode1BootFlagsValid() && mode1Snapshot) {
+            else if (initBootSelected() && initBootFlagsValid() && earlyInitSnapshot) {
+                // Private checkpoint follows complete schema4 publication and
+                // the live guard; the compound phase must still revalidate.
+                earlyInitBootCheckpoint = true;
+            } else if (mode1BootSelected() && mode1BootFlagsValid() && mode1Snapshot) {
                 // This private checkpoint is set only after the complete
                 // Schema 4 console publication and its final live PCI guard.
                 mode1BootCheckpoint = true;
@@ -4785,6 +4939,8 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     if (mode1Lock) IOLockLock(mode1Lock);
     mode1Accepting = false;
     mode1BootCheckpoint = false;
+    earlyInitBootCheckpoint = false;
+    if (earlyInitSnapshot) { earlyInitSnapshot->release(); earlyInitSnapshot = nullptr; }
     if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
     removeProperty("CobaltSurvey,DiscoverySnapshot");
     clearStateProperties(this);
@@ -4796,6 +4952,7 @@ void CobaltNavi44Survey::stop(IOService *provider) {
     clearPreSosProperties(this);
     clearSosBootProperties(this);
     clearMode1Properties(this);
+    clearEarlyInitProperties(this);
     removeProperty("CobaltSurvey,BuildVersion");
     removeProperty("CobaltSurvey,Schema");
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
@@ -4841,6 +4998,7 @@ void CobaltNavi44Survey::free() {
     // methods. stop drains an in-flight request before final free.
     if (mode1Lock) IOLockLock(mode1Lock);
     mode1Accepting = false;
+    if (earlyInitSnapshot) { earlyInitSnapshot->release(); earlyInitSnapshot = nullptr; }
     if (mode1Snapshot) { mode1Snapshot->release(); mode1Snapshot = nullptr; }
     if (mode1Lock) {
         IOLockUnlock(mode1Lock); IOLockFree(mode1Lock); mode1Lock = nullptr;

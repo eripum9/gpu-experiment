@@ -47,6 +47,7 @@ class SurveyPackageTests(unittest.TestCase):
         }
         for relative in ("tools/navi44-survey/collect-survey.sh", "tools/navi44-survey/test-software-reset.sh", "docs/NAVI44-SURVEY.md", "docs/MODE1-RESET.md",
                          "tools/navi44-survey/install-early-reset-test.sh", "tools/navi44-survey/capture-early-reset.sh", "docs/EARLY-MODE1-RESET.md",
+                         "docs/EARLY-RESET-SOS.md",
                          "src/navi48-bringup/LICENSE", "src/navi48-bringup/NOTICE",
                          "src/navi48-bringup/firmware/LICENSE.amdgpu",
                          "third-party/THIRD-PARTY-LICENSES.txt"):
@@ -68,12 +69,14 @@ class SurveyPackageTests(unittest.TestCase):
         files = self.payload()
         self.assertIn("collect-gpu-survey.sh", files)
         self.assertIn("SHA256SUMS.txt", files)
-        self.assertEqual(len(files), 20)
+        self.assertEqual(len(files), 21)
         self.assertIn("CobaltEarlyCapture.app/Contents/MacOS/CobaltEarlyCapture", files)
         self.assertEqual(files["mode1-reset"], self.reset_client.read_bytes())
         self.assertIn("test-software-reset.sh", files)
         self.assertIn("MODE1-RESET.md", files)
         self.assertIn("EARLY-MODE1-RESET.md", files)
+        self.assertIn("EARLY-RESET-SOS.md", files)
+        self.assertIn(b"Optional cobalt-survey-initboot=1", files["BUILD-INFO.txt"])
         self.assertIn("install-early-reset-test.sh", files)
         self.assertIn("capture-early-reset.sh", files)
         self.assertIn(b"Optional cobalt-survey-mode1boot=1", files["BUILD-INFO.txt"])

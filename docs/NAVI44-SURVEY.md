@@ -17,6 +17,10 @@ Version 0.11.1 records the initial reset ownership census and adds a read-only
 provider-child inventory to explain refusals without relaxing the check.
 Version 0.12.0 adds a separate [early-boot reset experiment](EARLY-MODE1-RESET.md)
 with passive bootstrap and a one-time capture helper.
+Version 0.13.0 adds the exclusive
+[early reset and PSP/SOS checkpoint](EARLY-RESET-SOS.md), with fresh discovery
+between reset and firmware startup under one provider session. It retains
+`Ready=false` and does not establish a cold-cycle replacement or acceleration.
 
 ## One-command KDB checkpoint (0.7.0)
 

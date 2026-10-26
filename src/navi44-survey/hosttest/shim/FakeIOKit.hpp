@@ -68,6 +68,17 @@ struct TestState {
     bool mode1BootPresent = false, mode1Enabled = false, mode1Claimed = false, mode1ClaimFail = false;
     std::string mode1EarlyBoot = "1";
     bool mode1EarlyBootPresent = false;
+    std::string earlyInitBoot = "1";
+    bool earlyInitBootPresent = false, earlyInitEnabled = false;
+    unsigned earlyInitPhase = 0;
+    bool failEarlyInitSchema13 = false;
+    std::vector<uint64_t> earlyInitSchemaWrites;
+    std::vector<unsigned> earlyInitPhases;
+    std::vector<std::string> earlyInitEvents;
+    unsigned earlyInitRefreshDataReads = 0;
+    void *earlyInitMarker = nullptr, *mode1Marker = nullptr, *sosMarker = nullptr;
+    unsigned metadataAllocations = 0;
+    std::map<void *, uint64_t> metadataPointers;
     bool consolePaused = false, consolePauseFail = false, consoleResumeFail = false;
     unsigned consolePauseCalls = 0, consoleResumeCalls = 0;
     std::function<void(unsigned)> onConsoleControl;
@@ -175,6 +186,11 @@ struct TestState {
     std::function<void(unsigned)> onMemsize;
 };
 inline TestState testState;
+inline bool earlyInitPathActive() { return testState.earlyInitEnabled; }
+inline bool sosPathActive() { return testState.sosEnabled || earlyInitPathActive(); }
+inline void earlyInitEvent(const std::string &event) {
+    if (earlyInitPathActive()) testState.earlyInitEvents.push_back(event);
+}
 struct IOLock { bool held = false; };
 inline IOLock *IOLockAlloc() {
     ++testState.mode1LockAllocations;
@@ -195,10 +211,10 @@ inline void IOLockFree(IOLock *lock) {
 inline task_t current_task() { return reinterpret_cast<task_t>(2); }
 constexpr const char *kIOClientPrivilegeAdministrator = "admin";
 inline bool aperturePhase() {
-    return testState.apertureBootPresent && testState.openCalls >= 2 && testState.openLive == 1;
+    return (testState.apertureBootPresent || earlyInitPathActive()) && testState.openCalls >= 2 && testState.openLive == 1;
 }
 inline bool stagingPhase() {
-    return (testState.stagingEnabled || testState.kdbEnabled || testState.splEnabled || testState.preSosEnabled || testState.sosEnabled) && testState.openCalls >= 2 && testState.openLive == 1;
+    return (testState.stagingEnabled || testState.kdbEnabled || testState.splEnabled || testState.preSosEnabled || sosPathActive()) && testState.openCalls >= 2 && testState.openLive == 1;
 }
 inline void requireExplicitWritableMode();
 inline void apertureEvent(char operation, uint32_t offset, uint32_t value) {
@@ -288,6 +304,8 @@ public:
     std::map<std::string, std::string> strings;
     std::map<std::string, uint64_t> numbers;
     std::map<std::string, std::vector<uint8_t>> blobs;
+    std::map<std::string, OSObject *> markerObjects;
+    ~IOService() override { for (auto &entry : markerObjects) entry.second->release(); }
     virtual IOService *probe(IOService *, SInt32 *) { return this; }
     virtual bool start(IOService *newProvider) { ++startCalls; if (testState.superStart) providerService = newProvider; return testState.superStart; }
     virtual void stop(IOService *) { ++stopCalls; providerService = nullptr; }
@@ -332,6 +350,15 @@ public:
     }
     bool setProperty(const char *key, uint64_t value, unsigned) {
         consolePublication(key);
+        if (std::string(key) == "CobaltSurvey,Schema" && earlyInitPathActive()) {
+            testState.earlyInitSchemaWrites.push_back(value);
+            if (testState.failEarlyInitSchema13 && value == 13) return false;
+        }
+        if (std::string(key) == "CobaltSurvey,EarlyInitPhase") {
+            testState.earlyInitPhase = static_cast<unsigned>(value);
+            testState.earlyInitPhases.push_back(static_cast<unsigned>(value));
+            earlyInitEvent("phase-" + std::to_string(value));
+        }
         if (testState.failConsoleSchema && std::string(key)=="CobaltSurvey,Schema" && value==4) return false;
         if (testState.failApertureSchema && std::string(key)=="CobaltSurvey,Schema" && value==5) return false;
         if (testState.propertyFailKey == key) return false;
@@ -358,9 +385,26 @@ public:
         numbers[key] = value ? 1 : 0; return true;
     }
     OSObject *getProperty(const char *key) {
+        const auto marker = markerObjects.find(key);
+        if (marker != markerObjects.end()) return marker->second;
         return numbers.count(key) || strings.count(key) || blobs.count(key) ? this : nullptr;
     }
     bool setProperty(const char *key, OSObject *object) {
+        const std::string name(key);
+        if (earlyInitPathActive() && (name == "CobaltSurvey,EarlyInitAttempt-v1" ||
+            name == "CobaltSurvey,Mode1ResetAttempt-v1" || name == "CobaltSurvey,SosBootAttempt-v1")) {
+            if (testState.openLive != 1 || testState.iteratorsLive || !object)
+                throw std::runtime_error("compound claim without continuous provider ownership");
+            if (testState.propertyFailKey == key ||
+                (name == "CobaltSurvey,Mode1ResetAttempt-v1" && testState.mode1ClaimFail) ||
+                (name == "CobaltSurvey,SosBootAttempt-v1" && testState.sosClaimFail)) return false;
+            if (markerObjects.count(name)) throw std::runtime_error("compound marker claimed twice");
+            object->retain(); markerObjects[name] = object;
+            if (name == "CobaltSurvey,EarlyInitAttempt-v1") testState.earlyInitMarker = object;
+            if (name == "CobaltSurvey,Mode1ResetAttempt-v1") { testState.mode1Marker = object; testState.mode1Claimed = true; }
+            if (name == "CobaltSurvey,SosBootAttempt-v1") { testState.sosMarker = object; testState.sosClaimed = true; }
+            return true;
+        }
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.openLive || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at snapshot publication");
         if (testState.publicationFail) return false;
@@ -368,9 +412,16 @@ public:
             testState.onDiscoverySnapshotPublication();
         auto *value = dynamic_cast<OSData *>(object);
         if (!value) throw std::runtime_error("non OSData publication");
+        if (std::string(key) == "CobaltSurvey,EarlyInitAttempt-v1") testState.earlyInitMarker = object;
+        if (std::string(key) == "CobaltSurvey,Mode1ResetAttempt-v1") testState.mode1Marker = object;
+        if (std::string(key) == "CobaltSurvey,SosBootAttempt-v1") testState.sosMarker = object;
         blobs[key] = value->bytes; return true;
     }
-    void removeProperty(const char *key) { strings.erase(key); numbers.erase(key); blobs.erase(key); }
+    void removeProperty(const char *key) {
+        const auto marker = markerObjects.find(key);
+        if (marker != markerObjects.end()) { marker->second->release(); markerObjects.erase(marker); }
+        strings.erase(key); numbers.erase(key); blobs.erase(key);
+    }
     void registerService() {
         if (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations ||
             testState.openLive || testState.iteratorsLive)
@@ -390,6 +441,20 @@ public:
 };
 inline void requireExplicitWritableMode() {
     if (!testState.indexedOwner) throw std::runtime_error("missing indexed owner");
+    if (earlyInitPathActive()) {
+        const bool initial = testState.earlyInitPhase == 0 && testState.openCalls == 1 &&
+            !testState.earlyInitMarker && !testState.mode1Marker && !testState.sosMarker;
+        const bool refresh = testState.earlyInitPhase == 2 && testState.earlyInitMarker &&
+            testState.mode1Marker == testState.earlyInitMarker && !testState.sosMarker;
+        const bool firmware = testState.earlyInitPhase == 3 && testState.earlyInitMarker &&
+            testState.mode1Marker == testState.earlyInitMarker && testState.sosMarker == testState.earlyInitMarker;
+        if (!initial && !refresh && !firmware)
+            throw std::runtime_error("compound PSP write without the one shared early-init marker");
+        const auto ready = testState.indexedOwner->numbers.find("CobaltSurvey,Ready");
+        if (ready == testState.indexedOwner->numbers.end() || ready->second != 0)
+            throw std::runtime_error("compound PSP write outside non-ready mode");
+        return;
+    }
     const auto readOnly = testState.indexedOwner->numbers.find("CobaltSurvey,ReadOnly");
     const auto ready = testState.indexedOwner->numbers.find("CobaltSurvey,Ready");
     if (readOnly == testState.indexedOwner->numbers.end() || ready == testState.indexedOwner->numbers.end())
@@ -407,12 +472,13 @@ public:
             testState.mapsLive >= 4 && testState.mapsLive <= 8;
         const bool preSosTransactionLive = testState.preSosEnabled && testState.openLive == 1 &&
             (testState.mapsLive == 12 || testState.mapsLive == 13);
-        const bool sosTransactionLive = testState.sosEnabled && testState.openLive == 1 &&
+        const bool sosTransactionLive = sosPathActive() && testState.openLive == 1 &&
             (testState.mapsLive == 13 || testState.mapsLive == 14);
         const bool mode1TransactionLive = testState.mode1Enabled && testState.openLive == 1 && testState.mode1MapsLive == 5;
-        if ((!kdbTransactionLive && !preSosTransactionLive && !sosTransactionLive && !mode1TransactionLive &&
+        const bool compoundLive = earlyInitPathActive() && testState.earlyInitMarker && testState.openLive == 1;
+        if ((!compoundLive && !kdbTransactionLive && !preSosTransactionLive && !sosTransactionLive && !mode1TransactionLive &&
              (testState.mapsLive || testState.backingDescriptorsLive || testState.allocations)) ||
-            (testState.openLive && !aperturePhase() && !mode1TransactionLive) || testState.iteratorsLive)
+            (testState.openLive && !compoundLive && !aperturePhase() && !mode1TransactionLive) || testState.iteratorsLive)
             throw std::runtime_error("GPU resources retained at console API");
         ++testState.consoleCalls;
         *video = testState.console;
@@ -421,8 +487,9 @@ public:
     }
     IOReturn setConsoleInfo(PE_Video *video, unsigned operation) {
         if (video || (operation != kPEDisableScreen && operation != kPEEnableScreen) ||
-            !testState.mode1EarlyBootPresent || !testState.mode1Enabled || testState.openLive != 1 ||
-            testState.mode1MapsLive != 5 || testState.iteratorsLive)
+            !(testState.mode1EarlyBootPresent || testState.earlyInitBootPresent) || !testState.mode1Enabled || testState.openLive != 1 ||
+            (testState.mode1MapsLive != 5 && !(earlyInitPathActive() && testState.earlyInitPhase >= 4 &&
+                testState.mapsLive == 0 && testState.allocations == 0)) || testState.iteratorsLive)
             throw std::runtime_error("console control outside owned early Mode 1 transaction");
         if (testState.mode1Quiet || (!testState.mode1Writes.empty() && testState.mode1SleepCalls == 0))
             throw std::runtime_error("console control during Mode 1 burst or quiet interval");
@@ -433,6 +500,7 @@ public:
         if (pause) ++testState.consolePauseCalls;
         else ++testState.consoleResumeCalls;
         testState.mode1Events.push_back(pause ? "console-pause" : "console-resume");
+        earlyInitEvent(pause ? "console-pause" : "console-resume");
         if (testState.onConsoleControl) testState.onConsoleControl(operation);
         if (pause ? testState.consolePauseFail : testState.consoleResumeFail) return kIOReturnError;
         // Like PE_initialize_console(nullptr,...), preserve PE_Video geometry.
@@ -514,7 +582,7 @@ public:
             ((offset - testState.apertureOffset) & ((1ULL << 20)-1)) == 0 && n == (1ULL << 20) &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const unsigned preSosIndex = preSosWindow ? static_cast<unsigned>((offset - testState.apertureOffset) >> 20) : 0;
-        const bool sosWindow = testState.sosEnabled && physical == 0x1000000000ULL &&
+        const bool sosWindow = sosPathActive() && physical == 0x1000000000ULL &&
             offset >= testState.apertureOffset && offset < testState.apertureOffset + (8ULL << 20) &&
             ((offset - testState.apertureOffset) & ((1ULL << 20)-1)) == 0 && n == (1ULL << 20) &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
@@ -522,7 +590,8 @@ public:
         const bool staging = !testState.preSosEnabled && stagingPhase() && physical == 0x1000000000ULL &&
             (offset == testState.apertureOffset || (testState.splEnabled && offset == testState.apertureOffset + (1ULL << 20))) && n == (1ULL << 20) &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
-        const bool kdbMailbox = testState.kdbEnabled && physical == 0xc0000000 && offset == 0x4000 && n == 4096 &&
+        const bool kdbMailbox = (testState.kdbEnabled || sosPathActive()) && physical == 0xc0000000 &&
+            offset == (earlyInitPathActive() ? 0x1000u : 0x4000u) && n == 4096 &&
             options == (kIOMapAnywhere | kIOMapUnique | kIOMapInhibitCache);
         const bool probe = aperturePhase() && physical == 0x1000000000ULL &&
             offset == testState.apertureOffset && n == 4096 &&
@@ -715,6 +784,7 @@ public:
         if (options != 0 || successfulOpenClient != client) throw std::runtime_error("invalid provider close");
         if (owner == client) owner = nullptr;
         successfulOpenClient = nullptr; --testState.openLive; ++testState.closeCalls;
+        earlyInitEvent("provider-close");
         if (onClose) onClose();
     }
     bool isOpen(const IOService *client) const { return owner == client; }
@@ -780,6 +850,7 @@ public:
     IOReturn restoreDeviceState(IOOptionBits options) {
         if (options != 0) throw std::runtime_error("nonzero restoreDeviceState options");
         ++testState.mode1RestoreCalls; testState.mode1Events.push_back("restore-pci");
+        earlyInitEvent("restore-pci");
         if (testState.mode1RestoreFail) return -1004;
         command = savedCommand; std::copy(std::begin(savedBars), std::end(savedBars), bars);
         testState.mode1BusMasterState = testState.mode1SavedBusMaster;
@@ -809,13 +880,13 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
     } else if (offset == 4) {
         const uint32_t low = testState.indexedPage[0], high = testState.indexedPage[6];
         const uint64_t pos = (uint64_t(high) << 31) | (low & 0x7fffffffu);
-        if (aperturePhase()) {
+        if (aperturePhase() && !(earlyInitPathActive() && testState.earlyInitPhase == 2)) {
             const uint64_t windowBytes = testState.splEnabled ? (2ULL << 20) : stagingPhase() ? (1ULL << 20) : 16;
-            const uint64_t activeWindowBytes = testState.sosEnabled ? (8ULL << 20) : testState.preSosEnabled ? (7ULL << 20) : windowBytes;
-            if ((!testState.preSosEnabled && !testState.sosEnabled && !testState.probeMapLive) || !(low & 0x80000000u) || (pos & 3) ||
+            const uint64_t activeWindowBytes = sosPathActive() ? (8ULL << 20) : testState.preSosEnabled ? (7ULL << 20) : windowBytes;
+            if ((!testState.preSosEnabled && !sosPathActive() && !testState.probeMapLive) || !(low & 0x80000000u) || (pos & 3) ||
                 pos < testState.apertureOffset || pos >= testState.apertureOffset + activeWindowBytes)
                 throw std::runtime_error("aperture MM_DATA outside fixed survey window");
-            if (testState.sosEnabled) {
+            if (sosPathActive()) {
                 const unsigned index = static_cast<unsigned>((pos - testState.apertureOffset) >> 20);
                 if (index >= testState.sosWindowLive.size() || !testState.sosWindowLive[index])
                     throw std::runtime_error("MM_DATA outside mapped SOS CPU window");
@@ -841,6 +912,8 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
         std::memcpy(&value, testState.discovery.data() + (pos - testState.discoveryOffset), 4);
         if (testState.dataRead) value = testState.dataRead(testState.indexedDataReads, value);
         ++testState.indexedDataReads;
+        if (earlyInitPathActive() && testState.mode1Writes.size() == 3 && testState.mode1RestoreCalls)
+            ++testState.earlyInitRefreshDataReads;
         }
     } else throw std::runtime_error("unexpected register read");
     const MmioEvent event {'r', offset, value}; testState.mmioEvents.push_back(event);
@@ -849,12 +922,13 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
 }
 inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t offset) {
     const bool expectedMaps = testState.mapsLive == 2 || testState.mapsLive == 4 ||
+        (earlyInitPathActive() && testState.openLive == 1 && testState.earlyInitMarker && testState.mapsLive == 3) ||
         (stagingPhase() && testState.mapsLive >= 4 && testState.mapsLive <= 8) ||
         (testState.preSosEnabled && (testState.mapsLive == 12 || testState.mapsLive == 13)) ||
-        (testState.sosEnabled && (testState.mapsLive == 13 || testState.mapsLive == 14));
+        (sosPathActive() && (testState.mapsLive == 13 || testState.mapsLive == 14));
     if (!testState.stateBootPresent || !expectedMaps ||
         (std::find(testState.stateAllowedOffsets.begin(), testState.stateAllowedOffsets.end(), offset) ==
-            testState.stateAllowedOffsets.end() && (!testState.kdbEnabled ||
+            testState.stateAllowedOffsets.end() && (!(testState.kdbEnabled || earlyInitPathActive()) ||
              std::find(testState.kdbStateOffsets.begin(), testState.kdbStateOffsets.end(), offset) == testState.kdbStateOffsets.end())))
         throw std::runtime_error("state MMIO outside fixed passive allowlist");
     const uint64_t page = offset & ~uint32_t(0xfff);
@@ -864,7 +938,7 @@ inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t
             mapping.second + (offset & 0xfffu)) mappedAddress = true;
     if (!mappedAddress) throw std::runtime_error("state MMIO pointer outside mapped page");
     uint32_t observed = 0;
-    if (testState.kdbBootPresent || testState.preSosEnabled || testState.sosEnabled) {
+    if (testState.kdbBootPresent || testState.preSosEnabled || sosPathActive()) {
         if (offset == 0x458c) observed = 0x80000000u;
         else if (offset == 0x4644) observed = 0;
         else if (offset == 0xa950 || offset == 0x5d14) observed = 0x33;
@@ -880,12 +954,12 @@ inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t
     return actual;
 }
 inline void cobaltSurveyTestKdbWrite32(volatile uint32_t *address, uint32_t value, uint32_t offset) {
-    if ((!testState.kdbEnabled && !testState.splEnabled && !testState.preSosEnabled && !testState.sosEnabled) || testState.openLive != 1 || !testState.indexedOwner ||
+    if ((!testState.kdbEnabled && !testState.splEnabled && !testState.preSosEnabled && !sosPathActive()) || testState.openLive != 1 || !testState.indexedOwner ||
         !testState.kdbMailboxMapLive || !testState.kdbMailboxPage ||
         (!(testState.kdbClaimed || testState.splClaimed || testState.preSosClaimed || testState.sosClaimed)))
         throw std::runtime_error("PSP mailbox write without owned attempt");
     requireExplicitWritableMode();
-    if (testState.sosEnabled) {
+    if (sosPathActive()) {
         if (testState.sosFinalStoreSeen) throw std::runtime_error("write after final SOS command store");
         if (testState.sosWrites == 0) {
             for (unsigned i = 0; i < testState.sosWindowLive.size(); ++i) {
@@ -893,16 +967,18 @@ inline void cobaltSurveyTestKdbWrite32(volatile uint32_t *address, uint32_t valu
                     testState.sosGpu[i].size() != 262144 || testState.sosCpu[i] != testState.sosGpu[i])
                     throw std::runtime_error("first mailbox store before all eight SOS images are staged and visible");
             }
+            earlyInitEvent("all-eight-images-visible");
         }
-        if (offset != testState.kdbAddressByteOffset && offset != 0x458c)
+        if (offset != testState.kdbAddressByteOffset && offset != testState.kdbCommandByteOffset)
             throw std::runtime_error("SOS mailbox write outside fixed C2P allowlist");
         auto *expected = reinterpret_cast<volatile uint32_t *>(
             reinterpret_cast<volatile uint8_t *>(testState.kdbMailboxPage) + (offset & 0xfffu));
         if (address != expected) throw std::runtime_error("SOS mailbox pointer outside mapped C2P word");
         ++testState.sosWrites;
         testState.sosEvents.push_back({offset, value});
+        earlyInitEvent(offset == testState.kdbCommandByteOffset && value == 0x00020000u ? "sos-final-command" : "sos-mailbox-store");
         if (testState.onSos) testState.onSos(testState.sosEvents.back());
-        if (offset == 0x458c && value == 0x00020000u) testState.sosFinalStoreSeen = true;
+        if (offset == testState.kdbCommandByteOffset && value == 0x00020000u) testState.sosFinalStoreSeen = true;
         return;
     }
     if (testState.preSosEnabled) {
@@ -934,19 +1010,21 @@ inline void cobaltSurveyTestKdbWrite32(volatile uint32_t *address, uint32_t valu
     }
 }
 inline void cobaltSurveyTestWriteSelector32(volatile uint32_t *address, uint32_t value) {
-    if (testState.sosEnabled && testState.sosFinalStoreSeen)
+    if (sosPathActive() && testState.sosFinalStoreSeen)
         throw std::runtime_error("selector write after final SOS command store");
     if (!testState.indexedMapLive || testState.openLive != 1 || !testState.indexedOwner)
         throw std::runtime_error("selector write without explicit writable mode");
     requireExplicitWritableMode();
     const auto offset = static_cast<uint32_t>(address - testState.indexedPage) * 4;
-    if (testState.sosEnabled && testState.sosFinalStoreSeen)
+    if (sosPathActive() && testState.sosFinalStoreSeen)
         throw std::runtime_error("selector write after final SOS command store");
     if (offset != 0 && offset != 0x18) throw std::runtime_error("write outside selectors");
     *address = value; ++testState.selectorWrites;
     const MmioEvent event {'w', offset, value}; testState.mmioEvents.push_back(event);
     if (aperturePhase()) {
-        if (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed && !testState.sosClaimed)
+        if (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed && !testState.sosClaimed &&
+            !(earlyInitPathActive() && testState.earlyInitPhase == 2 && testState.earlyInitMarker &&
+                testState.mode1Marker == testState.earlyInitMarker && !testState.sosMarker))
             throw std::runtime_error("aperture selector write before persistent claim");
         apertureEvent('s', offset, value);
     }
@@ -958,6 +1036,9 @@ inline void apertureIoOwnership(bool permitStagingBackupRead = false) {
         (!testState.apertureClaimed && !testState.stagingClaimed && !testState.kdbClaimed && !testState.splClaimed && !testState.preSosClaimed && !testState.sosClaimed &&
          !(permitStagingBackupRead && stagingPhase())))
         throw std::runtime_error("aperture access without owned explicit attempt");
+    if (permitStagingBackupRead && earlyInitPathActive() && testState.earlyInitPhase == 3 &&
+        testState.earlyInitMarker && testState.mode1Marker == testState.earlyInitMarker && !testState.sosMarker)
+        return; // bounded original-buffer reads only, before the firmware claim
     requireExplicitWritableMode();
 }
 inline uint32_t cobaltSurveyTestApertureRegisterRead(const volatile uint32_t *address, uint32_t offset) {
@@ -977,7 +1058,7 @@ inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
     apertureIoOwnership(true);
     const size_t maxWords = stagingPhase() ? 262144 : 4;
     const uintptr_t pointer = reinterpret_cast<uintptr_t>(address);
-    if (testState.sosEnabled) for (unsigned i = 0; i < testState.sosPages.size(); ++i) {
+    if (sosPathActive()) for (unsigned i = 0; i < testState.sosPages.size(); ++i) {
         const auto base = reinterpret_cast<uintptr_t>(testState.sosPages[i]);
         if (testState.sosWindowLive[i] && base && pointer >= base && pointer < base + maxWords * sizeof(uint32_t)) {
             uint32_t value = *address;
@@ -1010,7 +1091,7 @@ inline uint32_t cobaltSurveyTestApertureCpuRead(volatile uint32_t *address) {
 }
 inline void cobaltSurveyTestApertureCpuWrite(volatile uint32_t *address, uint32_t value) {
     apertureIoOwnership();
-    if (testState.sosEnabled && testState.sosWrites)
+    if (sosPathActive() && testState.sosWrites)
         throw std::runtime_error("CPU window write after an SOS mailbox attempt");
     const size_t maxWords = stagingPhase() ? 262144 : 4;
     if (testState.preSosEnabled && testState.preSosWrites)
@@ -1018,7 +1099,7 @@ inline void cobaltSurveyTestApertureCpuWrite(volatile uint32_t *address, uint32_
     if (testState.splEnabled && testState.kdbWrites + testState.splWrites)
         throw std::runtime_error("CPU window write after a PSP mailbox attempt");
     const uintptr_t pointer = reinterpret_cast<uintptr_t>(address);
-    if (testState.sosEnabled) for (unsigned i = 0; i < testState.sosPages.size(); ++i) {
+    if (sosPathActive()) for (unsigned i = 0; i < testState.sosPages.size(); ++i) {
         const auto base = reinterpret_cast<uintptr_t>(testState.sosPages[i]);
         if (testState.sosWindowLive[i] && base && pointer >= base && pointer < base + maxWords * sizeof(uint32_t)) {
             *address = value; ++testState.apertureCpuWrites;
@@ -1049,7 +1130,7 @@ inline void cobaltSurveyTestApertureFence() {
 }
 inline void cobaltSurveyTestApertureFlush(volatile uint32_t *address) {
     apertureIoOwnership();
-    if (testState.sosEnabled && testState.sosWrites)
+    if (sosPathActive() && testState.sosWrites)
         throw std::runtime_error("HDP flush after an SOS mailbox attempt");
     if (testState.preSosEnabled && testState.preSosWrites)
         throw std::runtime_error("HDP flush after a pre-SOS mailbox attempt");
@@ -1085,8 +1166,9 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         const auto numeric = std::strtoll(token.c_str(), &end, 0);
         return present && !token.empty() && end && *end == '\0' && numeric == 1;
     };
+    testState.earlyInitEnabled = enabled(testState.earlyInitBootPresent, testState.earlyInitBoot);
     testState.mode1Enabled = enabled(testState.mode1BootPresent, testState.mode1Boot) ||
-        enabled(testState.mode1EarlyBootPresent, testState.mode1EarlyBoot);
+        enabled(testState.mode1EarlyBootPresent, testState.mode1EarlyBoot) || testState.earlyInitEnabled;
     const bool indexed = std::string(key) == "cobalt-survey-indexed";
     const bool state = std::string(key) == "cobalt-survey-state";
     const bool aperture = std::string(key) == "cobalt-survey-aperture";
@@ -1097,15 +1179,17 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool sos = std::string(key) == "cobalt-survey-sos";
     const bool mode1 = std::string(key) == "cobalt-survey-mode1";
     const bool mode1Early = std::string(key) == "cobalt-survey-mode1boot";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1 && !mode1Early) throw std::runtime_error("unexpected boot argument");
+    const bool initBoot = std::string(key) == "cobalt-survey-initboot";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1 && !mode1Early && !initBoot) throw std::runtime_error("unexpected boot argument");
     if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
+        initBoot ? !testState.earlyInitBootPresent :
         mode1Early ? !testState.mode1EarlyBootPresent : mode1 ? !testState.mode1BootPresent : sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
         spl ? !testState.splBootPresent : kdb ? !testState.kdbBootPresent :
         aperture ? !testState.apertureBootPresent : staging ? !testState.stagingBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : mode1Early ? testState.mode1EarlyBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : initBoot ? testState.earlyInitBoot : mode1Early ? testState.mode1EarlyBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
         aperture ? testState.apertureBoot : staging ? testState.stagingBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;
@@ -1117,6 +1201,7 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (spl) testState.splEnabled = integer == 1;
         if (preSos) testState.preSosEnabled = integer == 1 && !testState.sosEnabled;
         if (sos) testState.sosEnabled = integer == 1;
+        if (initBoot) testState.earlyInitEnabled = integer == 1;
         std::memcpy(out, &integer, static_cast<size_t>(n) < sizeof(integer) ? static_cast<size_t>(n) : sizeof(integer));
     } else {
         if (staging) testState.stagingEnabled = false;
@@ -1124,19 +1209,30 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
         if (spl) testState.splEnabled = false;
         if (preSos) testState.preSosEnabled = false;
         if (sos) testState.sosEnabled = false;
+        if (initBoot) testState.earlyInitEnabled = false;
         std::memset(out, 0, static_cast<size_t>(n));
         std::memcpy(out, token.data(), token.size() < static_cast<size_t>(n) ? token.size() : static_cast<size_t>(n));
     }
     return true;
 }
 inline void *IOMalloc(uint64_t n) {
-    if (n != 10240 && n != 20480 && n != (1ULL << 20) && n != 125472)
+    const bool metadata = earlyInitPathActive() && n > 0 && n < 10240;
+    if (!metadata && n != 10240 && n != 20480 && n != (1ULL << 20) && n != 125472)
         throw std::runtime_error("unbounded allocation");
     const unsigned call = ++testState.allocationCalls;
     if (testState.allocFail || (testState.failAllocationCall && call == testState.failAllocationCall)) return nullptr;
-    ++testState.allocations; return std::malloc(static_cast<size_t>(n));
+    void *p = std::malloc(static_cast<size_t>(n));
+    if (!p) return nullptr;
+    if (metadata) { ++testState.metadataAllocations; testState.metadataPointers[p] = n; }
+    else ++testState.allocations;
+    return p;
 }
 inline void IOFree(void *p, uint64_t n) {
+    const auto metadata = testState.metadataPointers.find(p);
+    if (metadata != testState.metadataPointers.end()) {
+        if (metadata->second != n) throw std::runtime_error("metadata free size mismatch");
+        testState.metadataPointers.erase(metadata); --testState.metadataAllocations; std::free(p); return;
+    }
     if (!p || (n != 10240 && n != 20480 && n != (1ULL << 20) && n != 125472))
         throw std::runtime_error("invalid IOFree");
     --testState.allocations; std::free(p);
@@ -1148,6 +1244,7 @@ inline void IOSleep(unsigned milliseconds) {
         if (milliseconds < 1000) throw std::runtime_error("Mode 1 quiet interval shorter than one second");
         testState.mode1Quiet = true;
         testState.mode1Events.push_back("quiet-begin");
+        earlyInitEvent("quiet-begin");
         ++testState.mode1SleepCalls;
     }
     if (testState.onMode1Sleep) testState.onMode1Sleep();
@@ -1155,6 +1252,7 @@ inline void IOSleep(unsigned milliseconds) {
     if (testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && testState.mode1Quiet) {
         testState.mode1Quiet = false;
         testState.mode1Events.push_back("quiet-end");
+        earlyInitEvent("quiet-end");
     }
 }
 inline uint32_t OSSwapLittleToHostInt32(uint32_t value) {
@@ -1201,6 +1299,7 @@ inline void cobaltSurveyTestMode1Write32(volatile uint32_t *word, uint32_t value
     testState.mode1Writes.emplace_back(byteOffset, value);
     testState.mode1WritePointers.emplace_back(word, value);
     testState.mode1Events.push_back("write-" + std::to_string(byteOffset));
+    earlyInitEvent("mode1-write-" + std::to_string(byteOffset));
     *word = value;
     if (testState.mode1Write) testState.mode1Write(byteOffset, value);
 }

@@ -148,7 +148,15 @@ case "$SYSTEM_UUID" in *[!0-9A-Fa-f-]*) fail 'invalid ExpectedSystemUUID';; esac
 REVISION=$(get_plan BuildRevision) || fail 'missing BuildRevision'
 case "$REVISION" in *[!0-9a-f]*) fail 'invalid BuildRevision';; esac
 [ "${#REVISION}" -eq 40 ] || fail 'invalid BuildRevision'
-[ "$(get_plan BundleVersion)" = 0.12.0 ] || fail 'unexpected client version'
+[ "$(get_plan BundleVersion)" = 0.13.0 ] || fail 'unexpected client version'
+if /usr/bin/plutil -extract TestKind raw -o - "$PLAN" >/dev/null 2>&1; then
+    [ "$(/usr/bin/plutil -type TestKind "$PLAN" 2>/dev/null)" = string ] || fail 'malformed TestKind'
+    TEST_KIND=$(get_plan TestKind) || fail 'malformed TestKind'
+else
+    if /usr/bin/plutil -extract TestKind xml1 -o - "$PLAN" >/dev/null 2>&1; then fail 'malformed TestKind'; fi
+    TEST_KIND=mode1
+fi
+case "$TEST_KIND" in mode1|reset-sos) :;; *) fail 'unknown TestKind';; esac
 
 check_hash "$PAYLOAD_DIR/config-baseline.plist" "$(get_plan BaselineConfigSHA256)"
 check_hash "$PAYLOAD_DIR/config-bootstrap.plist" "$(get_plan BootstrapConfigSHA256)"
@@ -189,12 +197,12 @@ BOOTARGS=$(/usr/sbin/sysctl -n kern.bootargs 2>/dev/null) || fail 'cannot inspec
 for _flag in cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1; do
     require_flag "${_flag%=*}" || fail "required passive flag missing, duplicated, or invalid: $_flag"
 done
-for _flag in cobalt-survey-mode1 cobalt-survey-mode1boot cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do
+for _flag in cobalt-survey-initboot cobalt-survey-mode1 cobalt-survey-mode1boot cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do
     require_off "$_flag" || fail "test/write flag is active, duplicated, or invalid: $_flag"
 done
 DRIVERS=$(/usr/sbin/ioreg -r -c CobaltNavi44Survey -l 2>/dev/null) || fail 'cannot inspect survey service'
 case "$DRIVERS" in *'CobaltNavi44Survey'*) :;; *) fail 'Cobalt survey service is not loaded';; esac
-case "$DRIVERS" in *'CobaltSurvey,BuildVersion" = "0.12.0"'*) :;; *) fail 'loaded survey service is not build 0.12.0';; esac
+case "$DRIVERS" in *'CobaltSurvey,BuildVersion" = "0.13.0"'*) :;; *) fail 'loaded survey service is not build 0.13.0';; esac
 SERVICE_COUNT=$(printf '%s\n' "$DRIVERS" | /usr/bin/grep -c 'CobaltNavi44Survey  <class CobaltNavi44Survey' || true)
 [ "$SERVICE_COUNT" = 1 ] || fail 'expected exactly one Cobalt survey service'
 

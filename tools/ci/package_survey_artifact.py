@@ -95,6 +95,7 @@ def payload() -> dict[str, bytes]:
         "SURVEY-TEST.md": ROOT / "docs/NAVI44-SURVEY.md",
         "MODE1-RESET.md": ROOT / "docs/MODE1-RESET.md",
         "EARLY-MODE1-RESET.md": ROOT / "docs/EARLY-MODE1-RESET.md",
+        "EARLY-RESET-SOS.md": ROOT / "docs/EARLY-RESET-SOS.md",
         "licenses/LICENSE": ROOT / "src/navi48-bringup/LICENSE",
         "licenses/NOTICE": ROOT / "src/navi48-bringup/NOTICE",
         "licenses/LICENSE.amdgpu": ROOT / "src/navi48-bringup/firmware/LICENSE.amdgpu",
@@ -110,6 +111,7 @@ def payload() -> dict[str, bytes]:
         "Scope: default read-only PCI/direct-memory survey; separately gated indexed VRAM reads permit address-selector writes; optional passive PSP/MMHUB state and console observations; separately gated 16-byte aperture or full 1 MiB synthetic staging experiment permits bounded VRAM and HDP flush writes through an existing isolated or discovery-derived native NBIF route, with saved-original restoration checks\n"
         "Hardware validation: not yet loaded on the target GPU\n"
         "Acceleration: unavailable; Navi 44 bring-up remains disabled\n"
+        "Optional cobalt-survey-initboot=1: exclusive early compound Mode1 reset, fresh discovery and guarded eight-image PSP/SOS checkpoint in one provider session; requires only survey/indexed/state and every other experiment off; native capture plan TestKind=reset-sos; preserves firmware buffers after mailbox ownership; Ready and ColdCycleReplacementValidated remain false\n"
         "Optional cobalt-survey-kdb=1: one PSP KDB command using embedded pinned PSP 14.0.2 firmware; requires all five prior survey flags; no remaining firmware chain or SOS startup\n"
         "Optional cobalt-survey-spl=1: prepare two separate 1 MiB windows, then issue only KDB and SPL; requires all six prior survey flags; preserves both windows after any mailbox attempt; no SYS or SOS startup\n"
         "Optional cobalt-survey-presos=1: prepare all seven separate 1 MiB windows before the complete pinned pre-SOS batch; requires all seven prior survey flags; preserves every window after any mailbox attempt; no SOS startup\n"

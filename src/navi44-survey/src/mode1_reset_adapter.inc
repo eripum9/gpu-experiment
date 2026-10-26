@@ -56,7 +56,7 @@ bool mode1PeerCensus(IOPCIDevice *pci, IOService *service, Mode1PeerCensus &cens
 }
 
 bool mode1AnyAttempt(IOPCIDevice *pci) {
-    const char *keys[] = {"CobaltSurvey,Mode1ResetAttempt-v1", "CobaltSurvey,ApertureAttempt-v1",
+    const char *keys[] = {"CobaltSurvey,EarlyInitAttempt-v1", "CobaltSurvey,Mode1ResetAttempt-v1", "CobaltSurvey,ApertureAttempt-v1",
         "CobaltSurvey,StagingAttempt-v1", "CobaltSurvey,KdbAttempt-v1", "CobaltSurvey,KdbSplAttempt-v1",
         "CobaltSurvey,PreSosAttempt-v1", "CobaltSurvey,SosBootAttempt-v1"};
     for (const char *key : keys) if (pci->getProperty(key)) return true;
@@ -80,7 +80,7 @@ void clearMode1Properties(IOService *service) {
     }
 }
 
-bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
+bool publishMode1(IOService *service, const Mode1AdapterResult &result, bool compound = false) {
     const auto &r = result.protocol;
     // Revoke a previous commit before beginning this publication transaction.
     service->removeProperty("CobaltSurvey,Schema");
@@ -136,7 +136,7 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
 #undef MODE1_BOOL
 #undef MODE1_NUM
     published = service->setProperty("CobaltSurvey,AccessMode", "smu-debug-mode1-reset") && published;
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.12.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.13.0") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;
     // Indexed boot collection already used selector stores, including when
@@ -144,6 +144,9 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result) {
     published = service->setProperty("CobaltSurvey,ReadOnly", false) && published;
     const bool consoleBoundaryComplete = !result.earlyBoot ||
         (result.consolePauseAttempted && result.consolePaused && result.consoleResumeAttempted && result.consoleResumed);
+    // The compound publisher owns the only schema commit. Nested diagnostics
+    // remain useful on failure and must not momentarily advertise schema12.
+    if (compound) return published;
     if (published && r.success && result.consoleRecovered && consoleBoundaryComplete &&
         service->setProperty("CobaltSurvey,Schema", result.earlyBoot ? 12ULL : 11ULL, 32)) return true;
     // Failure must not leave an apparently committed success, even if the
@@ -163,6 +166,7 @@ class Mode1Transaction final : public cobalt::reset::Io {
     IOService *service;
     IOPCIDevice *pci;
     ProviderSession &session;
+    EarlyInitAuthorization *early;
     PciState saved, disabled;
     const Aperture &mmio, &vram;
     Mode1DebugMapping debug;
@@ -175,7 +179,8 @@ class Mode1Transaction final : public cobalt::reset::Io {
 
     bool fail(const char *reason) { result.reason = reason; lost = true; return false; }
     bool providerSafe() const {
-        return service->getProvider() == pci && session.owns() && apertureOnlyClient(pci, service);
+        return (!early || (early->owns(service, pci, session) && early->resetAuthorized())) &&
+            service->getProvider() == pci && session.owns() && apertureOnlyClient(pci, service);
     }
     bool guard(const PciState &expected) {
         if (lost) return false;
@@ -216,8 +221,9 @@ class Mode1Transaction final : public cobalt::reset::Io {
 public:
     Mode1Transaction(IOService *s, IOPCIDevice *p, ProviderSession &owner, const PciState &state,
         const Aperture &m, const Aperture &v, Mode1DebugMapping d,
-        const volatile uint8_t *const (&pages)[4], const uint32_t (&regs)[7], Mode1AdapterResult &r)
-        : service(s), pci(p), session(owner), saved(state), disabled(state), mmio(m), vram(v), debug(d), result(r) {
+        const volatile uint8_t *const (&pages)[4], const uint32_t (&regs)[7], Mode1AdapterResult &r,
+        EarlyInitAuthorization *compound = nullptr)
+        : service(s), pci(p), session(owner), early(compound), saved(state), disabled(state), mmio(m), vram(v), debug(d), result(r) {
         disabled.command = static_cast<uint16_t>(saved.command & ~4u);
         for (unsigned n = 0; n < 4; ++n) readPages[n] = pages[n];
         for (unsigned n = 0; n < 7; ++n) offsets[n] = regs[n];
@@ -226,8 +232,12 @@ public:
         if (!debug.valid() || !stableState(saved, true)) return false;
         observation = {initial[0], initial[1], initial[6]};
         if (!stableConsole(saved, true) || !guard(saved)) return false;
-        if (mode1AnyAttempt(pci)) return fail("provider-already-attempted");
-        if (!pci->setProperty("CobaltSurvey,Mode1ResetAttempt-v1", true)) return fail("provider-claim-failed");
+        if (early) {
+            if (!early->claimReset()) return fail("compound-reset-claim-failed");
+        } else {
+            if (mode1AnyAttempt(pci)) return fail("provider-already-attempted");
+            if (!pci->setProperty("CobaltSurvey,Mode1ResetAttempt-v1", true)) return fail("provider-claim-failed");
+        }
         return guard(saved);
     }
     bool savePci() override {
@@ -317,7 +327,7 @@ public:
             if (n >= 2 && value != initial[n]) return fail("postflight-layout-changed");
         }
         result.consoleRecovered = guard(saved);
-        if (result.consoleRecovered && result.earlyBoot) {
+        if (result.consoleRecovered && result.earlyBoot && !early) {
             if (!result.consolePaused) return fail("console-was-not-paused");
             IOPlatformExpert *platform = IOService::getPlatform();
             if (!platform || !guard(saved)) {
@@ -344,7 +354,10 @@ public:
 };
 
 COBALT_SURVEY_NOINLINE void runMode1(IOService *service, IOPCIDevice *pci, OSData *snapshot,
-    Mode1AdapterResult &result) {
+    Mode1AdapterResult &result, ProviderSession *continued = nullptr, EarlyInitAuthorization *early = nullptr) {
+    if (early && (!continued || !early->owns(service, pci, *continued) || !early->resetAuthorized())) {
+        result.reason = "compound-reset-authorization-refused"; return;
+    }
     if (!snapshot || snapshot->getLength() != kDiscoverySize) { result.reason = "snapshot-unavailable"; return; }
     IpDiscovery discovery;
     IpDiscovery::GcTopology topology {};
@@ -418,8 +431,9 @@ COBALT_SURVEY_NOINLINE void runMode1(IOService *service, IOPCIDevice *pci, OSDat
         }
     }
     if (!mode1PeerCensus(pci, service, result.peerCensus)) { result.reason = "peer-refused"; return; }
-    ProviderSession session(pci, service);
-    if (!session.open()) { result.reason = "provider-busy"; return; }
+    ProviderSession localSession(pci, service);
+    ProviderSession &session = continued ? *continued : localSession;
+    if (!continued && !session.open()) { result.reason = "provider-busy"; return; }
     if (!session.owns() || !consoleGuard(pci, state, mmio, vram) || !apertureOnlyClient(pci, service)) {
         result.reason = "device-context-changed"; return;
     }
@@ -441,7 +455,7 @@ COBALT_SURVEY_NOINLINE void runMode1(IOService *service, IOPCIDevice *pci, OSDat
     if (!debugMap.createMode1DebugPage(mmio, result.debug)) { result.reason = "debug-map-failed"; return; }
     const Mode1DebugMapping debug = debugMap.mode1Debug(result.debug);
     if (!debug.valid()) { result.reason = "debug-map-invalid"; return; }
-    Mode1Transaction transaction(service, pci, session, state, mmio, vram, debug, readPages, offsets, result);
+    Mode1Transaction transaction(service, pci, session, state, mmio, vram, debug, readPages, offsets, result, early);
     result.protocol = cobalt::reset::run(transaction);
     if (!result.protocol.success && !strcmp(result.reason, "prerequisites-unavailable"))
         result.reason = result.protocol.status;

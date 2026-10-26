@@ -9,6 +9,12 @@ This mode can issue a reset during the diagnostic boot. It is separate from
 the manual `cobalt-survey-mode1=1` interface and must not be combined with it.
 It is not a graphics acceleration or complete GPU initialization feature.
 
+Version 0.13.0 separately provides a compound
+[early reset and PSP/SOS checkpoint](EARLY-RESET-SOS.md). Its `initboot` flag
+must not be combined with either standalone reset flag. Capture plans select
+`TestKind=mode1` for this standalone experiment, or `TestKind=reset-sos` for
+the compound operation; a missing kind retains the standalone contract.
+
 ## Bootstrap and one test boot
 
 The hardware-specific private test payload includes verified bootstrap,
