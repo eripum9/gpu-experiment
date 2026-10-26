@@ -16,6 +16,23 @@ armed and baseline EFI configurations, a `plan.plist` with file hashes and
 machine/USB identity, and the capture scripts. The public artifact alone is
 not an armed installation and contains no machine identity or private EFI.
 
+The capture helper uses the signed `CobaltEarlyCapture.app` bundle, installed
+at `/Applications/CobaltEarlyCapture.app`, as its background process identity.
+Grant **this app** Full Disk Access in System Settings → Privacy & Security
+before allowing the test to arm. The installer does not grant that permission
+or change the privacy database. It does not require granting access to a
+general-purpose shell.
+
+Before arming, the installer launches a temporary probe through `launchd`,
+the native app, and the same child script used by the real capture job. The
+probe checks the planned machine, USB identity and bootstrap config, then
+proves read, write and rename access using its own nonce files. It leaves
+the active configuration unchanged. Permission from an interactive Terminal
+session is insufficient evidence: a background process has a separate access
+context. If this probe fails, setup remains unarmed and explains how to grant
+the app access before trying setup again. The app remains installed for that
+selection; newly created incomplete capture setup is cleaned up.
+
 The bootstrap configuration loads only the existing passive observation
 path, with `cobalt-survey`, `cobalt-survey-indexed` and `cobalt-survey-state`
 equal to 1. Indexed discovery still uses its existing selector stores; no
@@ -27,7 +44,7 @@ sudo sh /Volumes/TAHOE/gpu-early-test/install-early-reset-test.sh --install-and-
 ```
 
 The installer validates the private plan, machine and USB identity, checks
-the passive boot, and saves a baseline capture. It installs a root-owned
+the passive boot and background USB probe, and saves a baseline capture. It installs a root-owned
 capture job for the next boot before replacing the USB configuration with
 the verified armed configuration. It then attempts a normal reboot.
 
@@ -44,6 +61,23 @@ result. It does not request any GPU reset itself. It saves available output
 under `EARLY-RESET-<SessionID>`, disables its future launch and attempts a
 normal reboot. Select Windows Boot Manager directly from the firmware menu.
 The display need not remain available for that user-space collection.
+
+If USB access fails before baseline restoration in the intended test boot, available driver and
+collector evidence is saved locally under the root-owned capture directory.
+The job does not automatically reboot while the USB remains armed. Recover
+the known working configuration from Windows before another macOS boot, then
+retrieve the local evidence. An access failure is reported as such, rather
+than being interpreted as a changed configuration or a successful capture.
+
+The first tested shell-only job was denied access to the USB configuration
+even though its installer could access it from Terminal. Root credentials do
+not establish that the background job has removable-volume consent. The app
+and preflight address that observed failure; successful background access
+still needs to be established on the target Mac before a further reset boot.
+
+References: [Apple DTS on helper-process access](https://developer.apple.com/forums/thread/802650),
+[Apple DTS on app bundles and Full Disk Access](https://developer.apple.com/forums/thread/118508),
+and [Apple's removable-volume permission description](https://developer.apple.com/documentation/bundleresources/information-property-list/nsremovablevolumesusagedescription).
 
 A hard hang or panic before user space can prevent the job from collecting
 or restoring the baseline configuration. The kernel's attempt marker is

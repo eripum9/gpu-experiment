@@ -13,6 +13,10 @@ KEXT := $(BUILD)/$(PRODUCT).kext
 EXEC := $(KEXT)/Contents/MacOS/$(PRODUCT)
 MODE1_RESET := $(BUILD)/mode1-reset
 MODE1_RESET_SRC := ../../tools/navi44-survey/mode1-reset.c
+CAPTURE_APP := $(BUILD)/CobaltEarlyCapture.app
+CAPTURE_EXEC := $(CAPTURE_APP)/Contents/MacOS/CobaltEarlyCapture
+CAPTURE_SRC := ../../tools/navi44-survey/capture-launcher.c
+CAPTURE_PLIST := ../../tools/navi44-survey/CaptureApp-Info.plist
 SHARED := ../navi48-bringup/src
 PSP_FIRMWARE := $(BUILD)/psp_firmware.generated.cpp
 PSP_INPUT := ../navi48-bringup/firmware/psp_14_0_2_sos.bin
@@ -28,7 +32,7 @@ CFLAGS := $(COMMON)
 LDFLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
   -nostdlib -Xlinker -kext -L$(MKSDK)/Library/x86_64 -lkmodc++ -lkmod -Wl,-no_deduplicate
 
-all: $(KEXT) $(MODE1_RESET)
+all: $(KEXT) $(MODE1_RESET) $(CAPTURE_APP)
 $(BUILD)/CobaltNavi44Survey.o: src/CobaltNavi44Survey.cpp
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
@@ -54,6 +58,17 @@ $(MODE1_RESET): $(MODE1_RESET_SRC)
 	  -framework IOKit -framework CoreFoundation $< -o $@
 	codesign --force --sign - $@
 	codesign --verify --strict --verbose=2 $@
+$(CAPTURE_APP): $(CAPTURE_SRC) $(CAPTURE_PLIST)
+	@mkdir -p $(BUILD)
+	@mkdir -p $@/Contents/MacOS
+	$(CC) -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+	  -mmacosx-version-min=$(DEPLOY) -std=c11 -Wall -Wextra -Werror -pedantic -O2 \
+	  $(CAPTURE_SRC) -o $(CAPTURE_EXEC)
+	cp $(CAPTURE_PLIST) $@/Contents/Info.plist
+	codesign --force --sign - --identifier com.cobalt.early-capture $@
+	codesign --verify --strict --verbose=2 $@
+	@test -f $@/Contents/_CodeSignature/CodeResources
+	@echo "Built $@ for $(ARCH), minimum macOS $(DEPLOY)"
 -include $(OBJS:.o=.d)
 $(KEXT): $(OBJS) Info.plist
 	@mkdir -p $(KEXT)/Contents/MacOS

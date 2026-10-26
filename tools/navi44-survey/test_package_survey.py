@@ -24,6 +24,17 @@ class SurveyPackageTests(unittest.TestCase):
         self.executable.write_bytes(struct.pack("<8I", 0xFEEDFACF, 0x01000007, 3, 11, 0, 0, 0, 0))
         self.reset_client = self.root / "mode1-reset"
         self.reset_client.write_bytes(struct.pack("<8I", 0xFEEDFACF, 0x01000007, 3, 2, 0, 0, 0, 0))
+        self.capture_app = self.root / "CobaltEarlyCapture.app"
+        self.capture_executable = self.capture_app / "Contents/MacOS/CobaltEarlyCapture"
+        self.capture_executable.parent.mkdir(parents=True)
+        self.capture_executable.write_bytes(self.reset_client.read_bytes())
+        (self.capture_app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "com.cobalt.early-capture",
+            "CFBundleExecutable": "CobaltEarlyCapture", "CFBundlePackageType": "APPL",
+            "CFBundleVersion": "1.0.0"}))
+        app_signature = self.capture_app / "Contents/_CodeSignature/CodeResources"
+        app_signature.parent.mkdir()
+        app_signature.write_bytes(b"fixture-signature-resource")
         signature = self.kext / "Contents/_CodeSignature/CodeResources"
         signature.parent.mkdir()
         signature.write_bytes(b"fixture-signature-resource")
@@ -46,6 +57,7 @@ class SurveyPackageTests(unittest.TestCase):
         patch.object(PACKAGE, "ROOT", self.root).start()
         patch.object(PACKAGE, "KEXT", self.kext).start()
         patch.object(PACKAGE, "RESET_CLIENT", self.reset_client).start()
+        patch.object(PACKAGE, "CAPTURE_APP", self.capture_app).start()
         patch.object(PACKAGE.subprocess, "check_output", return_value="a" * 40).start()
 
     def payload(self):
@@ -56,7 +68,8 @@ class SurveyPackageTests(unittest.TestCase):
         files = self.payload()
         self.assertIn("collect-gpu-survey.sh", files)
         self.assertIn("SHA256SUMS.txt", files)
-        self.assertEqual(len(files), 17)
+        self.assertEqual(len(files), 20)
+        self.assertIn("CobaltEarlyCapture.app/Contents/MacOS/CobaltEarlyCapture", files)
         self.assertEqual(files["mode1-reset"], self.reset_client.read_bytes())
         self.assertIn("test-software-reset.sh", files)
         self.assertIn("MODE1-RESET.md", files)
@@ -81,6 +94,23 @@ class SurveyPackageTests(unittest.TestCase):
     def test_missing_firmware_license_refuses_packaging(self):
         (self.root / "src/navi48-bringup/firmware/LICENSE.amdgpu").unlink()
         with self.assertRaises(FileNotFoundError):
+            self.payload()
+
+    def test_capture_app_substitution_or_missing_signature_is_rejected(self):
+        self.capture_executable.write_bytes(struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 3, 2, 0, 0, 0, 0))
+        with self.assertRaisesRegex(ValueError, "capture app.*x86_64"):
+            self.payload()
+        self.capture_executable.write_bytes(self.reset_client.read_bytes())
+        info_path = self.capture_app / "Contents/Info.plist"
+        info = plistlib.loads(info_path.read_bytes())
+        info["CFBundleIdentifier"] = "com.other.helper"
+        info_path.write_bytes(plistlib.dumps(info))
+        with self.assertRaisesRegex(ValueError, "capture app identity"):
+            self.payload()
+        info["CFBundleIdentifier"] = "com.cobalt.early-capture"
+        info_path.write_bytes(plistlib.dumps(info))
+        (self.capture_app / "Contents/_CodeSignature/CodeResources").unlink()
+        with self.assertRaisesRegex(ValueError, "missing.*signed"):
             self.payload()
 
     def test_missing_or_wrong_reset_client_refuses_packaging(self):
