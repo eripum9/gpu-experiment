@@ -107,3 +107,24 @@ the RLC bootload bit provide the same observations used by the
 [Linux GC12 autoload wait](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c).
 A later command test still requires a validated firmware load path, isolated
 queue memory, and proof that the command processor consumed the packet.
+
+## PSP command ring checkpoint
+
+The host test runs the create and stop protocol against a simulated mailbox.
+It requires two agreeing idle snapshots and a dedicated zeroed 4 KiB page
+with a verified PSP-visible address. It writes the address and size, checks
+their readback, and then issues the kernel-mode ring create command. Each
+command gets a 20 ms settling delay. Two agreeing replies must follow an
+observed pending command or a new acknowledgement that echoes the command.
+The test issues stop only after confirming create. It keeps the page leased
+for the boot once programming starts, including on timeout and after a stop
+acknowledgement. It never advances the ring write pointer.
+
+The standalone survey's BAR0 window planner checks ranges and exclusions.
+The live adapter still needs an allocator that owns a separate page across
+the entire transaction, including an uncertain stop. The eight SOS staging
+windows must remain reserved for their firmware contents. Linux allocates
+a buffer object for its ring. The older Cobalt path uses a fixed VRAM offset,
+which is insufficient evidence that the survey owns that page.
+[Linux PSP buffer allocation](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c)
+and [Linux PSP v14 ring protocol](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/psp_v14_0.c).

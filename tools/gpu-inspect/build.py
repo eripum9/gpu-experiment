@@ -142,6 +142,8 @@ def test_psp_containers(cxx):
     run([output, *firmware])
     test_psp_protocol(cxx, firmware)
     test_psp_staging(cxx, firmware)
+    ring_test = ROOT / "src/navi44-survey/hosttest/psp_ring_checkpoint_test.cpp"
+    run([compile_host(cxx, "psp-ring-checkpoint-test", [ring_test])])
 
 
 def main():
