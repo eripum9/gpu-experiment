@@ -1166,6 +1166,37 @@ static Bytes mode1DiscoveryFixture() {
     b.resize(10240);
     return b;
 }
+static Bytes earlyInitGfxDiscoveryFixture() {
+    Bytes b = mode1DiscoveryFixture();
+    const uint16_t numIps = uint16_t(b[die + 2] | (uint16_t(b[die + 3]) << 8));
+    size_t ip = die + 4;
+    bool gcFound = false;
+    for (uint16_t i = 0; i < numIps; ++i) {
+        const uint16_t hwId = uint16_t(b[ip] | (uint16_t(b[ip + 1]) << 8));
+        const uint8_t bases = b[ip + 3];
+        if (hwId == IpDiscovery::HwGc && !gcFound) {
+            if (bases != 1) throw std::runtime_error("unexpected synthetic GC base count");
+            b[ip + 3] = 2;
+            put32(b, ip + 8, 0x1260);
+            b.insert(b.begin() + static_cast<std::ptrdiff_t>(ip + 12), 4, 0);
+            put32(b, ip + 12, 0xa000);
+            gcFound = true;
+            break;
+        }
+        ip += 8 + static_cast<size_t>(bases) * 4;
+    }
+    if (!gcFound) throw std::runtime_error("synthetic GC instance not found");
+    put16(b, prefix + 10, uint16_t((b[prefix + 10] | (uint16_t(b[prefix + 11]) << 8)) + 4));
+    put16(b, prefix + 16, uint16_t((b[prefix + 16] | (uint16_t(b[prefix + 17]) << 8)) + 4));
+    put16(b, prefix + 20, uint16_t((b[prefix + 20] | (uint16_t(b[prefix + 21]) << 8)) + 4));
+    put16(b, ipds + 6, uint16_t((b[ipds + 6] | (uint16_t(b[ipds + 7]) << 8)) + 4));
+    const size_t shiftedGc = gc + 56 + 4;
+    put16(b, prefix + 14, sum(b, ipds, ipds + (ipdsSize + 56 + 4)));
+    put16(b, prefix + 22, sum(b, shiftedGc, shiftedGc + gcSize));
+    put16(b, prefix + 8, sum(b, prefix + 10, shiftedGc + gcSize));
+    b.resize(10240);
+    return b;
+}
 static void apertureDevice(Device &d, bool nativeRoute=false, uint32_t nbifSegmentBase=0xd20) {
     consoleFixture(d); d.load(apertureFixture(nbifSegmentBase)); d.indexed();
     d.mmio.length=d.mmio.contiguous=0x80000; d.pci.subsystem=0x86011eae;
@@ -3497,7 +3528,7 @@ static void mode1EarlyTests() {
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && quietObserved);
         CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
         CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
-        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.13.0");
+        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.14.0");
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetTrigger") == "early-boot");
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePauseAttempted") == 1);
@@ -3989,8 +4020,13 @@ static void mode1Tests() {
     CHECK(!mode1CleanupFailed);
 }
 
-static void earlyInitDevice(Device &d, bool nativeRoute=false) {
+static constexpr uint32_t kGfxPreflightOffsets[] = {
+    0x8680, 0x3b9f0, 0x8010, 0x98f8, 0x1200, 0x120c, 0x1214, 0x1218, 0x121c, 0x1244
+};
+static void earlyInitDevice(Device &d, bool nativeRoute=false, uint32_t gfxUnreadableOffset=0) {
     mode1Device(d);
+    d.load(earlyInitGfxDiscoveryFixture());
+    testState.gfxPreflightOffsets.assign(std::begin(kGfxPreflightOffsets), std::end(kGfxPreflightOffsets));
     testState.mode1BootPresent = false;
     testState.earlyInitBootPresent = true;
     testState.earlyInitBoot = "1";
@@ -4004,7 +4040,18 @@ static void earlyInitDevice(Device &d, bool nativeRoute=false) {
     testState.kdbStateOffsets = {0x118c,0x1244,0xa950,0xa954,0xa71c,0x6dd4};
     testState.sosCpu.assign(8, std::vector<uint32_t>(262144, 0x27182818));
     testState.sosGpu.assign(8, std::vector<uint32_t>(262144, 0x27182818));
-    testState.stateRead = [](uint32_t offset, uint32_t value) {
+    testState.stateRead = [gfxUnreadableOffset](uint32_t offset, uint32_t value) {
+        if (earlyInitPathActive() && testState.consoleResumeCalls == 1 &&
+            testState.earlyInitPhase >= 4 && testState.mapsLive == 1 &&
+            std::find(testState.gfxPreflightOffsets.begin(), testState.gfxPreflightOffsets.end(), offset) !=
+                testState.gfxPreflightOffsets.end()) {
+            if (offset == gfxUnreadableOffset) return UINT32_MAX;
+            const unsigned sample = testState.gfxPreflightReads - 1;
+            const unsigned pass = sample / 10;
+            const unsigned reg = sample % 10;
+            if (offset == kGfxPreflightOffsets[9]) return 0x17u;
+            return (pass == 0 ? 0xa5000000u : 0x5a000000u) | reg;
+        }
         if (offset == 0x1244 && testState.sosFinalStoreSeen) return 0x17u;
         if (offset == 0x6dd4) return 0x8000u;
         return mode1RegisterValue(offset,value);
@@ -4026,6 +4073,14 @@ static void earlyInitTests() {
         activeTestPhase = native ? "earlyInit.native-success" : "earlyInit.isolated-success";
         FirmwareOverrideScope firmware(fake);
         Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d,native);
+        unsigned resumeMode1Writes = 0, resumeSosWrites = 0, resumeApertureWrites = 0;
+        testState.onConsoleControl = [&](unsigned op) {
+            if (op == kPEEnableScreen) {
+                resumeMode1Writes = static_cast<unsigned>(testState.mode1Writes.size());
+                resumeSosWrites = testState.sosWrites;
+                resumeApertureWrites = testState.apertureCpuWrites;
+            }
+        };
         mode1Start(d);
         if (d.service.numbers["CobaltSurvey,EarlyInitSuccess"] != 1)
             throw std::runtime_error("compound failed: " + d.service.strings["CobaltSurvey,EarlyInitStatus"] +
@@ -4038,8 +4093,29 @@ static void earlyInitTests() {
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetResetTransitionObserved") == 0);
         CHECK(d.service.numbers.at("CobaltSurvey,SosBootAliveObserved") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,SosBootFinalSosRaw") == 0x17);
+        CHECK(d.service.strings.at("CobaltSurvey,GfxPreflightStatus") == "observed");
+        const char *gfxKeys[] = {"CobaltSurvey,GfxPreflightCpStatus", "CobaltSurvey,GfxPreflightRlcBootloadStatus",
+            "CobaltSurvey,GfxPreflightGrbmStatus", "CobaltSurvey,GfxPreflightGbAddrConfig",
+            "CobaltSurvey,GfxPreflightPspRingControl", "CobaltSurvey,GfxPreflightPspRingWritePointer",
+            "CobaltSurvey,GfxPreflightPspRingAddressLow", "CobaltSurvey,GfxPreflightPspRingAddressHigh",
+            "CobaltSurvey,GfxPreflightPspRingSize", "CobaltSurvey,GfxPreflightPspSosAlive"};
+        CHECK(testState.gfxPreflightReads == 20);
+        for (unsigned i = 0; i < 10; ++i) {
+            const uint64_t expected = i == 9 ? 0x1700000017ULL :
+                (uint64_t(0x5a000000u | i) << 32) | (0xa5000000u | i);
+            CHECK(d.service.numbers.at(gfxKeys[i]) == expected);
+        }
+        CHECK(testState.stateMapRequests.size() >= 20);
+        for (unsigned i = 0; i < 20; ++i) {
+            const auto &request = testState.stateMapRequests[testState.stateMapRequests.size() - 20 + i];
+            CHECK(request.first == (kGfxPreflightOffsets[i % 10] & ~0xfffu));
+            CHECK(request.second == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache));
+        }
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1);
         CHECK(testState.mode1RestoreCalls == 1 && testState.sosWrites == 16);
+        CHECK(resumeMode1Writes == testState.mode1Writes.size());
+        CHECK(resumeSosWrites == testState.sosWrites);
+        CHECK(resumeApertureWrites == testState.apertureCpuWrites);
         CHECK(testState.earlyInitRefreshDataReads == 5120);
         CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitDiscoveryVerified") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitDiscoveryDataReads") == 5120);
@@ -4067,6 +4143,23 @@ static void earlyInitTests() {
                     throw std::runtime_error("compound staging payload/tail mismatch");
             }
         }
+        earlyInitResourceFree();
+    }
+    {
+        activeTestPhase = "earlyInit.gfx-register-unreadable";
+        FirmwareOverrideScope firmware(fake);
+        Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d, false, kGfxPreflightOffsets[2]);
+        unsigned resumeSosWrites = 0;
+        testState.onConsoleControl = [&](unsigned op) {
+            if (op == kPEEnableScreen) resumeSosWrites = testState.sosWrites;
+        };
+        mode1Start(d);
+        CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitSuccess") == 1);
+        CHECK(d.service.strings.at("CobaltSurvey,GfxPreflightStatus") == "register-unreadable");
+        CHECK(!d.service.numbers.count("CobaltSurvey,GfxPreflightCpStatus"));
+        CHECK(!d.service.numbers.count("CobaltSurvey,GfxPreflightGrbmStatus"));
+        CHECK(testState.gfxPreflightReads == 3);
+        CHECK(resumeSosWrites == testState.sosWrites);
         earlyInitResourceFree();
     }
     for (unsigned invalid=0;invalid<11;++invalid) {

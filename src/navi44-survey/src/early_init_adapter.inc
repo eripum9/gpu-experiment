@@ -1,5 +1,72 @@
 // Included after the standalone adapters. This is one synchronous capability-
 // guarded reset -> fresh discovery -> fixed eight-image SOS transaction.
+namespace gfxPreflight {
+// GC register indices come from Linux v6.19 gc_12_0_0_offset.h.
+// Restrict the GC reads to the target's captured BAR5 register addresses.
+// MP0 offsets are derived from the same segment as the verified SOS witness.
+struct Register {
+    const char *property;
+    uint16_t ip;
+    uint8_t segment;
+    uint32_t dword, expectedByteOffset;
+};
+constexpr Register registers[] = {
+    {"CobaltSurvey,GfxPreflightCpStatus", IpDiscovery::HwGc, 0, 0x0f40, 0x8680},
+    {"CobaltSurvey,GfxPreflightRlcBootloadStatus", IpDiscovery::HwGc, 1, 0x4e7c, 0x3b9f0},
+    {"CobaltSurvey,GfxPreflightGrbmStatus", IpDiscovery::HwGc, 0, 0x0da4, 0x8010},
+    {"CobaltSurvey,GfxPreflightGbAddrConfig", IpDiscovery::HwGc, 0, 0x13de, 0x98f8},
+    {"CobaltSurvey,GfxPreflightPspRingControl", IpDiscovery::HwMp0, 0, 0x80, 0},
+    {"CobaltSurvey,GfxPreflightPspRingWritePointer", IpDiscovery::HwMp0, 0, 0x83, 0},
+    {"CobaltSurvey,GfxPreflightPspRingAddressLow", IpDiscovery::HwMp0, 0, 0x85, 0},
+    {"CobaltSurvey,GfxPreflightPspRingAddressHigh", IpDiscovery::HwMp0, 0, 0x86, 0},
+    {"CobaltSurvey,GfxPreflightPspRingSize", IpDiscovery::HwMp0, 0, 0x87, 0},
+    {"CobaltSurvey,GfxPreflightPspSosAlive", IpDiscovery::HwMp0, 0, 0x91, 0},
+};
+constexpr unsigned count = sizeof(registers) / sizeof(registers[0]);
+constexpr unsigned sosIndex = count - 1;
+constexpr const char *statusKey = "CobaltSurvey,GfxPreflightStatus";
+struct Observation {
+    const char *status {"not-attempted"};
+    uint32_t offsets[count] {};
+    uint32_t samples[2][count] {};
+};
+
+void clear(IOService *service) {
+    service->removeProperty(statusKey);
+    for (const auto &reg : registers) service->removeProperty(reg.property);
+}
+
+void resolve(const IpDiscovery &discovery, const Aperture &mmio, uint32_t sosOffset, Observation &out) {
+    out.status = "register-layout-refused";
+    for (unsigned i = 0; i < count; ++i) {
+        const auto &reg = registers[i];
+        uint32_t offset = 0;
+        if (!discovery.regByteOffset(reg.ip, 0, reg.segment, reg.dword, offset) ||
+            (offset & 3u) || offset > mmio.length || sizeof(uint32_t) > mmio.length - offset ||
+            (reg.expectedByteOffset && reg.expectedByteOffset != offset) ||
+            (reg.ip == IpDiscovery::HwMp0 && (offset & ~0xfffu) != (sosOffset & ~0xfffu))) return;
+        out.offsets[i] = offset;
+    }
+    if (out.offsets[sosIndex] == sosOffset) out.status = nullptr;
+}
+
+void publish(IOService *service, const Observation &out) {
+    if (out.status) {
+        service->setProperty(statusKey, out.status);
+        return;
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        const uint64_t samples = out.samples[0][i] | (static_cast<uint64_t>(out.samples[1][i]) << 32);
+        if (!service->setProperty(registers[i].property, samples, 64)) {
+            clear(service);
+            service->setProperty(statusKey, "metadata-publication-failed");
+            return;
+        }
+    }
+    if (!service->setProperty(statusKey, "observed")) clear(service);
+}
+} // namespace gfxPreflight
+
 struct EarlyInitContext {
     // Class-specific placement construction keeps all default result values
     // without requiring a large aggregate temporary on the kernel stack.
@@ -14,6 +81,7 @@ struct EarlyInitContext {
     ConsoleObservation console {};
     ApertureProof apertureProof {};
     KdbProof firmwareProof {};
+    gfxPreflight::Observation gfx {};
     uint8_t *fresh {nullptr};
     uint32_t mib {0};
     const char *status {"early-prerequisites-unavailable"};
@@ -27,6 +95,7 @@ struct EarlyInitContext {
 };
 
 void clearEarlyInitProperties(IOService *service) {
+    gfxPreflight::clear(service);
     const char *names[] = {"Requested", "Trigger", "Attempted", "Phase", "Status", "Success",
         "ColdCycleReplacementValidated", "ConsoleRePauseAttempted", "ConsoleRePaused",
         "DiscoveryVerified", "DiscoveryDataReads", "DiscoverySelectorWrites"};
@@ -134,6 +203,7 @@ COBALT_SURVEY_NOINLINE bool earlyInitRefresh(IOService *service, IOPCIDevice *pc
         context.prior.values[0] != 0x80000000u || context.prior.values[1] != 0) {
         context.status = "post-reset-state-invalid"; return false;
     }
+    gfxPreflight::resolve(discovery, mmio, context.firmwareProof.offsets[1], context.gfx);
     context.discoveryVerified = true;
     return true;
 }
@@ -177,6 +247,44 @@ COBALT_SURVEY_NOINLINE bool earlyInitPostflight(IOService *service, IOPCIDevice 
         }
     }
     return earlyInitGuard(service, pci, context);
+}
+
+// The previous postflight and console resume must succeed first. Keep this
+// observation inside the same provider session, with no selector or MMIO writes.
+COBALT_SURVEY_NOINLINE void readGfxPreflight(IOService *service, IOPCIDevice *pci, EarlyInitContext &context) {
+    auto &out = context.gfx;
+    if (out.status) return;
+    for (auto &pass : out.samples) {
+        for (unsigned i = 0; i < gfxPreflight::count; ++i) {
+            if (!earlyInitGuard(service, pci, context)) {
+                out.status = "context-changed"; return;
+            }
+            const uint32_t offset = out.offsets[i];
+            Map page;
+            if (!page.create(context.mmio, offset & ~0xfffu, 4096) ||
+                !page.bytes() || (reinterpret_cast<uintptr_t>(page.bytes()) & 3u)) {
+                out.status = "register-map-failed"; return;
+            }
+            if (!earlyInitGuard(service, pci, context)) {
+                out.status = "context-changed"; return;
+            }
+            const auto *word = reinterpret_cast<const volatile uint32_t *>(page.bytes() + (offset & 0xfffu));
+#if defined(COBALT_SURVEY_HOSTTEST)
+            pass[i] = cobaltSurveyTestReadState32(const_cast<volatile uint32_t *>(word), offset);
+#else
+            pass[i] = *word;
+#endif
+            if (!earlyInitGuard(service, pci, context)) {
+                out.status = "context-changed"; return;
+            }
+            if (pass[i] == UINT32_MAX) {
+                out.status = "register-unreadable"; return;
+            }
+            if (i == gfxPreflight::sosIndex && pass[i] != context.sos.finalSosRaw) {
+                out.status = "sos-witness-changed"; return;
+            }
+        }
+    }
 }
 
 COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice *pci,
@@ -231,6 +339,7 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     }
     context.success = true;
     context.status = "reset-and-sos-transition-observed";
+    readGfxPreflight(service, pci, context);
 }
 
 COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContext *context,
@@ -244,6 +353,7 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     }
     const bool success = context && context->success && context->reset.protocol.success &&
         context->reset.consoleRecovered && context->reset.consolePaused && context->reset.consoleResumed && context->sos.success;
+    if (success) gfxPreflight::publish(service, context->gfx);
 #define EARLY_PROPERTY(name, value) published = service->setProperty("CobaltSurvey,EarlyInit" name, value) && published
     EARLY_PROPERTY("Requested", initBootSelected());
     EARLY_PROPERTY("Trigger", "early-boot");
@@ -258,7 +368,7 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoveryDataReads", context ? context->discoveryReads : 0u, 32) && published;
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoverySelectorWrites", context ? context->discoverySelectorWrites : 0u, 32) && published;
 #undef EARLY_PROPERTY
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.13.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.14.0") && published;
     published = service->setProperty("CobaltSurvey,AccessMode", "early-mode1-and-sos-initialization") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;

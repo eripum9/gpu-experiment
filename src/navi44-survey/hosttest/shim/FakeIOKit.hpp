@@ -163,6 +163,8 @@ struct TestState {
     volatile uint32_t *kdbMailboxPage = nullptr;
     std::vector<uint32_t> kdbStateOffsets = {0x458c, 0x4644, 0xa950, 0xa954, 0xad1c, 0x5d14};
     unsigned stateReads = 0;
+    std::vector<uint32_t> gfxPreflightOffsets;
+    unsigned gfxPreflightReads = 0;
     std::vector<std::pair<uint64_t, IOOptionBits>> stateMapRequests;
     std::vector<std::pair<uint64_t, uintptr_t>> stateMapBases;
     std::vector<std::pair<uint32_t, uint32_t>> stateEvents;
@@ -921,14 +923,20 @@ inline uint32_t cobaltSurveyTestRead32(volatile uint32_t *address) {
     return value;
 }
 inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t offset) {
+    const bool gfxPreflightRead = earlyInitPathActive() && testState.earlyInitMarker &&
+        testState.consoleResumeCalls == 1 && testState.earlyInitPhase >= 4 &&
+        testState.mapsLive == 1 &&
+        std::find(testState.gfxPreflightOffsets.begin(), testState.gfxPreflightOffsets.end(), offset) !=
+            testState.gfxPreflightOffsets.end();
     const bool expectedMaps = testState.mapsLive == 2 || testState.mapsLive == 4 ||
         (earlyInitPathActive() && testState.openLive == 1 && testState.earlyInitMarker && testState.mapsLive == 3) ||
+        gfxPreflightRead ||
         (stagingPhase() && testState.mapsLive >= 4 && testState.mapsLive <= 8) ||
         (testState.preSosEnabled && (testState.mapsLive == 12 || testState.mapsLive == 13)) ||
         (sosPathActive() && (testState.mapsLive == 13 || testState.mapsLive == 14));
     if (!testState.stateBootPresent || !expectedMaps ||
         (std::find(testState.stateAllowedOffsets.begin(), testState.stateAllowedOffsets.end(), offset) ==
-            testState.stateAllowedOffsets.end() && (!(testState.kdbEnabled || earlyInitPathActive()) ||
+            testState.stateAllowedOffsets.end() && !gfxPreflightRead && (!(testState.kdbEnabled || earlyInitPathActive()) ||
              std::find(testState.kdbStateOffsets.begin(), testState.kdbStateOffsets.end(), offset) == testState.kdbStateOffsets.end())))
         throw std::runtime_error("state MMIO outside fixed passive allowlist");
     const uint64_t page = offset & ~uint32_t(0xfff);
@@ -948,6 +956,7 @@ inline uint32_t cobaltSurveyTestReadState32(volatile uint32_t *address, uint32_t
         const uint32_t values[] = {0x11u, 0x22u, 0x33u, 0x44u};
         observed = values[testState.stateReads % 4];
     }
+    if (gfxPreflightRead) ++testState.gfxPreflightReads;
     const uint32_t actual = testState.stateRead ? testState.stateRead(offset, observed) : observed;
     testState.stateEvents.emplace_back(offset, actual);
     ++testState.stateReads;

@@ -25,7 +25,7 @@ refuse before indexed access. Default and standalone modes retain their
 separate gates. No userspace request starts this compound transaction.
 
 The native one-shot capture workflow is shared with the
-[early reset test](EARLY-MODE1-RESET.md), using a version 0.13.0 private plan
+[early reset test](EARLY-MODE1-RESET.md), using a version 0.14.0 private plan
 with `TestKind=reset-sos`. A missing `TestKind` selects the standalone Mode1
 capture contract; an unknown value is refused. The bootstrap remains passive.
 The background native-app USB permission probe must succeed before baseline
@@ -83,3 +83,27 @@ failure cannot retain a successful compound commit. Global `Ready` and
 startup. A successful checkpoint is firmware evidence, not authentication,
 graphics execution, a daily-driver stability claim or an established power-cycle
 replacement.
+
+## Graphics bring-up preflight
+
+Version 0.14.0 adds a read-only register snapshot after the successful
+console resume and its postflight check. The original provider session and
+peer checks still apply. The fresh discovery table resolves the GC 12.0.0
+registers to the target's known BAR5 addresses and resolves the PSP ring
+mailbox registers on the same page as the verified SOS register.
+
+`CobaltSurvey,GfxPreflightStatus=observed` commits the snapshot. Each
+`CobaltSurvey,GfxPreflight*` numeric property packs two 32-bit samples, with
+the first in the low half and the second in the high half. The samples cover
+CP status, RLC bootload status, GRBM status, GB address configuration, and
+PSP mailbox registers 64, 67, 69–71 and 81. Each SOS sample must match the
+live value observed after firmware startup. A bad layout, unreadable register,
+or changed context leaves the snapshot incomplete and the earlier firmware
+result intact.
+
+The PSP ring samples show the ready response and any preexisting ring state
+that a subsequent firmware loader would have to account for. CP status and
+the RLC bootload bit provide the same observations used by the
+[Linux GC12 autoload wait](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c).
+A later command test still requires a validated firmware load path, isolated
+queue memory, and proof that the command processor consumed the packet.

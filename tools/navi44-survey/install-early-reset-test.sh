@@ -148,7 +148,7 @@ case "$SYSTEM_UUID" in *[!0-9A-Fa-f-]*) fail 'invalid ExpectedSystemUUID';; esac
 REVISION=$(get_plan BuildRevision) || fail 'missing BuildRevision'
 case "$REVISION" in *[!0-9a-f]*) fail 'invalid BuildRevision';; esac
 [ "${#REVISION}" -eq 40 ] || fail 'invalid BuildRevision'
-[ "$(get_plan BundleVersion)" = 0.13.0 ] || fail 'unexpected client version'
+[ "$(get_plan BundleVersion)" = 0.14.0 ] || fail 'unexpected client version'
 if /usr/bin/plutil -extract TestKind raw -o - "$PLAN" >/dev/null 2>&1; then
     [ "$(/usr/bin/plutil -type TestKind "$PLAN" 2>/dev/null)" = string ] || fail 'malformed TestKind'
     TEST_KIND=$(get_plan TestKind) || fail 'malformed TestKind'
@@ -202,7 +202,7 @@ for _flag in cobalt-survey-initboot cobalt-survey-mode1 cobalt-survey-mode1boot 
 done
 DRIVERS=$(/usr/sbin/ioreg -r -c CobaltNavi44Survey -l 2>/dev/null) || fail 'cannot inspect survey service'
 case "$DRIVERS" in *'CobaltNavi44Survey'*) :;; *) fail 'Cobalt survey service is not loaded';; esac
-case "$DRIVERS" in *'CobaltSurvey,BuildVersion" = "0.13.0"'*) :;; *) fail 'loaded survey service is not build 0.13.0';; esac
+case "$DRIVERS" in *'CobaltSurvey,BuildVersion" = "0.14.0"'*) :;; *) fail 'loaded survey service is not build 0.14.0';; esac
 SERVICE_COUNT=$(printf '%s\n' "$DRIVERS" | /usr/bin/grep -c 'CobaltNavi44Survey  <class CobaltNavi44Survey' || true)
 [ "$SERVICE_COUNT" = 1 ] || fail 'expected exactly one Cobalt survey service'
 
