@@ -4611,7 +4611,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     removeProperty("CobaltSurvey,BuildVersion");
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
-    setProperty("CobaltSurvey,BuildVersion", "0.14.0");
+    setProperty("CobaltSurvey,BuildVersion", "0.15.0");
     setProperty("CobaltSurvey,Mode1ResetEarlyRequested", mode1BootSelected());
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);

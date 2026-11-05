@@ -3528,7 +3528,7 @@ static void mode1EarlyTests() {
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && quietObserved);
         CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
         CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
-        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.14.0");
+        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.15.0");
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetTrigger") == "early-boot");
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePauseAttempted") == 1);
@@ -4021,8 +4021,10 @@ static void mode1Tests() {
 }
 
 static constexpr uint32_t kGfxPreflightOffsets[] = {
-    0x8680, 0x3b9f0, 0x8010, 0x98f8, 0x1200, 0x120c, 0x1214, 0x1218, 0x121c, 0x1244
+    0x8680, 0x3b9f0, 0x8010, 0x98f8, 0x1200, 0x120c, 0x1214, 0x1218, 0x121c,
+    0xa990, 0xab3c, 0xab40, 0xabbc, 0xabc0, 0xac3c, 0xac40, 0xa96c, 0xa790, 0xa794, 0xa798, 0xa7f4, 0xa80c, 0xa964, 0xa968, 0xa95c, 0xa958, 0xa960, 0xa71c, 0xa950, 0xa954, 0x1244
 };
+static constexpr unsigned kGfxPreflightCount = sizeof(kGfxPreflightOffsets) / sizeof(kGfxPreflightOffsets[0]);
 static void earlyInitDevice(Device &d, bool nativeRoute=false, uint32_t gfxUnreadableOffset=0) {
     mode1Device(d);
     d.load(earlyInitGfxDiscoveryFixture());
@@ -4047,9 +4049,10 @@ static void earlyInitDevice(Device &d, bool nativeRoute=false, uint32_t gfxUnrea
                 testState.gfxPreflightOffsets.end()) {
             if (offset == gfxUnreadableOffset) return UINT32_MAX;
             const unsigned sample = testState.gfxPreflightReads - 1;
-            const unsigned pass = sample / 10;
-            const unsigned reg = sample % 10;
-            if (offset == kGfxPreflightOffsets[9]) return 0x17u;
+            const unsigned pass = sample / kGfxPreflightCount;
+            const unsigned reg = sample % kGfxPreflightCount;
+            if (offset == kGfxPreflightOffsets[kGfxPreflightCount - 1]) return 0x17u;
+            if (offset == kGfxPreflightOffsets[9]) return 0u;
             return (pass == 0 ? 0xa5000000u : 0x5a000000u) | reg;
         }
         if (offset == 0x1244 && testState.sosFinalStoreSeen) return 0x17u;
@@ -4098,17 +4101,39 @@ static void earlyInitTests() {
             "CobaltSurvey,GfxPreflightGrbmStatus", "CobaltSurvey,GfxPreflightGbAddrConfig",
             "CobaltSurvey,GfxPreflightPspRingControl", "CobaltSurvey,GfxPreflightPspRingWritePointer",
             "CobaltSurvey,GfxPreflightPspRingAddressLow", "CobaltSurvey,GfxPreflightPspRingAddressHigh",
-            "CobaltSurvey,GfxPreflightPspRingSize", "CobaltSurvey,GfxPreflightPspSosAlive"};
-        CHECK(testState.gfxPreflightReads == 20);
-        for (unsigned i = 0; i < 10; ++i) {
-            const uint64_t expected = i == 9 ? 0x1700000017ULL :
+            "CobaltSurvey,GfxPreflightPspRingSize",
+            "CobaltSurvey,GfxPreflightMmhubContext0Control",
+            "CobaltSurvey,GfxPreflightMmhubContext0PageTableBaseLow",
+            "CobaltSurvey,GfxPreflightMmhubContext0PageTableBaseHigh",
+            "CobaltSurvey,GfxPreflightMmhubContext0PageTableStartLow",
+            "CobaltSurvey,GfxPreflightMmhubContext0PageTableStartHigh",
+            "CobaltSurvey,GfxPreflightMmhubContext0PageTableEndLow",
+            "CobaltSurvey,GfxPreflightMmhubContext0PageTableEndHigh",
+            "CobaltSurvey,GfxPreflightMmhubL1TlbControl",
+            "CobaltSurvey,GfxPreflightMmhubL2Control",
+            "CobaltSurvey,GfxPreflightMmhubL2Control2",
+            "CobaltSurvey,GfxPreflightMmhubL2Control3",
+            "CobaltSurvey,GfxPreflightMmhubL2Control4",
+            "CobaltSurvey,GfxPreflightMmhubL2Control5",
+            "CobaltSurvey,GfxPreflightMmhubSystemApertureLow",
+            "CobaltSurvey,GfxPreflightMmhubSystemApertureHigh",
+            "CobaltSurvey,GfxPreflightMmhubAgpBottom",
+            "CobaltSurvey,GfxPreflightMmhubAgpTop",
+            "CobaltSurvey,GfxPreflightMmhubAgpBase",
+            "CobaltSurvey,GfxPreflightMmhubFbOffset",
+            "CobaltSurvey,GfxPreflightMmhubFbLocationBase",
+            "CobaltSurvey,GfxPreflightMmhubFbLocationTop", "CobaltSurvey,GfxPreflightPspSosAlive"};
+        static_assert(sizeof(gfxKeys) / sizeof(gfxKeys[0]) == kGfxPreflightCount, "preflight keys and offsets must match");
+        CHECK(testState.gfxPreflightReads == 2 * kGfxPreflightCount);
+        for (unsigned i = 0; i < kGfxPreflightCount; ++i) {
+            const uint64_t expected = i == kGfxPreflightCount - 1 ? 0x1700000017ULL : i == 9 ? 0 :
                 (uint64_t(0x5a000000u | i) << 32) | (0xa5000000u | i);
             CHECK(d.service.numbers.at(gfxKeys[i]) == expected);
         }
-        CHECK(testState.stateMapRequests.size() >= 20);
-        for (unsigned i = 0; i < 20; ++i) {
-            const auto &request = testState.stateMapRequests[testState.stateMapRequests.size() - 20 + i];
-            CHECK(request.first == (kGfxPreflightOffsets[i % 10] & ~0xfffu));
+        CHECK(testState.stateMapRequests.size() >= 2 * kGfxPreflightCount);
+        for (unsigned i = 0; i < 2 * kGfxPreflightCount; ++i) {
+            const auto &request = testState.stateMapRequests[testState.stateMapRequests.size() - 2 * kGfxPreflightCount + i];
+            CHECK(request.first == (kGfxPreflightOffsets[i % kGfxPreflightCount] & ~0xfffu));
             CHECK(request.second == (kIOMapAnywhere | kIOMapUnique | kIOMapReadOnly | kIOMapInhibitCache));
         }
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1);
@@ -4160,6 +4185,35 @@ static void earlyInitTests() {
         CHECK(!d.service.numbers.count("CobaltSurvey,GfxPreflightGrbmStatus"));
         CHECK(testState.gfxPreflightReads == 3);
         CHECK(resumeSosWrites == testState.sosWrites);
+        earlyInitResourceFree();
+    }
+    {
+        activeTestPhase = "earlyInit.mmhub-register-unreadable";
+        FirmwareOverrideScope firmware(fake);
+        Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d, false, kGfxPreflightOffsets[9]);
+        mode1Start(d);
+        CHECK(d.service.numbers.at("CobaltSurvey,EarlyInitSuccess") == 1);
+        CHECK(d.service.strings.at("CobaltSurvey,GfxPreflightStatus") == "register-unreadable");
+        CHECK(!d.service.numbers.count("CobaltSurvey,GfxPreflightMmhubContext0Control"));
+        CHECK(testState.gfxPreflightReads == 10);
+        CHECK(testState.mode1Writes.size() == 3 && testState.sosWrites == 16);
+        earlyInitResourceFree();
+    }
+    {
+        activeTestPhase = "earlyInit.fresh-mmhub-layout-change";
+        FirmwareOverrideScope firmware(fake);
+        Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d);
+        const Bytes fixture = earlyInitGfxDiscoveryFixture();
+        size_t ip = die + 4;
+        while ((fixture[ip] | (uint16_t(fixture[ip + 1]) << 8)) != IpDiscovery::HwMmhub)
+            ip += 8 + static_cast<size_t>(fixture[ip + 3]) * 4;
+        const unsigned baseWord = static_cast<unsigned>((ip + 8) / 4);
+        testState.dataRead = [baseWord](unsigned index, uint32_t value) {
+            return index >= 5120 && index % 2560 == baseWord ? value ^ 0x100u : value;
+        };
+        CHECK(d.service.start(&d.pci));
+        CHECK(d.service.strings.at("CobaltSurvey,EarlyInitStatus") == "post-reset-discovery-changed");
+        CHECK(testState.sosWrites == 0 && testState.gfxPreflightReads == 0);
         earlyInitResourceFree();
     }
     for (unsigned invalid=0;invalid<11;++invalid) {

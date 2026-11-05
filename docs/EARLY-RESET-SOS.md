@@ -25,7 +25,7 @@ refuse before indexed access. Default and standalone modes retain their
 separate gates. No userspace request starts this compound transaction.
 
 The native one-shot capture workflow is shared with the
-[early reset test](EARLY-MODE1-RESET.md), using a version 0.14.0 private plan
+[early reset test](EARLY-MODE1-RESET.md), using a version 0.15.0 private plan
 with `TestKind=reset-sos`. A missing `TestKind` selects the standalone Mode1
 capture contract; an unknown value is refused. The bootstrap remains passive.
 The background native-app USB permission probe must succeed before baseline
@@ -101,6 +101,19 @@ live value observed after firmware startup. A bad layout, unreadable register,
 or changed context leaves the snapshot incomplete and the earlier firmware
 result intact.
 
+Version 0.15.0 extends this same post-resume snapshot with the MMHUB 4.1.0
+VMID0 page-table base, range and control, framebuffer location/offset,
+system and AGP apertures, and L1/L2 translation controls. Register indices
+and segments follow the
+[Linux MMHUB 4.1.0 definitions](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_4_1_0_offset.h).
+The new reads use fresh discovery, read-only mappings and the existing
+ownership and PCI guards. They add no adapter writes.
+
+The two samples are observations and may differ; compare their halves before
+using a configuration. `observed` commits the captured values, not a working
+GPU memory mapping. All-ones reads are refused. Only the SOS witness is
+required to match the firmware startup result in both passes.
+
 The PSP ring samples show the ready response and any preexisting ring state
 that a subsequent firmware loader would have to account for. CP status and
 the RLC bootload bit provide the same observations used by the
@@ -128,3 +141,12 @@ a buffer object for its ring. The older Cobalt path uses a fixed VRAM offset,
 which is insufficient evidence that the survey owns that page.
 [Linux PSP buffer allocation](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c)
 and [Linux PSP v14 ring protocol](https://github.com/torvalds/linux/blob/v6.19/drivers/gpu/drm/amd/amdgpu/psp_v14_0.c).
+
+A host RAM allocation and its DMA address alone also cannot satisfy the ring
+lease. It needs an owned GPU page-table mapping, or another verified route by
+which the PSP can reach that allocation. The older GMC setup zeroes a fixed
+VRAM page-table location and changes apertures, L1/L2 controls and VMID0; it
+cannot be adopted as a single-page mapping helper. The MMHUB snapshot records
+those settings before designing that binding. It neither reserves an existing
+page-table entry nor proves that a host-resident page table is supported.
+The ring create/stop protocol remains a host test in this revision.

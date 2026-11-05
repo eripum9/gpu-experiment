@@ -21,7 +21,7 @@ enum class Register { AddressLow, AddressHigh, Size, Control };
 // The adapter must hold exclusive hardware access for the whole transaction.
 // It must guard each read and write against a lost device or changed owner.
 // A lease means the adapter owns a dedicated, verified zero page, visible to
-// the PSP at its framebuffer aperture address. A planned BAR range alone
+// the PSP at a verified GPU address. A DMA/physical address or planned BAR range alone
 // cannot satisfy this contract. No SOS staging page may be leased here.
 struct Io {
     virtual ~Io() = default;

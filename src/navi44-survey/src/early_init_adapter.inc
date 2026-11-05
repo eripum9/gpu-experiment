@@ -4,6 +4,8 @@ namespace gfxPreflight {
 // GC register indices come from Linux v6.19 gc_12_0_0_offset.h.
 // Restrict the GC reads to the target's captured BAR5 register addresses.
 // MP0 offsets are derived from the same segment as the verified SOS witness.
+// MMHUB indices and segment 0 are from Linux v6.19 mmhub_4_1_0_offset.h;
+// the segment base is anchored to the fresh validated passive-state observation.
 struct Register {
     const char *property;
     uint16_t ip;
@@ -20,6 +22,27 @@ constexpr Register registers[] = {
     {"CobaltSurvey,GfxPreflightPspRingAddressLow", IpDiscovery::HwMp0, 0, 0x85, 0},
     {"CobaltSurvey,GfxPreflightPspRingAddressHigh", IpDiscovery::HwMp0, 0, 0x86, 0},
     {"CobaltSurvey,GfxPreflightPspRingSize", IpDiscovery::HwMp0, 0, 0x87, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0Control", IpDiscovery::HwMmhub, 0, 0x0564, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0PageTableBaseLow", IpDiscovery::HwMmhub, 0, 0x05cf, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0PageTableBaseHigh", IpDiscovery::HwMmhub, 0, 0x05d0, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0PageTableStartLow", IpDiscovery::HwMmhub, 0, 0x05ef, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0PageTableStartHigh", IpDiscovery::HwMmhub, 0, 0x05f0, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0PageTableEndLow", IpDiscovery::HwMmhub, 0, 0x060f, 0},
+    {"CobaltSurvey,GfxPreflightMmhubContext0PageTableEndHigh", IpDiscovery::HwMmhub, 0, 0x0610, 0},
+    {"CobaltSurvey,GfxPreflightMmhubL1TlbControl", IpDiscovery::HwMmhub, 0, 0x055b, 0},
+    {"CobaltSurvey,GfxPreflightMmhubL2Control", IpDiscovery::HwMmhub, 0, 0x04e4, 0},
+    {"CobaltSurvey,GfxPreflightMmhubL2Control2", IpDiscovery::HwMmhub, 0, 0x04e5, 0},
+    {"CobaltSurvey,GfxPreflightMmhubL2Control3", IpDiscovery::HwMmhub, 0, 0x04e6, 0},
+    {"CobaltSurvey,GfxPreflightMmhubL2Control4", IpDiscovery::HwMmhub, 0, 0x04fd, 0},
+    {"CobaltSurvey,GfxPreflightMmhubL2Control5", IpDiscovery::HwMmhub, 0, 0x0503, 0},
+    {"CobaltSurvey,GfxPreflightMmhubSystemApertureLow", IpDiscovery::HwMmhub, 0, 0x0559, 0},
+    {"CobaltSurvey,GfxPreflightMmhubSystemApertureHigh", IpDiscovery::HwMmhub, 0, 0x055a, 0},
+    {"CobaltSurvey,GfxPreflightMmhubAgpBottom", IpDiscovery::HwMmhub, 0, 0x0557, 0},
+    {"CobaltSurvey,GfxPreflightMmhubAgpTop", IpDiscovery::HwMmhub, 0, 0x0556, 0},
+    {"CobaltSurvey,GfxPreflightMmhubAgpBase", IpDiscovery::HwMmhub, 0, 0x0558, 0},
+    {"CobaltSurvey,GfxPreflightMmhubFbOffset", IpDiscovery::HwMmhub, 0, 0x04c7, 0},
+    {"CobaltSurvey,GfxPreflightMmhubFbLocationBase", IpDiscovery::HwMmhub, 0, 0x0554, 0},
+    {"CobaltSurvey,GfxPreflightMmhubFbLocationTop", IpDiscovery::HwMmhub, 0, 0x0555, 0},
     {"CobaltSurvey,GfxPreflightPspSosAlive", IpDiscovery::HwMp0, 0, 0x91, 0},
 };
 constexpr unsigned count = sizeof(registers) / sizeof(registers[0]);
@@ -36,14 +59,19 @@ void clear(IOService *service) {
     for (const auto &reg : registers) service->removeProperty(reg.property);
 }
 
-void resolve(const IpDiscovery &discovery, const Aperture &mmio, uint32_t sosOffset, Observation &out) {
+void resolve(const IpDiscovery &discovery, const Aperture &mmio, uint32_t sosOffset, uint32_t mmhubFbBaseOffset, Observation &out) {
     out.status = "register-layout-refused";
+    constexpr uint32_t fbBaseBytes = 0x554u * 4u;
+    if (mmhubFbBaseOffset < fbBaseBytes) return;
+    const uint32_t mmhubBase = mmhubFbBaseOffset - fbBaseBytes;
     for (unsigned i = 0; i < count; ++i) {
         const auto &reg = registers[i];
         uint32_t offset = 0;
         if (!discovery.regByteOffset(reg.ip, 0, reg.segment, reg.dword, offset) ||
             (offset & 3u) || offset > mmio.length || sizeof(uint32_t) > mmio.length - offset ||
             (reg.expectedByteOffset && reg.expectedByteOffset != offset) ||
+            (reg.ip == IpDiscovery::HwMmhub &&
+                (reg.dword > (UINT32_MAX - mmhubBase) / 4u || offset != mmhubBase + reg.dword * 4u)) ||
             (reg.ip == IpDiscovery::HwMp0 && (offset & ~0xfffu) != (sosOffset & ~0xfffu))) return;
         out.offsets[i] = offset;
     }
@@ -203,7 +231,7 @@ COBALT_SURVEY_NOINLINE bool earlyInitRefresh(IOService *service, IOPCIDevice *pc
         context.prior.values[0] != 0x80000000u || context.prior.values[1] != 0) {
         context.status = "post-reset-state-invalid"; return false;
     }
-    gfxPreflight::resolve(discovery, mmio, context.firmwareProof.offsets[1], context.gfx);
+    gfxPreflight::resolve(discovery, mmio, context.firmwareProof.offsets[1], context.prior.offsets[2], context.gfx);
     context.discoveryVerified = true;
     return true;
 }
@@ -368,7 +396,7 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoveryDataReads", context ? context->discoveryReads : 0u, 32) && published;
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoverySelectorWrites", context ? context->discoverySelectorWrites : 0u, 32) && published;
 #undef EARLY_PROPERTY
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.14.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.15.0") && published;
     published = service->setProperty("CobaltSurvey,AccessMode", "early-mode1-and-sos-initialization") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;
