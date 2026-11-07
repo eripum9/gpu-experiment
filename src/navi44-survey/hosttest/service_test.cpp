@@ -3528,7 +3528,7 @@ static void mode1EarlyTests() {
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && quietObserved);
         CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
         CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
-        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.15.0");
+        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.16.0");
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetTrigger") == "early-boot");
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePauseAttempted") == 1);

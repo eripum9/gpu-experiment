@@ -25,7 +25,7 @@ refuse before indexed access. Default and standalone modes retain their
 separate gates. No userspace request starts this compound transaction.
 
 The native one-shot capture workflow is shared with the
-[early reset test](EARLY-MODE1-RESET.md), using a version 0.15.0 private plan
+[early reset test](EARLY-MODE1-RESET.md), using a version 0.16.0 private plan
 with `TestKind=reset-sos`. A missing `TestKind` selects the standalone Mode1
 capture contract; an unknown value is refused. The bootstrap remains passive.
 The background native-app USB permission probe must succeed before baseline
@@ -150,3 +150,11 @@ cannot be adopted as a single-page mapping helper. The MMHUB snapshot records
 those settings before designing that binding. It neither reserves an existing
 page-table entry nor proves that a host-resident page table is supported.
 The ring create/stop protocol remains a host test in this revision.
+
+Version 0.16.0 prepares a candidate host-resident table after the observed
+inactive VMID0 state. It obtains two distinct, aligned 4 KiB DMA pages
+through IOKit and fills the table with one data-only GFX12 PTE. The candidate
+GPU address sits above the framebuffer aperture. `CobaltSurvey,PspDmaPlanStatus`
+records whether preparation succeeded. The allocations are scoped to the
+preparation step. A later device transfer must prove the MMHUB can walk this
+table and establish quiescence before releasing an exposed page.

@@ -23,6 +23,9 @@
 #include "mode1_reset.hpp"
 #if defined(COBALT_SURVEY_HOSTTEST)
 #include <atomic>
+#else
+#include "psp_dma_page.hpp"
+#include "psp_mmhub_layout.hpp"
 #endif
 
 #if defined(_MSC_VER)
@@ -4611,7 +4614,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     removeProperty("CobaltSurvey,BuildVersion");
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
-    setProperty("CobaltSurvey,BuildVersion", "0.15.0");
+    setProperty("CobaltSurvey,BuildVersion", "0.16.0");
     setProperty("CobaltSurvey,Mode1ResetEarlyRequested", mode1BootSelected());
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);

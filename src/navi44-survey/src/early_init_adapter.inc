@@ -113,6 +113,7 @@ struct EarlyInitContext {
     uint8_t *fresh {nullptr};
     uint32_t mib {0};
     const char *status {"early-prerequisites-unavailable"};
+    const char *dmaPlanStatus {"not-attempted"};
     bool attempted {false}, success {false}, published {true};
     bool consoleRePauseAttempted {false}, consoleRePaused {false};
     bool discoveryVerified {false};
@@ -124,6 +125,7 @@ struct EarlyInitContext {
 
 void clearEarlyInitProperties(IOService *service) {
     gfxPreflight::clear(service);
+    service->removeProperty("CobaltSurvey,PspDmaPlanStatus");
     const char *names[] = {"Requested", "Trigger", "Attempted", "Phase", "Status", "Success",
         "ColdCycleReplacementValidated", "ConsoleRePauseAttempted", "ConsoleRePaused",
         "DiscoveryVerified", "DiscoveryDataReads", "DiscoverySelectorWrites"};
@@ -315,6 +317,46 @@ COBALT_SURVEY_NOINLINE void readGfxPreflight(IOService *service, IOPCIDevice *pc
     }
 }
 
+#if !defined(COBALT_SURVEY_HOSTTEST)
+// Allocate the two pages and populate the prospective table before adding
+// any device programming. Both pages are released while still unpublished.
+COBALT_SURVEY_NOINLINE void preparePspDmaLayout(IOService *service, IOPCIDevice *pci,
+    EarlyInitContext &context) {
+    const auto &observation = context.gfx;
+    context.dmaPlanStatus = "mapping-context-unavailable";
+    if (observation.status || !earlyInitGuard(service, pci, context)) return;
+    const auto readMmhub = [&observation](uint32_t dword) {
+        for (unsigned i = 0; i < gfxPreflight::count; ++i) {
+            const auto &reg = gfxPreflight::registers[i];
+            if (reg.ip == IpDiscovery::HwMmhub && reg.dword == dword &&
+                observation.samples[0][i] == observation.samples[1][i])
+                return observation.samples[0][i];
+        }
+        return UINT32_MAX;
+    };
+    // Check for the captured inactive VMID0 context with no table installed.
+    constexpr uint32_t tableRegisters[] = {0x05cf, 0x05d0, 0x05ef, 0x05f0, 0x060f, 0x0610};
+    if (readMmhub(0x0564) != 0x03fffc00) return;
+    for (uint32_t dword : tableRegisters) if (readMmhub(dword) != 0) return;
+
+    cobalt::PspDmaPage table, data;
+    context.dmaPlanStatus = "dma-lease-refused";
+    if (!table.allocate(pci) || !data.allocate(pci)) return;
+    if (!earlyInitGuard(service, pci, context)) {
+        context.dmaPlanStatus = "mapping-context-changed";
+        return;
+    }
+    cobalt::survey::pspMemory::Layout layout {};
+    context.dmaPlanStatus = "table-layout-refused";
+    if (!cobalt::survey::pspMemory::makeLayout(table.deviceAddress().value,
+        data.deviceAddress().value, readMmhub(0x0554), readMmhub(0x0555), layout)) return;
+    context.dmaPlanStatus = "table-sync-failed";
+    if (!table.initializeTable(layout.leaf)) return;
+    context.dmaPlanStatus = earlyInitGuard(service, pci, context) ?
+        "host-table-prepared" : "mapping-context-changed";
+}
+#endif
+
 COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice *pci,
     OSData *retained, EarlyInitContext &context) {
     if (!initBootFlagsValid() || !retained || retained->getLength() != kDiscoverySize ||
@@ -368,6 +410,9 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     context.success = true;
     context.status = "reset-and-sos-transition-observed";
     readGfxPreflight(service, pci, context);
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    preparePspDmaLayout(service, pci, context);
+#endif
 }
 
 COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContext *context,
@@ -381,7 +426,10 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     }
     const bool success = context && context->success && context->reset.protocol.success &&
         context->reset.consoleRecovered && context->reset.consolePaused && context->reset.consoleResumed && context->sos.success;
-    if (success) gfxPreflight::publish(service, context->gfx);
+    if (success) {
+        gfxPreflight::publish(service, context->gfx);
+        published = service->setProperty("CobaltSurvey,PspDmaPlanStatus", context->dmaPlanStatus) && published;
+    }
 #define EARLY_PROPERTY(name, value) published = service->setProperty("CobaltSurvey,EarlyInit" name, value) && published
     EARLY_PROPERTY("Requested", initBootSelected());
     EARLY_PROPERTY("Trigger", "early-boot");
@@ -396,7 +444,7 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoveryDataReads", context ? context->discoveryReads : 0u, 32) && published;
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoverySelectorWrites", context ? context->discoverySelectorWrites : 0u, 32) && published;
 #undef EARLY_PROPERTY
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.15.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.16.0") && published;
     published = service->setProperty("CobaltSurvey,AccessMode", "early-mode1-and-sos-initialization") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;

@@ -163,7 +163,7 @@ print(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+str(path))
  echo 'driver-ioreg' >> "$TRACE"
  [ "${DRIVER_MISSING-0}" != 1 ] || { echo 'ioreg driver missing' >&2; exit 7; }
  echo '+-o CobaltNavi44Survey  <class CobaltNavi44Survey, id 0x1>'
- echo '\"CobaltSurvey,BuildVersion\" = \"0.15.0\"'
+ echo '\"CobaltSurvey,BuildVersion\" = \"0.16.0\"'
  if [ "${TEST_KIND-mode1}" = reset-sos ]; then
   echo '\"CobaltSurvey,EarlyInitRequested\" = Yes'
   echo '\"CobaltSurvey,EarlyInitTrigger\" = \"early-boot\"'
@@ -231,7 +231,7 @@ esac
         launcher.chmod(0o755)
         (source_app / "Info.plist").write_bytes(plistlib.dumps(dict(CFBundleVersion="1.0.0")))
         (source_app / "_CodeSignature" / "CodeResources").write_bytes(b"fixture signature")
-        self.values = dict(PlanVersion=1, BundleVersion="0.15.0", TestKind="mode1", BuildRevision="0123456789abcdef0123456789abcdef01234567",
+        self.values = dict(PlanVersion=1, BundleVersion="0.16.0", TestKind="mode1", BuildRevision="0123456789abcdef0123456789abcdef01234567",
                            SessionID=SESSION, PartitionGUID=PARTITION, ExpectedSystemUUID=SYSTEM_UUID)
         for name, content, key in (("config-baseline.plist", b"base\n", "BaselineConfigSHA256"),
                                    ("config-bootstrap.plist", b"bootstrap\n", "BootstrapConfigSHA256"),
@@ -511,7 +511,7 @@ esac
         self.assertIn("driver_ioreg_exit=7", receipt)
         self.assertIn("test_kind=mode1", receipt)
         self.assertIn("expected_trigger=early-boot", receipt)
-        self.assertIn("expected_build_version=0.15.0", receipt)
+        self.assertIn("expected_build_version=0.16.0", receipt)
         self.assertTrue((self.session_dir / ("completion-" + SESSION + ".txt")).exists())
         self.assertIn("client:--inspect-peers", self.events())
         self.assertNotIn("client:--run", self.events())
@@ -526,7 +526,7 @@ esac
         receipt = (self.resident / ("completion-" + SESSION + ".txt")).read_text()
         self.assertIn("test_kind=reset-sos", receipt)
         self.assertIn("expected_trigger=early-boot", receipt)
-        self.assertIn("expected_build_version=0.15.0", receipt)
+        self.assertIn("expected_build_version=0.16.0", receipt)
         self.assertIn("early_requested=yes", receipt)
         self.assertIn("EarlyInitRequested", (self.session_dir / "early-driver-ioreg.txt").read_text())
         self.assertEqual(self.config.read_bytes(), b"base\n")

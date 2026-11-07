@@ -136,7 +136,7 @@ bool publishMode1(IOService *service, const Mode1AdapterResult &result, bool com
 #undef MODE1_BOOL
 #undef MODE1_NUM
     published = service->setProperty("CobaltSurvey,AccessMode", "smu-debug-mode1-reset") && published;
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.15.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.16.0") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;
     // Indexed boot collection already used selector stores, including when

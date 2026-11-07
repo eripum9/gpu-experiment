@@ -1,4 +1,5 @@
 #include "../src/psp_ring_checkpoint.hpp"
+#include "../src/psp_mmhub_layout.hpp"
 
 #include <cstdio>
 #include <stdexcept>
@@ -7,6 +8,7 @@
 #include <vector>
 
 namespace ring = cobalt::survey::pspRing;
+namespace memory = cobalt::survey::pspMemory;
 using Register = ring::Register;
 
 #define CHECK(expr) do { if (!(expr)) throw std::runtime_error( \
@@ -77,6 +79,24 @@ struct Bus final : ring::Io {
 };
 
 int main() try {
+    {
+        constexpr uint64_t table = 0x12345000, data = 0x2468b000;
+        memory::Layout layout {};
+        CHECK(memory::makeLayout(table, data, 0x8000, 0x83fb, layout));
+        CHECK(layout.tableBase == 0x12345007ULL);
+        CHECK(layout.leaf == 0x808000002468b067ULL);
+        CHECK(layout.gpuAddress == 0x8400000000ULL);
+
+        // Refuse aliasing, truncation and overflow before a root or leaf
+        // encoding can become available to a future register transaction.
+        CHECK(!memory::makeLayout(table, table, 0x8000, 0x83fb, layout));
+        CHECK(layout.tableBase == 0 && layout.leaf == 0 && layout.gpuAddress == 0);
+        CHECK(!memory::makeLayout(table + 1, data, 0x8000, 0x83fb, layout));
+        CHECK(!memory::makeLayout(table, 1ULL << 48, 0x8000, 0x83fb, layout));
+        CHECK(!memory::makeLayout(table, data, 0x8000, 0xffffff, layout));
+        CHECK(!memory::makeLayout(table, 0x8400000000ULL, 0x8000, 0x83fb, layout));
+        CHECK(!memory::makeLayout(table, data, 0x83fb, 0x8000, layout));
+    }
     {
         Bus bus;
         const auto result = ring::run(bus, kSos);
