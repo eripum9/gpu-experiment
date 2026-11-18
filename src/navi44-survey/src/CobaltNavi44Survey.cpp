@@ -25,7 +25,7 @@
 #include <atomic>
 #else
 #include "psp_dma_page.hpp"
-#include "psp_mmhub_layout.hpp"
+#include "psp_mmhub_copy.hpp"
 #endif
 
 #if defined(_MSC_VER)
@@ -112,6 +112,13 @@ bool initBootSelected() {
     return PE_parse_boot_argn("cobalt-survey-initboot", &value, sizeof(value)) && value != 0;
 }
 
+uint32_t dmaCopyBootValue() {
+    uint32_t value = 0;
+    return PE_parse_boot_argn("cobalt-survey-dmacopy", &value, sizeof(value)) ? value : 0;
+}
+
+bool dmaCopyBootArmed() { return dmaCopyBootValue() == 1; }
+
 bool initBootFlagsValid() {
     uint32_t value = 0;
     if (!armed() || !indexedArmed() || !stateArmed() ||
@@ -123,7 +130,7 @@ bool initBootFlagsValid() {
         value = 0;
         if (PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0) return false;
     }
-    return true;
+    return dmaCopyBootValue() <= 1;
 }
 
 bool mode1FlagsValid() {
@@ -408,6 +415,11 @@ public:
     bool createMode1DebugPage(const Aperture &a, const Mode1DebugTarget &target) {
         return target.valid() && createPolicy(a, target.page(), 4096, true);
     }
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    bool createDmaCopyPage(const Aperture &a, bool lsdma) {
+        return createPolicy(a, lsdma ? 0x45000 : 0x69000, 4096, true);
+    }
+#endif
 private:
     bool createPolicy(const Aperture &a, uint64_t offset, uint64_t length, bool indexed) {
         requestedOptions = indexed ? (kMapOptions & ~kIOMapReadOnly) : kMapOptions;
@@ -837,6 +849,7 @@ public:
         return guard();
     }
     bool firmwareAuthorized() const { return phase == Firmware && resetClaimed && guard(); }
+    bool copyAuthorized() const { return phase == Postflight && dmaCopyBootArmed() && guard(); }
     bool claimFirmware() {
         if (!firmwareAuthorized() || firmwareClaimed || !pci->setProperty("CobaltSurvey,SosBootAttempt-v1", marker)) return false;
         firmwareClaimed = true;
@@ -4614,7 +4627,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     removeProperty("CobaltSurvey,BuildVersion");
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
-    setProperty("CobaltSurvey,BuildVersion", "0.16.0");
+    setProperty("CobaltSurvey,BuildVersion", "0.17.0");
     setProperty("CobaltSurvey,Mode1ResetEarlyRequested", mode1BootSelected());
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);
@@ -4626,7 +4639,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitStatus", initBootSelected() ? "awaiting-prerequisites" : "not-requested") && earlyStartupPublished;
     earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitSuccess", false) && earlyStartupPublished;
     earlyStartupPublished = setProperty("CobaltSurvey,EarlyInitColdCycleReplacementValidated", false) && earlyStartupPublished;
-    if (initBootSelected() && (!initBootFlagsValid() || !earlyStartupPublished)) {
+    if ((initBootSelected() || dmaCopyBootValue()) && (!initBootFlagsValid() || !earlyStartupPublished)) {
         setProperty("CobaltSurvey,EarlyInitStatus", earlyStartupPublished ? "mixed-or-invalid-boot-flags" : "metadata-publication-failed");
         status("early-init-flags-refused"); registerService(); return true;
     }

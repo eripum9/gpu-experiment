@@ -3528,7 +3528,7 @@ static void mode1EarlyTests() {
         CHECK(testState.mode1Writes.size() == 3 && testState.mode1SleepCalls == 1 && quietObserved);
         CHECK(testState.mode1SaveCalls == 1 && testState.mode1RestoreCalls == 1);
         CHECK(testState.consolePauseCalls == 1 && testState.consoleResumeCalls == 1 && !testState.consolePaused);
-        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.16.0");
+        CHECK(d.service.strings.at("CobaltSurvey,BuildVersion") == "0.17.0");
         CHECK(d.service.strings.at("CobaltSurvey,Mode1ResetTrigger") == "early-boot");
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetEarlyRequested") == 1);
         CHECK(d.service.numbers.at("CobaltSurvey,Mode1ResetConsolePauseAttempted") == 1);
@@ -4216,7 +4216,7 @@ static void earlyInitTests() {
         CHECK(testState.sosWrites == 0 && testState.gfxPreflightReads == 0);
         earlyInitResourceFree();
     }
-    for (unsigned invalid=0;invalid<11;++invalid) {
+    for (unsigned invalid=0;invalid<13;++invalid) {
         activeTestPhase = "earlyInit.flag-refusal";
         Device d; Mode1Cleanup cleanup{d}; earlyInitDevice(d);
         if (invalid==0) testState.earlyInitBoot="2";
@@ -4230,6 +4230,14 @@ static void earlyInitTests() {
         if (invalid==8) testState.splBootPresent=true;
         if (invalid==9) testState.preSosBootPresent=true;
         if (invalid==10) testState.sosBootPresent=true;
+        if (invalid==11) {
+            testState.dmaCopyBootPresent = true;
+            testState.dmaCopyBoot = "2";
+        }
+        if (invalid==12) {
+            testState.dmaCopyBootPresent = true;
+            testState.earlyInitBootPresent = false;
+        }
         CHECK(d.service.start(&d.pci));
         CHECK(d.service.strings.at("CobaltSurvey,Status")=="early-init-flags-refused");
         CHECK(testState.mapRequests==0 && testState.selectorWrites==0 && testState.mode1Writes.empty() && testState.sosWrites==0);

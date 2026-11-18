@@ -57,7 +57,7 @@ read_test_kind() {
         if /usr/bin/plutil -extract TestKind xml1 -o - "$ROOT/plan.plist" >/dev/null 2>&1; then return 1; fi
         TEST_KIND=mode1
     fi
-    case "$TEST_KIND" in mode1|reset-sos) return 0;; *) return 1;; esac
+    case "$TEST_KIND" in mode1|reset-sos|reset-sos-dma) return 0;; *) return 1;; esac
 }
 
 [ "$(uname -s 2>/dev/null)" = Darwin ] || exit 0
@@ -76,7 +76,7 @@ PARTITION=$(get_plan PartitionGUID) || exit 1
 SYSTEM_UUID=$(get_plan ExpectedSystemUUID) || exit 1
 REVISION=$(get_plan BuildRevision) || exit 1
 [ "$(get_plan PlanVersion)" = 1 ] || exit 1
-[ "$(get_plan BundleVersion)" = 0.16.0 ] || exit 1
+[ "$(get_plan BundleVersion)" = 0.17.0 ] || exit 1
 read_test_kind || { say 'missing, malformed, or unknown TestKind; session retained'; exit 1; }
 case "$PARTITION" in ????????-????-????-????-????????????) :;; *) exit 1;; esac
 case "$PARTITION" in *[!0-9a-f-]*) exit 1;; esac
@@ -110,7 +110,7 @@ probe_usb() {
     [ "$(/usr/bin/stat -f '%u:%g' "$PROBE_DIR")" = 0:0 ] || return 1
     BOOTARGS=$(/usr/sbin/sysctl -n kern.bootargs 2>/dev/null) || return 1
     for _flag in cobalt-survey cobalt-survey-indexed cobalt-survey-state; do require_flag "$_flag" || return 1; done
-    for _flag in cobalt-survey-initboot cobalt-survey-mode1 cobalt-survey-mode1boot cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do require_off "$_flag" || return 1; done
+    for _flag in cobalt-survey-initboot cobalt-survey-dmacopy cobalt-survey-mode1 cobalt-survey-mode1boot cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do require_off "$_flag" || return 1; done
     PLATFORM=$(/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice -a 2>/dev/null) || return 1
     LIVE_UUID=$(extract "$PLATFORM" 0.IOPlatformUUID) || return 1
     [ "$(printf '%s' "$LIVE_UUID" | /usr/bin/tr 'A-F' 'a-f')" = "$(printf '%s' "$SYSTEM_UUID" | /usr/bin/tr 'A-F' 'a-f')" ] || return 1
@@ -195,6 +195,11 @@ else
     require_flag cobalt-survey-initboot || { say 'not the intended reset-sos boot: missing/invalid cobalt-survey-initboot=1; session retained'; exit 0; }
     require_off cobalt-survey-mode1boot || { say 'conflicting boot flag cobalt-survey-mode1boot; session retained'; exit 0; }
 fi
+if [ "$TEST_KIND" = reset-sos-dma ]; then
+    require_flag cobalt-survey-dmacopy || { say 'not the intended DMA boot: missing/invalid cobalt-survey-dmacopy=1; session retained'; exit 0; }
+else
+    require_off cobalt-survey-dmacopy || { say 'conflicting boot flag cobalt-survey-dmacopy; session retained'; exit 0; }
+fi
 for _flag in cobalt-survey-mode1 cobalt-survey-aperture cobalt-survey-staging cobalt-survey-kdb cobalt-survey-spl cobalt-survey-presos cobalt-survey-sos; do
     require_off "$_flag" || { say "conflicting boot flag $_flag; session retained"; exit 0; }
 done
@@ -203,6 +208,28 @@ done
 PLATFORM=$(/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice -a 2>/dev/null) || exit 0
 LIVE_UUID=$(extract "$PLATFORM" 0.IOPlatformUUID) || exit 0
 [ "$(printf '%s' "$LIVE_UUID" | /usr/bin/tr 'A-F' 'a-f')" = "$(printf '%s' "$SYSTEM_UUID" | /usr/bin/tr 'A-F' 'a-f')" ] || { say 'system UUID mismatch; leaving pending setup untouched'; exit 0; }
+
+# Require one service and exactly one complete, correctly typed property line for
+# each identity/readiness value. A failed or ambiguous ioreg read fails closed.
+dma_reboot_allowed() {
+    [ "$DRIVER_STATUS" -eq 0 ] || return 1
+    printf '%s\n' "$PLATFORM_DRIVER" | /usr/bin/awk '
+        /^[[:space:]|+ -]*o .*<class CobaltNavi44Survey,/ { services++ }
+        /^[[:space:]|]*"CobaltSurvey,BuildVersion"[[:space:]]*=/ {
+            version++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,BuildVersion"[[:space:]]*=[[:space:]]*"0[.]17[.]0"[[:space:]]*$/) version_ok++
+        }
+        /^[[:space:]|]*"CobaltSurvey,EarlyInitRequested"[[:space:]]*=/ {
+            requested++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,EarlyInitRequested"[[:space:]]*=[[:space:]]*Yes[[:space:]]*$/) requested_ok++
+        }
+        /^[[:space:]|]*"CobaltSurvey,EarlyInitTrigger"[[:space:]]*=/ {
+            trigger++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,EarlyInitTrigger"[[:space:]]*=[[:space:]]*"early-boot"[[:space:]]*$/) trigger_ok++
+        }
+        /^[[:space:]|]*"CobaltSurvey,PspDmaCopyRebootAllowed"[[:space:]]*=/ {
+            allowed++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,PspDmaCopyRebootAllowed"[[:space:]]*=[[:space:]]*Yes[[:space:]]*$/) allowed_ok++
+        }
+        END { exit !(services == 1 && version == 1 && version_ok == 1 && requested == 1 && requested_ok == 1 && trigger == 1 && trigger_ok == 1 && allowed == 1 && allowed_ok == 1) }
+    '
+}
 
 collect_evidence() {
 # Wait briefly for the early driver properties, but collect partial logs even
@@ -216,7 +243,7 @@ PLATFORM_DRIVER=''
 BUILD_VERSION=not-observed
 EARLY_REQUESTED=not-observed
 TRIGGER=not-observed
-EXPECTED_VERSION=0.16.0
+EXPECTED_VERSION=0.17.0
 EXPECTED_TRIGGER=early-boot
 while [ "$POLL" -lt 30 ]; do
     POLL=$((POLL + 1))
@@ -248,6 +275,13 @@ printf '%s\n' "$PEER_OUTPUT" > "$SESSION_DIR/peer-inventory.txt"
 printf 'test_kind=%s\nexpected_trigger=%s\nexpected_build_version=%s\ndriver_poll_attempts=%s\npeer_inspect_exit=%s\ndriver_ioreg_exit=%s\nbuild_version=%s\nearly_requested=%s\ntrigger=%s\n' \
     "$TEST_KIND" "$EXPECTED_TRIGGER" "$EXPECTED_VERSION" "$POLL" "$PEER_STATUS" "$DRIVER_STATUS" "$BUILD_VERSION" "$EARLY_REQUESTED" "$TRIGGER" >> "$RECEIPT"
 
+if [ "$TEST_KIND" = reset-sos-dma ]; then
+    DMA_REBOOT_ALLOWED=no
+    if dma_reboot_allowed; then DMA_REBOOT_ALLOWED=yes; fi
+    printf 'dma_reboot_allowed=%s\n' "$DMA_REBOOT_ALLOWED" >> "$RECEIPT"
+    say "DMA copy automatic reboot allowed: $DMA_REBOOT_ALLOWED"
+fi
+
 COLLECT_STATUS=0
 /bin/sh "$ROOT/collect-gpu-survey.sh" "$SESSION_DIR/after-early-test" > "$SESSION_DIR/collector.stdout.txt" 2> "$SESSION_DIR/collector.stderr.txt" || COLLECT_STATUS=$?
 printf 'collector_exit=%s\n' "$COLLECT_STATUS" >> "$RECEIPT"
@@ -259,7 +293,7 @@ capture_failure() {
     SESSION_DIR=$(/usr/bin/mktemp -d "$ROOT/evidence-$SESSION.XXXXXXXX") || { say 'cannot create private evidence directory'; exit 1; }
     chmod 700 "$SESSION_DIR"
     RECEIPT=$SESSION_DIR/incomplete-receipt.txt
-    EXPECTED_VERSION=0.16.0
+    EXPECTED_VERSION=0.17.0
     printf 'Session: %s\nusb_restore_verified=0\ncapture_complete=0\ntest_kind=%s\nexpected_trigger=early-boot\nexpected_build_version=%s\nreason=%s\n' "$SESSION" "$TEST_KIND" "$EXPECTED_VERSION" "$*" > "$RECEIPT"
     collect_evidence
     cp "$LOG" "$SESSION_DIR/capture-agent.log" || true
@@ -327,10 +361,16 @@ if [ -f "$DAEMON" ] && [ ! -L "$DAEMON" ]; then
 fi
 printf 'capture_complete=1\n' >> "$RECEIPT"
 rmdir "$LOCK" 2>/dev/null || true
-say "capture complete for $SESSION; preparing normal reboot (collector exit $COLLECT_STATUS)"
+say "capture complete for $SESSION (collector exit $COLLECT_STATUS)"
 cp "$RECEIPT" "$SESSION_DIR/completion-$SESSION.txt" || { say 'USB receipt copy failed; refusing automatic reboot'; exit 1; }
 cp "$LOG" "$SESSION_DIR/capture-agent.log" || { say 'USB agent log copy failed; refusing automatic reboot'; exit 1; }
 /bin/sync || { say 'sync failed; refusing automatic reboot'; exit 1; }
+if [ "$TEST_KIND" = reset-sos-dma ] && [ "$DMA_REBOOT_ALLOWED" != yes ]; then
+    say 'DMA copy readiness not confirmed; automatic reboot withheld'
+    cp "$LOG" "$SESSION_DIR/capture-agent.log" || exit 1
+    /bin/sync || exit 1
+    exit 0
+fi
 SHUTDOWN_STATUS=0
 /sbin/shutdown -r now || SHUTDOWN_STATUS=$?
 printf 'shutdown_command_returned=%s\n' "$SHUTDOWN_STATUS" >> "$RECEIPT"

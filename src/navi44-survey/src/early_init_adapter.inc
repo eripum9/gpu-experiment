@@ -114,6 +114,10 @@ struct EarlyInitContext {
     uint32_t mib {0};
     const char *status {"early-prerequisites-unavailable"};
     const char *dmaPlanStatus {"not-attempted"};
+    const char *dmaCopyStatus {"not-attempted"};
+    bool dmaCopyLayoutVerified {false}, dmaCopyRebootAllowed {false};
+    bool dmaCopyIssued {false}, dmaCopyProven {false}, dmaCopyRestored {false}, dmaCopyRetained {false};
+    uint32_t dmaCopyPolls {0}, dmaCopyPioStatus {UINT32_MAX};
     bool attempted {false}, success {false}, published {true};
     bool consoleRePauseAttempted {false}, consoleRePaused {false};
     bool discoveryVerified {false};
@@ -126,6 +130,11 @@ struct EarlyInitContext {
 void clearEarlyInitProperties(IOService *service) {
     gfxPreflight::clear(service);
     service->removeProperty("CobaltSurvey,PspDmaPlanStatus");
+    const char *copyKeys[] = {"CobaltSurvey,PspDmaCopyStatus", "CobaltSurvey,PspDmaCopyRebootAllowed",
+        "CobaltSurvey,PspDmaCopyCommandAttempted", "CobaltSurvey,PspDmaCopyProven",
+        "CobaltSurvey,PspDmaCopyRestored", "CobaltSurvey,PspDmaCopyRetained",
+        "CobaltSurvey,PspDmaCopyPolls", "CobaltSurvey,PspDmaCopyPioStatus"};
+    for (const char *key : copyKeys) service->removeProperty(key);
     const char *names[] = {"Requested", "Trigger", "Attempted", "Phase", "Status", "Success",
         "ColdCycleReplacementValidated", "ConsoleRePauseAttempted", "ConsoleRePaused",
         "DiscoveryVerified", "DiscoveryDataReads", "DiscoverySelectorWrites"};
@@ -151,6 +160,10 @@ bool earlyInitGuard(IOService *service, IOPCIDevice *pci, EarlyInitContext &cont
         if (observed.values[n] != context.console.values[n]) return false;
     return context.authorization.guard() && consoleGuard(pci, context.state, context.mmio, context.vram);
 }
+
+#if !defined(COBALT_SURVEY_HOSTTEST)
+bool verifyDmaCopyLayout(const IpDiscovery &discovery, const Aperture &mmio);
+#endif
 
 // Every read uses a newly created post-reset mapping. The retained snapshot is
 // an equality baseline only: it never supplies the firmware-phase permission.
@@ -234,6 +247,9 @@ COBALT_SURVEY_NOINLINE bool earlyInitRefresh(IOService *service, IOPCIDevice *pc
         context.status = "post-reset-state-invalid"; return false;
     }
     gfxPreflight::resolve(discovery, mmio, context.firmwareProof.offsets[1], context.prior.offsets[2], context.gfx);
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    if (dmaCopyBootArmed()) context.dmaCopyLayoutVerified = verifyDmaCopyLayout(discovery, mmio);
+#endif
     context.discoveryVerified = true;
     return true;
 }
@@ -318,6 +334,8 @@ COBALT_SURVEY_NOINLINE void readGfxPreflight(IOService *service, IOPCIDevice *pc
 }
 
 #if !defined(COBALT_SURVEY_HOSTTEST)
+#include "psp_mmhub_copy_adapter.inc"
+
 // Allocate the two pages and populate the prospective table before adding
 // any device programming. Both pages are released while still unpublished.
 COBALT_SURVEY_NOINLINE void preparePspDmaLayout(IOService *service, IOPCIDevice *pci,
@@ -393,6 +411,16 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     if (!platform || !earlyInitGuard(service, pci, context)) {
         context.status = "console-resume-context-unavailable"; return;
     }
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    if (dmaCopyBootArmed()) {
+        runPspDmaCopy(service, pci, context);
+        if (!context.dmaCopyRebootAllowed || !earlyInitPostflight(service, pci, context)) {
+            context.dmaCopyRebootAllowed = false;
+            context.status = "dma-copy-postflight-refused";
+            return;
+        }
+    }
+#endif
     // Platform console resume is the explicit OS boundary after safe SOS
     // success. It is not an adapter staging/MMIO/mailbox/selector/flush write.
     context.reset.consoleResumeAttempted = true;
@@ -411,7 +439,7 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     context.status = "reset-and-sos-transition-observed";
     readGfxPreflight(service, pci, context);
 #if !defined(COBALT_SURVEY_HOSTTEST)
-    preparePspDmaLayout(service, pci, context);
+    if (!dmaCopyBootArmed()) preparePspDmaLayout(service, pci, context);
 #endif
 }
 
@@ -430,6 +458,15 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
         gfxPreflight::publish(service, context->gfx);
         published = service->setProperty("CobaltSurvey,PspDmaPlanStatus", context->dmaPlanStatus) && published;
     }
+    if (context && dmaCopyBootArmed()) {
+        published = service->setProperty("CobaltSurvey,PspDmaCopyStatus", context->dmaCopyStatus) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyCommandAttempted", context->dmaCopyIssued) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyProven", context->dmaCopyProven) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyRestored", context->dmaCopyRestored) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyRetained", context->dmaCopyRetained) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyPolls", context->dmaCopyPolls, 32) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyPioStatus", context->dmaCopyPioStatus, 32) && published;
+    }
 #define EARLY_PROPERTY(name, value) published = service->setProperty("CobaltSurvey,EarlyInit" name, value) && published
     EARLY_PROPERTY("Requested", initBootSelected());
     EARLY_PROPERTY("Trigger", "early-boot");
@@ -444,13 +481,16 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoveryDataReads", context ? context->discoveryReads : 0u, 32) && published;
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoverySelectorWrites", context ? context->discoverySelectorWrites : 0u, 32) && published;
 #undef EARLY_PROPERTY
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.16.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.17.0") && published;
     published = service->setProperty("CobaltSurvey,AccessMode", "early-mode1-and-sos-initialization") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;
     published = service->setProperty("CobaltSurvey,ColdCycleReplacementValidated", false) && published;
     published = service->setProperty("CobaltSurvey,ReadOnly", false) && published;
-    if (published && success && service->setProperty("CobaltSurvey,Schema", 13ULL, 32)) return true;
+    if (published && success && service->setProperty("CobaltSurvey,Schema", 13ULL, 32)) {
+        if (!dmaCopyBootArmed() || service->setProperty("CobaltSurvey,PspDmaCopyRebootAllowed",
+            context->dmaCopyRebootAllowed)) return true;
+    }
     service->removeProperty("CobaltSurvey,Schema");
     service->setProperty("CobaltSurvey,Schema", 4ULL, 32);
     service->removeProperty("CobaltSurvey,EarlyInitSuccess");

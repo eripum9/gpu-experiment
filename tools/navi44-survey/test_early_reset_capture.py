@@ -163,10 +163,21 @@ print(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+str(path))
  echo 'driver-ioreg' >> "$TRACE"
  [ "${DRIVER_MISSING-0}" != 1 ] || { echo 'ioreg driver missing' >&2; exit 7; }
  echo '+-o CobaltNavi44Survey  <class CobaltNavi44Survey, id 0x1>'
- echo '\"CobaltSurvey,BuildVersion\" = \"0.16.0\"'
- if [ "${TEST_KIND-mode1}" = reset-sos ]; then
+ echo '\"CobaltSurvey,BuildVersion\" = \"0.17.0\"'
+ if [ "${TEST_KIND-mode1}" != mode1 ]; then
   echo '\"CobaltSurvey,EarlyInitRequested\" = Yes'
   echo '\"CobaltSurvey,EarlyInitTrigger\" = \"early-boot\"'
+  case "${DMA_READINESS-missing}" in
+   yes) echo '\"CobaltSurvey,PspDmaCopyRebootAllowed\" = Yes';;
+   no) echo '\"CobaltSurvey,PspDmaCopyRebootAllowed\" = No';;
+   duplicate)
+    echo '\"CobaltSurvey,PspDmaCopyRebootAllowed\" = Yes'
+    echo '\"CobaltSurvey,PspDmaCopyRebootAllowed\" = No';;
+   substring) echo '\"CobaltSurvey,PspDmaCopyRebootAllowed\" = \"Yes\"';;
+   multiple)
+    echo '\"CobaltSurvey,PspDmaCopyRebootAllowed\" = Yes'
+    echo '+-o CobaltNavi44Survey  <class CobaltNavi44Survey, id 0x2>';;
+  esac
  else
   echo '\"CobaltSurvey,Mode1ResetEarlyRequested\" = Yes'
   echo '\"CobaltSurvey,Mode1ResetTrigger\" = \"early-boot\"'
@@ -231,7 +242,7 @@ esac
         launcher.chmod(0o755)
         (source_app / "Info.plist").write_bytes(plistlib.dumps(dict(CFBundleVersion="1.0.0")))
         (source_app / "_CodeSignature" / "CodeResources").write_bytes(b"fixture signature")
-        self.values = dict(PlanVersion=1, BundleVersion="0.16.0", TestKind="mode1", BuildRevision="0123456789abcdef0123456789abcdef01234567",
+        self.values = dict(PlanVersion=1, BundleVersion="0.17.0", TestKind="mode1", BuildRevision="0123456789abcdef0123456789abcdef01234567",
                            SessionID=SESSION, PartitionGUID=PARTITION, ExpectedSystemUUID=SYSTEM_UUID)
         for name, content, key in (("config-baseline.plist", b"base\n", "BaselineConfigSHA256"),
                                    ("config-bootstrap.plist", b"bootstrap\n", "BootstrapConfigSHA256"),
@@ -333,6 +344,59 @@ esac
         self.assertFalse(self.resident.exists())
         self.assertNotIn("collector:", self.events())
         self.assertNotIn("shutdown", self.events())
+
+    def test_dma_flag_refuses_passive_installer_and_probe(self):
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-dmacopy=1"
+        result = self.install(BOOTARGS=args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test/write flag is active", result.stderr)
+        result = self.install(PROBE_BOOTARGS=args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.config.read_bytes(), b"bootstrap\n")
+        self.assertNotIn("shutdown", self.events())
+
+    def test_legacy_capture_rejects_dma_flag(self):
+        self.prepare_agent()
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-mode1boot=1 cobalt-survey-dmacopy=1"
+        result = self.run_agent(BOOTARGS=args)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((self.resident / "pending-session").exists())
+        self.assertEqual(self.config.read_bytes(), b"armed\n")
+        self.assertNotIn("shutdown", self.events())
+
+    def test_dma_capture_readiness_gates_reboot_after_restore_and_receipt(self):
+        for readiness in ("yes", "missing", "no", "duplicate", "substring", "multiple"):
+            with self.subTest(readiness=readiness):
+                # Isolate each one-shot session in a fresh fixture directory.
+                if readiness != "yes":
+                    self.doCleanups()
+                    self.setUp()
+                self.values["TestKind"] = "reset-sos-dma"
+                self.write_plan()
+                self.prepare_agent()
+                args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-initboot=1 cobalt-survey-dmacopy=1"
+                result = self.run_agent(BOOTARGS=args, DMA_READINESS=readiness)
+                self.assertEqual(result.returncode, 0, result.stderr + self.log.read_text())
+                self.assertEqual(self.config.read_bytes(), b"base\n")
+                self.assertIn(":base", self.events())
+                receipt = (self.resident / ("completion-" + SESSION + ".txt")).read_text()
+                expected = "yes" if readiness == "yes" else "no"
+                self.assertIn("dma_reboot_allowed=" + expected, receipt)
+                self.assertIn("capture_complete=1", receipt)
+                self.assertEqual((self.session_dir / ("completion-" + SESSION + ".txt")).read_text(), receipt)
+                self.assertIn("DMA copy automatic reboot allowed: " + expected, self.log.read_text())
+                self.assertEqual("shutdown" in self.events(), readiness == "yes")
+                self.assertTrue((self.session_dir / "early-driver-ioreg.txt").exists())
+
+    def test_dma_capture_requires_explicit_flag(self):
+        self.values["TestKind"] = "reset-sos-dma"
+        self.write_plan()
+        self.prepare_agent()
+        args = "cobalt-survey=1 cobalt-survey-indexed=1 cobalt-survey-state=1 cobalt-survey-initboot=1"
+        result = self.run_agent(BOOTARGS=args)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((self.resident / "pending-session").exists())
+        self.assertEqual(self.config.read_bytes(), b"armed\n")
 
     def test_missing_test_kind_keeps_legacy_mode1(self):
         self.values.pop("TestKind")
@@ -511,7 +575,7 @@ esac
         self.assertIn("driver_ioreg_exit=7", receipt)
         self.assertIn("test_kind=mode1", receipt)
         self.assertIn("expected_trigger=early-boot", receipt)
-        self.assertIn("expected_build_version=0.16.0", receipt)
+        self.assertIn("expected_build_version=0.17.0", receipt)
         self.assertTrue((self.session_dir / ("completion-" + SESSION + ".txt")).exists())
         self.assertIn("client:--inspect-peers", self.events())
         self.assertNotIn("client:--run", self.events())
@@ -526,7 +590,7 @@ esac
         receipt = (self.resident / ("completion-" + SESSION + ".txt")).read_text()
         self.assertIn("test_kind=reset-sos", receipt)
         self.assertIn("expected_trigger=early-boot", receipt)
-        self.assertIn("expected_build_version=0.16.0", receipt)
+        self.assertIn("expected_build_version=0.17.0", receipt)
         self.assertIn("early_requested=yes", receipt)
         self.assertIn("EarlyInitRequested", (self.session_dir / "early-driver-ioreg.txt").read_text())
         self.assertEqual(self.config.read_bytes(), b"base\n")

@@ -70,6 +70,8 @@ struct TestState {
     bool mode1EarlyBootPresent = false;
     std::string earlyInitBoot = "1";
     bool earlyInitBootPresent = false, earlyInitEnabled = false;
+    std::string dmaCopyBoot = "1";
+    bool dmaCopyBootPresent = false;
     unsigned earlyInitPhase = 0;
     bool failEarlyInitSchema13 = false;
     std::vector<uint64_t> earlyInitSchemaWrites;
@@ -1189,16 +1191,17 @@ inline bool PE_parse_boot_argn(const char *key, void *out, int n) {
     const bool mode1 = std::string(key) == "cobalt-survey-mode1";
     const bool mode1Early = std::string(key) == "cobalt-survey-mode1boot";
     const bool initBoot = std::string(key) == "cobalt-survey-initboot";
-    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1 && !mode1Early && !initBoot) throw std::runtime_error("unexpected boot argument");
+    const bool dmaCopy = std::string(key) == "cobalt-survey-dmacopy";
+    if (std::string(key) != "cobalt-survey" && !indexed && !state && !aperture && !staging && !kdb && !spl && !preSos && !sos && !mode1 && !mode1Early && !initBoot && !dmaCopy) throw std::runtime_error("unexpected boot argument");
     if (indexed ? !testState.indexedBootPresent : state ? !testState.stateBootPresent :
-        initBoot ? !testState.earlyInitBootPresent :
+        initBoot ? !testState.earlyInitBootPresent : dmaCopy ? !testState.dmaCopyBootPresent :
         mode1Early ? !testState.mode1EarlyBootPresent : mode1 ? !testState.mode1BootPresent : sos ? !testState.sosBootPresent : preSos ? !testState.preSosBootPresent :
         spl ? !testState.splBootPresent : kdb ? !testState.kdbBootPresent :
         aperture ? !testState.apertureBootPresent : staging ? !testState.stagingBootPresent : !testState.bootPresent) return false;
     // Reproduce XNU's integer conversion first, including decimal/hex/octal.
     // The real API does not choose string versus integer from buffer size.
     // Space and tab terminate the value in the actual boot-argument string.
-    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : initBoot ? testState.earlyInitBoot : mode1Early ? testState.mode1EarlyBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
+    const auto &argument = indexed ? testState.indexedBoot : state ? testState.stateBoot : initBoot ? testState.earlyInitBoot : dmaCopy ? testState.dmaCopyBoot : mode1Early ? testState.mode1EarlyBoot : mode1 ? testState.mode1Boot : sos ? testState.sosBoot : preSos ? testState.preSosBoot : spl ? testState.splBoot : kdb ? testState.kdbBoot :
         aperture ? testState.apertureBoot : staging ? testState.stagingBoot : testState.boot;
     const std::string token = argument.substr(0, argument.find_first_of(" \t"));
     char *end = nullptr;

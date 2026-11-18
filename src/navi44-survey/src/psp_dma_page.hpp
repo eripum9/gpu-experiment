@@ -77,9 +77,17 @@ public:
         return command_->synchronize(kIODirectionOut) == kIOReturnSuccess;
     }
 
-    // This preparation checkpoint never publishes an address to the GPU.
-    // A future transfer must keep the lease alive until hardware is quiescent.
+    uint8_t *bytes() { return ready() ? static_cast<uint8_t *>(memory_->getBytesNoCopy()) : nullptr; }
+    bool synchronize(IOOptionBits direction) {
+        return ready() && command_->synchronize(direction) == kIOReturnSuccess;
+    }
+
+    // After an unresolved transfer, intentionally keep the prepared mapping
+    // and its backing objects alive. The caller also holds automatic reboot.
+    void retainForBoot() { retain_ = true; }
+
     void reset() {
+        if (retain_) return;
         if (commandPrepared_) { command_->complete(); commandPrepared_ = false; }
         if (attached_) { command_->clearMemoryDescriptor(false); attached_ = false; }
         if (command_) { command_->release(); command_ = nullptr; }
@@ -97,6 +105,7 @@ private:
     bool memoryPrepared_ = false;
     bool attached_ = false;
     bool commandPrepared_ = false;
+    bool retain_ = false;
 };
 
 } // namespace cobalt

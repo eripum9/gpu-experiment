@@ -25,7 +25,7 @@ refuse before indexed access. Default and standalone modes retain their
 separate gates. No userspace request starts this compound transaction.
 
 The native one-shot capture workflow is shared with the
-[early reset test](EARLY-MODE1-RESET.md), using a version 0.16.0 private plan
+[early reset test](EARLY-MODE1-RESET.md), using a version 0.17.0 private plan
 with `TestKind=reset-sos`. A missing `TestKind` selects the standalone Mode1
 capture contract; an unknown value is refused. The bootstrap remains passive.
 The background native-app USB permission probe must succeed before baseline
@@ -158,3 +158,16 @@ GPU address sits above the framebuffer aperture. `CobaltSurvey,PspDmaPlanStatus`
 records whether preparation succeeded. The allocations are scoped to the
 preparation step. A later device transfer must prove the MMHUB can walk this
 table and establish quiescence before releasing an exposed page.
+
+Version 0.17.0 adds the separately armed `reset-sos-dma` capture plan with
+`cobalt-survey-dmacopy=1` alongside the existing compound boot flags. After
+SOS startup, with the console still paused, the driver checks the captured
+inactive MMHUB configuration and an idle LSDMA. It programs a temporary
+one-page VMID0 mapping, copies 64 bytes between two regions of the owned
+page, verifies both regions and the remaining bytes, and restores the
+mapping and PIO setup. The PSP ring remains a separate milestone.
+
+`CobaltSurvey,PspDmaCopyStatus` describes the result.
+`CobaltSurvey,PspDmaCopyRebootAllowed` is published after successful
+postflight and verified cleanup, or after a refusal before mutation. An
+uncertain transaction retains both DMA pages and withholds automatic reboot.

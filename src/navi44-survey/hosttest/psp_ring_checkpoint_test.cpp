@@ -84,7 +84,7 @@ int main() try {
         memory::Layout layout {};
         CHECK(memory::makeLayout(table, data, 0x8000, 0x83fb, layout));
         CHECK(layout.tableBase == 0x12345007ULL);
-        CHECK(layout.leaf == 0x808000002468b067ULL);
+        CHECK(layout.leaf == 0x80c000002468b067ULL);
         CHECK(layout.gpuAddress == 0x8400000000ULL);
 
         // Refuse aliasing, truncation and overflow before a root or leaf

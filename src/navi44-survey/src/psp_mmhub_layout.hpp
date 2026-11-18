@@ -35,10 +35,11 @@ inline bool makeLayout(uint64_t tableDma, uint64_t dataDma, uint32_t fbBase,
     if (!pageAddress(gpuAddress) || gpuAddress == tableDma || gpuAddress == dataDma) return false;
 
     // Linux v6.19 amdgpu_vm.h and gmc_v12_0.c describe the root PDE and
-    // flat GART leaf. Keep execute permission out of this data-only page.
+    // flat GART leaf. soc24_enum.h defines UC as 3. Keep execute permission
+    // out of this data-only page.
     constexpr uint64_t valid = 1, system = 2, snooped = 4;
     constexpr uint64_t readable = 1ULL << 5, writable = 1ULL << 6;
-    constexpr uint64_t uncached = 2ULL << 54, isPte = 1ULL << 63;
+    constexpr uint64_t uncached = 3ULL << 54, isPte = 1ULL << 63;
     out = {tableDma | valid | system | snooped,
            dataDma | valid | system | snooped | readable | writable | uncached | isPte,
            gpuAddress};
