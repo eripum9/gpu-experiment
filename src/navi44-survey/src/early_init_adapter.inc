@@ -425,7 +425,7 @@ COBALT_SURVEY_NOINLINE void readLsdmaQueues(IOService *service, IOPCIDevice *pci
 COBALT_SURVEY_NOINLINE void readLsdmaBeforeReset(IOService *service, IOPCIDevice *pci,
     OSData *retained, EarlyInitContext &context) {
     IpDiscovery discovery;
-    if (discovery.init(retained->getBytesNoCopy(), retained->getLength()) &&
+    if (discovery.init(static_cast<const uint8_t *>(retained->getBytesNoCopy()), retained->getLength()) &&
         verifyDmaCopyLayout(discovery, context.mmio))
         readLsdmaQueues(service, pci, context, context.lsdmaBeforeReset);
 }
