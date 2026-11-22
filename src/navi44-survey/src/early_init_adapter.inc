@@ -95,6 +95,54 @@ void publish(IOService *service, const Observation &out) {
 }
 } // namespace gfxPreflight
 
+#if !defined(COBALT_SURVEY_HOSTTEST)
+namespace lsdmaSurvey {
+// Segment-zero registers from Linux v6.19 lsdma_7_0_0_offset.h.
+struct Register { const char *name; uint16_t dword; };
+constexpr Register registers[] = {
+    {"EngineStatus", 0x0025}, {"PioStatus", 0x007a},
+    {"Queue0RingControl", 0x0080}, {"Queue0BaseLow", 0x0081}, {"Queue0BaseHigh", 0x0082},
+    {"Queue0ReadLow", 0x0083}, {"Queue0ReadHigh", 0x0084},
+    {"Queue0WriteLow", 0x0085}, {"Queue0WriteHigh", 0x0086},
+    {"Queue0WritePoll", 0x0087}, {"Queue0IndirectControl", 0x008c}, {"Queue0IndirectRead", 0x008d},
+    {"Queue0ContextStatus", 0x009b}, {"Queue0Status", 0x009c}, {"Queue0Doorbell", 0x009d},
+    {"Queue1RingControl", 0x00d8}, {"Queue1BaseLow", 0x00d9}, {"Queue1BaseHigh", 0x00da},
+    {"Queue1ReadLow", 0x00db}, {"Queue1ReadHigh", 0x00dc},
+    {"Queue1WriteLow", 0x00dd}, {"Queue1WriteHigh", 0x00de},
+    {"Queue1WritePoll", 0x00df}, {"Queue1IndirectControl", 0x00e4}, {"Queue1IndirectRead", 0x00e5},
+    {"Queue1ContextStatus", 0x00f3}, {"Queue1Status", 0x00f4}, {"Queue1Doorbell", 0x00f5},
+};
+constexpr unsigned count = sizeof(registers) / sizeof(registers[0]);
+
+struct Observation {
+    const char *status {"layout-unavailable"};
+    bool sampled {false};
+    uint32_t samples[2][count] {};
+};
+
+constexpr bool fitsLsdmaPage() {
+    for (const auto &reg : registers)
+        if (reg.dword >= 4096 / sizeof(uint32_t)) return false;
+    return true;
+}
+static_assert(fitsLsdmaPage());
+
+void publish(IOService *service, const char *phase, const Observation &out) {
+    char key[96];
+    bool published = true;
+    if (out.sampled) {
+        for (unsigned i = 0; i < count; ++i) {
+            const uint64_t pair = out.samples[0][i] | (static_cast<uint64_t>(out.samples[1][i]) << 32);
+            snprintf(key, sizeof(key), "CobaltSurvey,Lsdma%s%s", phase, registers[i].name);
+            published = service->setProperty(key, pair, 64) && published;
+        }
+    }
+    snprintf(key, sizeof(key), "CobaltSurvey,Lsdma%sSampleStatus", phase);
+    service->setProperty(key, published ? out.status : "metadata-publication-failed");
+}
+} // namespace lsdmaSurvey
+#endif
+
 struct EarlyInitContext {
     // Class-specific placement construction keeps all default result values
     // without requiring a large aggregate temporary on the kernel stack.
@@ -125,6 +173,9 @@ struct EarlyInitContext {
     bool consoleRePauseAttempted {false}, consoleRePaused {false};
     bool discoveryVerified {false};
     uint32_t discoveryReads {0}, discoverySelectorWrites {0};
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    lsdmaSurvey::Observation lsdmaBeforeReset {}, lsdmaAfterReset {}, lsdmaAfterSos {};
+#endif
     EarlyInitContext(IOService *service, IOPCIDevice *pci)
         : session(pci, service), authorization(service, pci, session) { reset.earlyBoot = true; }
     ~EarlyInitContext() { if (fresh) IOFree(fresh, 2 * kDiscoverySize); }
@@ -339,6 +390,46 @@ COBALT_SURVEY_NOINLINE void readGfxPreflight(IOService *service, IOPCIDevice *pc
 #if !defined(COBALT_SURVEY_HOSTTEST)
 #include "psp_mmhub_copy_adapter.inc"
 
+// Queue snapshots use the verified LSDMA BAR5 segment and a read-only map.
+// Observations do not confer queue ownership or change copy authorization.
+COBALT_SURVEY_NOINLINE void readLsdmaQueues(IOService *service, IOPCIDevice *pci,
+    EarlyInitContext &context, lsdmaSurvey::Observation &out) {
+    out.status = "context-changed";
+    if (!earlyInitGuard(service, pci, context)) return;
+    Map page;
+    if (!page.create(context.mmio, dmaCopy::lsdmaPage, 4096)) {
+        out.status = page.failureReason(); return;
+    }
+    const auto *view = page.bytes();
+    if (!view || (reinterpret_cast<uintptr_t>(view) & 3u)) {
+        out.status = "register-view-invalid"; return;
+    }
+    const auto *words = reinterpret_cast<const volatile uint32_t *>(view);
+    bool unavailable = false;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        if (pass) IODelay(100);
+        if (!earlyInitGuard(service, pci, context)) return;
+        for (unsigned i = 0; i < lsdmaSurvey::count; ++i) {
+            if (!context.authorization.guard() || !consoleGuard(pci, context.state, context.mmio, context.vram))
+                return;
+            const uint32_t value = words[lsdmaSurvey::registers[i].dword];
+            out.samples[pass][i] = value;
+            unavailable = unavailable || value == UINT32_MAX;
+        }
+    }
+    if (!earlyInitGuard(service, pci, context)) return;
+    out.sampled = true;
+    out.status = unavailable ? "partial" : "observed";
+}
+
+COBALT_SURVEY_NOINLINE void readLsdmaBeforeReset(IOService *service, IOPCIDevice *pci,
+    OSData *retained, EarlyInitContext &context) {
+    IpDiscovery discovery;
+    if (discovery.init(retained->getBytesNoCopy(), retained->getLength()) &&
+        verifyDmaCopyLayout(discovery, context.mmio))
+        readLsdmaQueues(service, pci, context, context.lsdmaBeforeReset);
+}
+
 // Allocate the two pages and populate the prospective table before adding
 // any device programming. Both pages are released while still unpublished.
 COBALT_SURVEY_NOINLINE void preparePspDmaLayout(IOService *service, IOPCIDevice *pci,
@@ -391,6 +482,9 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     if (!context.authorization.claim()) { context.status = "compound-claim-refused"; return; }
     context.attempted = true;
     if (!earlyInitPhase(service, context) || !earlyInitGuard(service, pci, context)) return;
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    if (dmaCopyBootArmed()) readLsdmaBeforeReset(service, pci, retained, context);
+#endif
     runMode1(service, pci, retained, context.reset, &context.session, &context.authorization);
     if (!context.reset.protocol.success || !context.reset.protocol.pciRestored || !context.reset.protocol.recoveryObserved ||
         !context.reset.consoleRecovered || !context.reset.consolePaused || !earlyInitGuard(service, pci, context)) {
@@ -400,6 +494,9 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     if (!earlyInitRefresh(service, pci, retained, context)) return;
     IOFree(context.fresh, 2 * kDiscoverySize); context.fresh = nullptr;
     if (!context.authorization.discoveryVerified() || !earlyInitPhase(service, context)) return;
+#if !defined(COBALT_SURVEY_HOSTTEST)
+    if (context.dmaCopyLayoutVerified) readLsdmaQueues(service, pci, context, context.lsdmaAfterReset);
+#endif
     runSosBootSurvey(service, pci, context.state, context.mmio, context.vram, context.mib,
         context.apertureProof, context.firmwareProof, context.prior, context.console, context.sos,
         &context.session, &context.authorization);
@@ -416,6 +513,7 @@ COBALT_SURVEY_NOINLINE void runEarlyInitHardware(IOService *service, IOPCIDevice
     }
 #if !defined(COBALT_SURVEY_HOSTTEST)
     if (dmaCopyBootArmed()) {
+        if (context.dmaCopyLayoutVerified) readLsdmaQueues(service, pci, context, context.lsdmaAfterSos);
         runPspDmaCopy(service, pci, context);
         if (!context.dmaCopyRebootAllowed || !earlyInitPostflight(service, pci, context)) {
             context.dmaCopyRebootAllowed = false;
@@ -462,6 +560,11 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
         published = service->setProperty("CobaltSurvey,PspDmaPlanStatus", context->dmaPlanStatus) && published;
     }
     if (context && dmaCopyBootArmed()) {
+#if !defined(COBALT_SURVEY_HOSTTEST)
+        lsdmaSurvey::publish(service, "BeforeReset", context->lsdmaBeforeReset);
+        lsdmaSurvey::publish(service, "AfterReset", context->lsdmaAfterReset);
+        lsdmaSurvey::publish(service, "AfterSos", context->lsdmaAfterSos);
+#endif
         published = service->setProperty("CobaltSurvey,PspDmaCopyStatus", context->dmaCopyStatus) && published;
         published = service->setProperty("CobaltSurvey,PspDmaCopyAccessStatus", context->dmaCopyAccessStatus) && published;
         published = service->setProperty("CobaltSurvey,PspDmaCopyMapFailure", context->dmaCopyMapFailure) && published;
@@ -488,7 +591,7 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoveryDataReads", context ? context->discoveryReads : 0u, 32) && published;
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoverySelectorWrites", context ? context->discoverySelectorWrites : 0u, 32) && published;
 #undef EARLY_PROPERTY
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.18.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.19.0") && published;
     published = service->setProperty("CobaltSurvey,AccessMode", "early-mode1-and-sos-initialization") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;

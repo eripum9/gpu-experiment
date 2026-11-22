@@ -25,7 +25,7 @@ refuse before indexed access. Default and standalone modes retain their
 separate gates. No userspace request starts this compound transaction.
 
 The native one-shot capture workflow is shared with the
-[early reset test](EARLY-MODE1-RESET.md), using a version 0.18.0 private plan
+[early reset test](EARLY-MODE1-RESET.md), using a version 0.19.0 private plan
 with `TestKind=reset-sos`. A missing `TestKind` selects the standalone Mode1
 capture contract; an unknown value is refused. The bootstrap remains passive.
 The background native-app USB permission probe must succeed before baseline
@@ -172,6 +172,12 @@ Version 0.18.0 also publishes `PspDmaCopyAccessStatus` on an armed boot.
 For an MMIO access refusal, `PspDmaCopyAccessOffset` identifies the BAR5
 byte offset, and `PspDmaCopyAccessValue` records the value if available.
 For a mapping failure, `PspDmaCopyMapFailure` identifies the failed map check.
+Version 0.19.0 samples the LSDMA engine and both queues before reset, after
+verified reset recovery, and after SOS startup. `LsdmaBeforeReset*`,
+`LsdmaAfterReset*`, and `LsdmaAfterSos*` hold the two samples for each register,
+with the first sample in the low 32 bits and the second in the high 32 bits.
+`SampleStatus` reports whether the read completed. Live queue pointers may
+change between samples. An enabled queue still prevents the copy.
 `CobaltSurvey,PspDmaCopyRebootAllowed` is published after successful
 postflight and verified cleanup, or after a refusal before mutation. An
 uncertain transaction retains both DMA pages and withholds automatic reboot.
