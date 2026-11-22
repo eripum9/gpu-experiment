@@ -76,7 +76,7 @@ PARTITION=$(get_plan PartitionGUID) || exit 1
 SYSTEM_UUID=$(get_plan ExpectedSystemUUID) || exit 1
 REVISION=$(get_plan BuildRevision) || exit 1
 [ "$(get_plan PlanVersion)" = 1 ] || exit 1
-[ "$(get_plan BundleVersion)" = 0.17.0 ] || exit 1
+[ "$(get_plan BundleVersion)" = 0.18.0 ] || exit 1
 read_test_kind || { say 'missing, malformed, or unknown TestKind; session retained'; exit 1; }
 case "$PARTITION" in ????????-????-????-????-????????????) :;; *) exit 1;; esac
 case "$PARTITION" in *[!0-9a-f-]*) exit 1;; esac
@@ -216,7 +216,7 @@ dma_reboot_allowed() {
     printf '%s\n' "$PLATFORM_DRIVER" | /usr/bin/awk '
         /^[[:space:]|+ -]*o .*<class CobaltNavi44Survey,/ { services++ }
         /^[[:space:]|]*"CobaltSurvey,BuildVersion"[[:space:]]*=/ {
-            version++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,BuildVersion"[[:space:]]*=[[:space:]]*"0[.]17[.]0"[[:space:]]*$/) version_ok++
+            version++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,BuildVersion"[[:space:]]*=[[:space:]]*"0[.]18[.]0"[[:space:]]*$/) version_ok++
         }
         /^[[:space:]|]*"CobaltSurvey,EarlyInitRequested"[[:space:]]*=/ {
             requested++; if ($0 ~ /^[[:space:]|]*"CobaltSurvey,EarlyInitRequested"[[:space:]]*=[[:space:]]*Yes[[:space:]]*$/) requested_ok++
@@ -243,7 +243,7 @@ PLATFORM_DRIVER=''
 BUILD_VERSION=not-observed
 EARLY_REQUESTED=not-observed
 TRIGGER=not-observed
-EXPECTED_VERSION=0.17.0
+EXPECTED_VERSION=0.18.0
 EXPECTED_TRIGGER=early-boot
 while [ "$POLL" -lt 30 ]; do
     POLL=$((POLL + 1))
@@ -293,7 +293,7 @@ capture_failure() {
     SESSION_DIR=$(/usr/bin/mktemp -d "$ROOT/evidence-$SESSION.XXXXXXXX") || { say 'cannot create private evidence directory'; exit 1; }
     chmod 700 "$SESSION_DIR"
     RECEIPT=$SESSION_DIR/incomplete-receipt.txt
-    EXPECTED_VERSION=0.17.0
+    EXPECTED_VERSION=0.18.0
     printf 'Session: %s\nusb_restore_verified=0\ncapture_complete=0\ntest_kind=%s\nexpected_trigger=early-boot\nexpected_build_version=%s\nreason=%s\n' "$SESSION" "$TEST_KIND" "$EXPECTED_VERSION" "$*" > "$RECEIPT"
     collect_evidence
     cp "$LOG" "$SESSION_DIR/capture-agent.log" || true

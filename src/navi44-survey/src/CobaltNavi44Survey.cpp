@@ -419,6 +419,7 @@ public:
     bool createDmaCopyPage(const Aperture &a, bool lsdma) {
         return createPolicy(a, lsdma ? 0x45000 : 0x69000, 4096, true);
     }
+    const char *failureReason() const { return failure; }
 #endif
 private:
     bool createPolicy(const Aperture &a, uint64_t offset, uint64_t length, bool indexed) {
@@ -4627,7 +4628,7 @@ bool CobaltNavi44Survey::start(IOService *provider) {
     removeProperty("CobaltSurvey,BuildVersion");
     Map::clearFailure(this);
     setProperty("CobaltSurvey,Protocol", "CobaltNavi44Survey");
-    setProperty("CobaltSurvey,BuildVersion", "0.17.0");
+    setProperty("CobaltSurvey,BuildVersion", "0.18.0");
     setProperty("CobaltSurvey,Mode1ResetEarlyRequested", mode1BootSelected());
     setProperty("CobaltSurvey,Schema", 1ULL, 32);
     setProperty("CobaltSurvey,ReadOnly", true);

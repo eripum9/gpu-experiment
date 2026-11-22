@@ -115,6 +115,9 @@ struct EarlyInitContext {
     const char *status {"early-prerequisites-unavailable"};
     const char *dmaPlanStatus {"not-attempted"};
     const char *dmaCopyStatus {"not-attempted"};
+    const char *dmaCopyAccessStatus {"not-attempted"};
+    const char *dmaCopyMapFailure {"none"};
+    uint32_t dmaCopyAccessOffset {UINT32_MAX}, dmaCopyAccessValue {UINT32_MAX};
     bool dmaCopyLayoutVerified {false}, dmaCopyRebootAllowed {false};
     bool dmaCopyIssued {false}, dmaCopyProven {false}, dmaCopyRestored {false}, dmaCopyRetained {false};
     uint32_t dmaCopyPolls {0}, dmaCopyPioStatus {UINT32_MAX};
@@ -460,6 +463,10 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     }
     if (context && dmaCopyBootArmed()) {
         published = service->setProperty("CobaltSurvey,PspDmaCopyStatus", context->dmaCopyStatus) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyAccessStatus", context->dmaCopyAccessStatus) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyMapFailure", context->dmaCopyMapFailure) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyAccessOffset", context->dmaCopyAccessOffset, 32) && published;
+        published = service->setProperty("CobaltSurvey,PspDmaCopyAccessValue", context->dmaCopyAccessValue, 32) && published;
         published = service->setProperty("CobaltSurvey,PspDmaCopyCommandAttempted", context->dmaCopyIssued) && published;
         published = service->setProperty("CobaltSurvey,PspDmaCopyProven", context->dmaCopyProven) && published;
         published = service->setProperty("CobaltSurvey,PspDmaCopyRestored", context->dmaCopyRestored) && published;
@@ -481,7 +488,7 @@ COBALT_SURVEY_NOINLINE bool publishEarlyInit(IOService *service, EarlyInitContex
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoveryDataReads", context ? context->discoveryReads : 0u, 32) && published;
     published = service->setProperty("CobaltSurvey,EarlyInitDiscoverySelectorWrites", context ? context->discoverySelectorWrites : 0u, 32) && published;
 #undef EARLY_PROPERTY
-    published = service->setProperty("CobaltSurvey,BuildVersion", "0.17.0") && published;
+    published = service->setProperty("CobaltSurvey,BuildVersion", "0.18.0") && published;
     published = service->setProperty("CobaltSurvey,AccessMode", "early-mode1-and-sos-initialization") && published;
     service->removeProperty("CobaltSurvey,Ready");
     published = service->setProperty("CobaltSurvey,Ready", false) && published;

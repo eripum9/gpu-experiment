@@ -30,15 +30,25 @@ class Adapter final : public protocol::Io {
     cobalt::PspDmaPage table, data;
     bool guardLost {false};
 
+    bool accessFailure(const char *reason, uint32_t offset = UINT32_MAX,
+        uint32_t value = UINT32_MAX) {
+        context.dmaCopyAccessStatus = reason;
+        context.dmaCopyAccessOffset = offset;
+        context.dmaCopyAccessValue = value;
+        return false;
+    }
+
     volatile uint32_t *word(Location reg) const {
         const auto *base = reg.lsdma ? lsdma.bytes() : mmhub.bytes();
         return reinterpret_cast<volatile uint32_t *>(
             const_cast<volatile uint8_t *>(base + (byteOffset(reg) & 0xfffu)));
     }
     bool load(Location reg, uint32_t &value) {
-        if (!guard()) return false;
+        if (!guard()) return accessFailure("guard-lost-before-register-read", byteOffset(reg));
         value = *word(reg);
-        return value != UINT32_MAX && guard();
+        if (value == UINT32_MAX) return accessFailure("register-unavailable", byteOffset(reg), value);
+        if (!guard()) return accessFailure("guard-lost-after-register-read", byteOffset(reg));
+        return true;
     }
     bool store(Location reg, uint32_t value) {
         if (!guard()) return false;
@@ -48,11 +58,16 @@ class Adapter final : public protocol::Io {
     }
     bool otherClientsIdle() {
         uint32_t control;
-        for (uint16_t reg = 0x0565; reg <= 0x0573; ++reg)
-            if (!load({reg, false}, control) || (control & 1u)) return false;
+        for (uint16_t reg = 0x0565; reg <= 0x0573; ++reg) {
+            if (!load({reg, false}, control)) return false;
+            if (control & 1u) return accessFailure("mmhub-context-enabled", byteOffset({reg, false}), control);
+        }
+        // LSDMA's queue offsets are local to this block, independent of SDMA.
         constexpr uint16_t queues[] = {0x0080, 0x00d8};
-        for (uint16_t reg : queues)
-            if (!load({reg, true}, control) || (control & 1u)) return false;
+        for (uint16_t reg : queues) {
+            if (!load({reg, true}, control)) return false;
+            if (control & 1u) return accessFailure("lsdma-queue-enabled", byteOffset({reg, true}), control);
+        }
         return true;
     }
 
@@ -64,11 +79,22 @@ public:
         return !guardLost;
     }
     bool open() {
-        if (!guard() || !mmhub.createDmaCopyPage(context.mmio, false) ||
-            !lsdma.createDmaCopyPage(context.mmio, true)) return false;
+        if (!(context.state.command & 4u)) return accessFailure("pci-bus-master-disabled");
+        if (!guard()) return accessFailure("copy-guard-refused");
+        if (!mmhub.createDmaCopyPage(context.mmio, false)) {
+            context.dmaCopyMapFailure = mmhub.failureReason();
+            return accessFailure("mmhub-map-failed", mmhubPage);
+        }
+        if (!lsdma.createDmaCopyPage(context.mmio, true)) {
+            context.dmaCopyMapFailure = lsdma.failureReason();
+            return accessFailure("lsdma-map-failed", lsdmaPage);
+        }
         const auto *mm = mmhub.bytes(), *ls = lsdma.bytes();
-        return mm && ls && !((reinterpret_cast<uintptr_t>(mm) | reinterpret_cast<uintptr_t>(ls)) & 3u) &&
-            otherClientsIdle();
+        if (!mm || (reinterpret_cast<uintptr_t>(mm) & 3u)) return accessFailure("mmhub-map-view-invalid", mmhubPage);
+        if (!ls || (reinterpret_cast<uintptr_t>(ls) & 3u)) return accessFailure("lsdma-map-view-invalid", lsdmaPage);
+        if (!otherClientsIdle()) return false;
+        context.dmaCopyAccessStatus = "access-verified";
+        return true;
     }
     bool read(Register reg, uint32_t &value) override {
         return load(locations[static_cast<unsigned>(reg)], value);
